@@ -1,652 +1,186 @@
-import {
-  CircleDot,
-  FolderGit2,
-  GitCommit,
-  GitPullRequest,
-  MoreHorizontal,
-  TerminalSquare,
-  Trash2,
-} from "lucide-react";
 import * as React from "react";
-import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
-import {
-  resolveUserLabel,
-  type UserProfileLookup,
-} from "@/features/profile/lib/identity";
+import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import {
   type Project,
-  type ProjectActivitySummary,
   type ProjectIssue,
   type ProjectPullRequest,
+  type Repository,
   useDeleteProjectMutation,
   useProjectActivitySummariesQuery,
   useProjectLocalRepositoriesQuery,
-  useProjectsIssuesQuery,
-  useProjectsPullRequestsQuery,
   useProjectsQuery,
+  useProjectsWorkItemsQuery,
 } from "@/features/projects/hooks";
+import { useRepositoryActivitySummariesQuery } from "@/features/projects/repositoryActivityHooks";
+import { isExplicitProject } from "@/features/projects/projectModels";
+import { projectsWithWorkItemRepositories } from "@/features/projects/projectWorkItems";
 import { useProjectsRepoSnapshotsQuery } from "@/features/projects/useProjectsRepoSnapshots";
+import { buildProjectSelectionAgentContext } from "@/features/projects/lib/projectDetailAgentContext";
+import { buildProjectsActivityDigest } from "@/features/projects/lib/projectsActivityDigest";
+import { matchesProjectsSearch } from "@/features/projects/lib/projectsSearch";
+import type { ProjectSelectionItem } from "@/features/projects/lib/projectSelection";
+import {
+  useMemberChannelIds,
+  useRepositoryUnavailableReasonFor,
+} from "@/features/projects/useRepositoryAccess";
+import { projectRepoHostForProject } from "@/features/projects/lib/projectRepoHost";
+import { ProjectsActivityFeed } from "@/features/projects/ui/ProjectsActivityFeed";
+import { ProjectsChannelsList } from "@/features/projects/ui/ProjectsChannelsList";
+import {
+  ProjectsOverviewContextSheet,
+  ProjectsOverviewNarrowContextToggle,
+} from "@/features/projects/ui/ProjectsOverviewContextSheet";
+import {
+  ProjectsActivityIntro,
+  ProjectsOverviewContextPanel,
+  ProjectsOverviewPanel,
+} from "@/features/projects/ui/ProjectsOverviewPanel";
+import { ProjectsOverviewChromeActions } from "@/features/projects/ui/ProjectsOverviewChromeActions";
+import { ProjectContextRail } from "@/features/projects/ui/ProjectContextRail";
+import {
+  projectsSectionIcon,
+  projectsSectionTitle,
+} from "@/features/projects/ui/projectsSectionMeta";
+import { EmptyState } from "@/features/projects/ui/ProjectCards";
+import {
+  ProjectsOverviewProjectItems,
+  ProjectsOverviewRepositoryItems,
+} from "@/features/projects/ui/ProjectsOverviewItems";
+import { ProjectCreationDialog } from "@/features/projects/ui/ProjectCreationDialog";
+import { CreateProjectIssueDialog } from "@/features/projects/ui/CreateProjectIssueDialog";
+import { CreatePullRequestDialog } from "@/features/projects/ui/CreatePullRequestDialog";
+import { ProjectAgentChatPanel } from "@/features/projects/ui/ProjectAgentChatPanel";
+import { ProjectsCategoryCreateDialogs } from "@/features/projects/ui/ProjectsCategoryCreateDialogs";
 import { ProjectsIssuesList } from "@/features/projects/ui/ProjectsIssuesList";
-import { ProjectsOverviewPanel } from "@/features/projects/ui/ProjectsOverviewPanel";
+import { ProjectsWorkspaceChrome } from "@/features/projects/ui/ProjectDetailChrome";
 import { ProjectsPullRequestsList } from "@/features/projects/ui/ProjectsPullRequestsList";
+import { ProjectsWorkItemsLoadNotice } from "@/features/projects/ui/ProjectsWorkItemsLoadNotice";
+import { ProjectsListHeaderBar } from "@/features/projects/ui/ProjectsListHeaderBar";
+import { ProjectsSectionSearch } from "@/features/projects/ui/ProjectsSectionSearch";
+import { ProjectSectionHeader } from "@/features/projects/ui/ProjectSectionHeader";
+import { PROJECT_COLUMN_HEADER_BACKDROP_CLASS } from "@/features/projects/ui/projectPanelStyles";
+import { ProjectSelectionProvider } from "@/features/projects/lib/useProjectSelection";
+import { hasLocalRepositoryCheckout } from "@/features/projects/lib/projectLocalRepos";
 import {
-  ProjectsToolbar,
-  ProjectsViewModeToggle,
-} from "@/features/projects/ui/ProjectsToolbar";
-import { hasLocalCheckout } from "@/features/projects/lib/projectLocalRepos";
-import {
-  formatExactTimestamp,
   getProjectUpdatedAt,
-  isProjectMine,
-  isProjectOwnedByCurrentUser,
   projectHasAgent,
   projectOwnerIsUser,
   projectPeople,
-  relativeTime,
   type ProjectsFilter,
   type ProjectsSort,
   type ProjectsViewMode,
   readStoredFilter,
   readStoredSort,
   readStoredViewMode,
-  uniqueRepositories,
   writeStoredFilter,
   writeStoredSort,
   writeStoredViewMode,
 } from "@/features/projects/lib/projectsViewHelpers";
+import { useOpenProjectTerminal } from "@/features/projects/ui/useOpenProjectTerminal";
+import { useProjectsScrollIndicator } from "@/features/projects/ui/useProjectsScrollIndicator";
 import {
-  projectTerminalLabel,
-  useOpenProjectTerminal,
-} from "@/features/projects/ui/useOpenProjectTerminal";
-import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
+  PROJECT_CONTEXT_PANEL_DEFAULT_WIDTH_PX,
+  useProjectPanelWidths,
+} from "@/features/projects/ui/useProjectPanelWidths";
+import { useMediaBreakpoint } from "@/shared/hooks/use-mobile";
+import { useNow } from "@/shared/lib/useNow";
+import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
-import {
-  channelChrome,
-  channelContentTopPaddingMeasurement,
-  topChromeInset,
-} from "@/shared/layout/chromeLayout";
-import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
+import { topChromeInset } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/shared/ui/alert-dialog";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { Button } from "@/shared/ui/button";
-import { Card } from "@/shared/ui/card";
+import { useOptionalSidebar } from "@/shared/ui/sidebar";
+import { useProjectsOverviewAgentContext } from "./useProjectsOverviewAgentContext";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/shared/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-import { UserAvatar } from "@/shared/ui/UserAvatar";
+  EMPTY_ITEMS,
+  useContextWorkItems,
+  useDeleteProjectHandler,
+  useOpenProjectTerminalHandler,
+} from "./projectsViewWorkItems";
 
 const MANY_PROJECTS_THRESHOLD = 12;
-
-function ProjectUpdatedLabel({
-  profiles,
-  project,
-  summary,
-}: {
-  profiles?: UserProfileLookup;
-  project: Project;
-  summary: ProjectActivitySummary | undefined;
-}) {
-  const updatedAt = getProjectUpdatedAt(project, summary);
-  const latestCommit = summary?.latestCommit;
-  const authorLabel = latestCommit?.author
-    ? resolveUserLabel({ profiles, pubkey: latestCommit.author })
-    : null;
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="whitespace-nowrap text-xs text-muted-foreground">
-          {relativeTime(updatedAt)}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-96 break-words">
-        {latestCommit
-          ? `${latestCommit.title || latestCommit.commit.slice(0, 7)}${
-              authorLabel ? ` · ${authorLabel}` : ""
-            } · ${formatExactTimestamp(latestCommit.createdAt)}`
-          : `Created ${formatExactTimestamp(project.createdAt)}`}
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-function ProjectPeopleStack({
-  pubkeys,
-  profiles,
-  workOwnerPubkey,
-}: {
-  pubkeys: string[];
-  profiles?: UserProfileLookup;
-  workOwnerPubkey: string;
-}) {
-  const visible = pubkeys.slice(0, 5);
-  const remaining = pubkeys.length - visible.length;
-
-  if (visible.length === 0) {
-    return null;
-  }
-
-  return (
-    <div className="flex items-center justify-end -space-x-1.5">
-      {visible.map((pubkey, index) => {
-        const profile = profiles?.[normalizePubkey(pubkey)];
-        const label = resolveUserLabel({ pubkey, profiles });
-        return (
-          <Tooltip key={pubkey}>
-            <TooltipTrigger asChild>
-              {/* First avatar sits on the top layer, cascading down rightward. */}
-              <span
-                className="relative inline-flex"
-                style={{ zIndex: visible.length - index }}
-              >
-                <UserAvatar
-                  accent={
-                    normalizePubkey(pubkey) === normalizePubkey(workOwnerPubkey)
-                  }
-                  avatarUrl={profile?.avatarUrl ?? null}
-                  className="ring-2 ring-card"
-                  displayName={label}
-                  size="xs"
-                />
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>{label}</TooltipContent>
-          </Tooltip>
-        );
-      })}
-      {remaining > 0 ? (
-        <span className="relative z-0 flex h-5 min-w-5 items-center justify-center rounded-sm bg-muted px-1 text-3xs font-semibold text-muted-foreground ring-2 ring-card">
-          +{remaining}
-        </span>
-      ) : null}
-    </div>
-  );
-}
-
-const PROJECT_STAT_ITEMS = [
-  {
-    key: "commitCount",
-    icon: GitCommit,
-    iconClass: "text-primary/60",
-    barClass: "bg-primary/60",
-    columnClass: "w-24",
-    label: (count: number) => (count === 1 ? "commit" : "commits"),
-  },
-  {
-    key: "prCount",
-    icon: GitPullRequest,
-    iconClass: "text-primary",
-    barClass: "bg-primary",
-    columnClass: "w-16",
-    label: (count: number) => (count === 1 ? "PR" : "PRs"),
-  },
-  {
-    key: "issueCount",
-    icon: CircleDot,
-    iconClass: "text-orange-500",
-    barClass: "bg-orange-500",
-    columnClass: "w-20",
-    label: (count: number) => (count === 1 ? "issue" : "issues"),
-  },
-] as const;
-
-function ProjectStatsRow({
-  summary,
-  fixedColumns = false,
-}: {
-  summary: ProjectActivitySummary | undefined;
-  /** Give each stat a fixed width so stats align vertically across list rows. */
-  fixedColumns?: boolean;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex items-center gap-x-3 gap-y-1 text-xs text-muted-foreground",
-        !fixedColumns && "flex-wrap",
-      )}
-    >
-      {PROJECT_STAT_ITEMS.map(
-        ({ key, icon: Icon, iconClass, label, columnClass }) => {
-          const count = summary?.[key] ?? 0;
-          return (
-            <span
-              className={cn(
-                "flex items-center gap-1",
-                fixedColumns && cn("shrink-0", columnClass),
-              )}
-              key={key}
-            >
-              <Icon className={cn("h-3.5 w-3.5 shrink-0", iconClass)} />
-              <span className="font-medium text-foreground">{count}</span>
-              {label(count)}
-            </span>
-          );
-        },
-      )}
-    </div>
-  );
-}
-
-// Segmented commits/PRs/issues distribution — the card's "progress bar".
-// Hovering thickens the bar and reveals a tooltip with the exact breakdown.
-function ProjectActivityBar({
-  summary,
-}: {
-  summary: ProjectActivitySummary | undefined;
-}) {
-  const items = PROJECT_STAT_ITEMS.map(({ key, barClass, label }) => {
-    const count = summary?.[key] ?? 0;
-    return { barClass, count, text: label(count) };
-  });
-  const total = items.reduce((sum, item) => sum + item.count, 0);
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        {/* z-10 lifts the bar above the card's full-surface open button so it
-            can receive hover events. Fixed h-2 wrapper keeps layout stable
-            while the inner bar grows on hover. */}
-        <div className="group/activity-bar relative z-10 flex h-2 w-full items-center">
-          <div className="flex h-1.5 w-full gap-px overflow-hidden rounded-full bg-muted/60 transition-all duration-150 group-hover/activity-bar:h-2">
-            {total > 0
-              ? items
-                  .filter((item) => item.count > 0)
-                  .map((item) => (
-                    <div
-                      className={cn("h-full", item.barClass)}
-                      key={item.barClass}
-                      style={{ width: `${(item.count / total) * 100}%` }}
-                    />
-                  ))
-              : null}
-          </div>
-        </div>
-      </TooltipTrigger>
-      <TooltipContent>
-        <div className="flex items-center gap-3">
-          {items.map((item) => (
-            <span className="flex items-center gap-1.5" key={item.barClass}>
-              <span className={cn("h-2 w-2 rounded-full", item.barClass)} />
-              {item.count} {item.text}
-            </span>
-          ))}
-        </div>
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
-function StatusPill({ status }: { status: string }) {
-  if (status === "active") {
-    return null;
-  }
-
-  return (
-    <span className="shrink-0 rounded-full border border-border/60 bg-muted/40 px-2 pb-[3px] pt-[5px] text-2xs font-semibold uppercase leading-none tracking-[0.18em] text-muted-foreground">
-      {status}
-    </span>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-16 text-center">
-      <FolderGit2 className="h-10 w-10 text-muted-foreground/40" />
-      <div className="space-y-1">
-        <p className="text-sm font-medium text-foreground">No projects yet</p>
-        <p className="text-sm text-muted-foreground">
-          Projects published to this relay will appear here.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function EmptyFilteredState() {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 border border-dashed border-border/60 px-4 py-12 text-center">
-      <FolderGit2 className="h-9 w-9 text-muted-foreground/40" />
-      <div className="space-y-1">
-        <p className="text-sm font-medium text-foreground">
-          No matching projects
-        </p>
-        <p className="text-sm text-muted-foreground">
-          Try another owner filter or sort mode.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function ProjectCardButton({
-  project,
-  onOpen,
-}: {
-  project: Project;
-  onOpen: (project: Project) => void;
-}) {
-  return (
-    <button
-      className="absolute inset-0"
-      onClick={() => onOpen(project)}
-      type="button"
-    >
-      <span className="sr-only">View {project.name}</span>
-    </button>
-  );
-}
-
-function ProjectActionsMenu({
-  project,
-  hasLocal,
-  canDelete,
-  disabled,
-  onDelete,
-  onOpenTerminal,
-}: {
-  project: Project;
-  hasLocal: boolean;
-  canDelete: boolean;
-  disabled: boolean;
-  onDelete: (project: Project) => Promise<void> | void;
-  onOpenTerminal: (project: Project) => Promise<void> | void;
-}) {
-  const [confirmOpen, setConfirmOpen] = React.useState(false);
-
-  return (
-    <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
-      <DropdownMenu modal={false}>
-        <DropdownMenuTrigger asChild>
-          <Button
-            aria-label={`More options for ${project.name}`}
-            className="relative z-20 h-7 w-7 text-muted-foreground hover:text-foreground"
-            onClick={(event) => event.stopPropagation()}
-            size="icon"
-            type="button"
-            variant="ghost"
-          >
-            <MoreHorizontal className="h-4 w-4" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-48">
-          <DropdownMenuItem
-            onSelect={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              void onOpenTerminal(project);
-            }}
-          >
-            <TerminalSquare className="h-4 w-4" />
-            {projectTerminalLabel(hasLocal)}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="text-destructive focus:text-destructive"
-            disabled={!canDelete || disabled}
-            onSelect={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              if (canDelete && !disabled) {
-                setConfirmOpen(true);
-              }
-            }}
-          >
-            <Trash2 className="h-4 w-4" />
-            Delete project
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-      <AlertDialogContent
-        data-testid={`project-delete-confirm-${project.dtag}`}
-      >
-        <AlertDialogHeader>
-          <AlertDialogTitle>Delete project?</AlertDialogTitle>
-          <AlertDialogDescription>
-            Delete {project.name} from Projects for everyone. This can only be
-            done for projects you own and cannot be undone.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel asChild>
-            <Button disabled={disabled} type="button" variant="outline">
-              Cancel
-            </Button>
-          </AlertDialogCancel>
-          <AlertDialogAction asChild>
-            <Button
-              data-testid={`project-delete-confirm-button-${project.dtag}`}
-              disabled={disabled}
-              onClick={(event) => {
-                event.preventDefault();
-                void Promise.resolve(onDelete(project)).finally(() =>
-                  setConfirmOpen(false),
-                );
-              }}
-              type="button"
-              variant="destructive"
-            >
-              {disabled ? "Deleting..." : "Delete project"}
-            </Button>
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  );
-}
-
-function ProjectGridCard({
-  project,
-  people,
-  profiles,
-  summary,
-  hasLocal,
-  canDelete,
-  deleteDisabled,
-  onDelete,
-  onOpen,
-  onOpenTerminal,
-}: {
-  project: Project;
-  people: string[];
-  profiles?: UserProfileLookup;
-  summary: ProjectActivitySummary | undefined;
-  hasLocal: boolean;
-  canDelete: boolean;
-  deleteDisabled: boolean;
-  onDelete: (project: Project) => Promise<void> | void;
-  onOpen: (project: Project) => void;
-  onOpenTerminal: (project: Project) => Promise<void> | void;
-}) {
-  return (
-    <Card
-      className="group relative flex min-h-44 flex-col overflow-hidden border-border/60 bg-card shadow-none transition-colors duration-150 hover:bg-muted/20"
-      data-testid={`project-card-${project.dtag}`}
-    >
-      <ProjectCardButton onOpen={onOpen} project={project} />
-      <div className="flex min-h-0 flex-1 flex-col">
-        <div className="flex min-w-0 items-center justify-between gap-3 px-4 pt-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center border border-border/60 bg-muted/40">
-              <FolderGit2 className="h-4 w-4 text-muted-foreground" />
-            </span>
-            <span className="min-w-0 truncate text-sm font-semibold text-foreground">
-              {project.name}
-            </span>
-            <StatusPill status={project.status} />
-          </div>
-          <div className="relative z-10 flex shrink-0 items-center gap-1">
-            <ProjectUpdatedLabel
-              profiles={profiles}
-              project={project}
-              summary={summary}
-            />
-            <ProjectActionsMenu
-              canDelete={canDelete}
-              disabled={deleteDisabled}
-              hasLocal={hasLocal}
-              onDelete={onDelete}
-              onOpenTerminal={onOpenTerminal}
-              project={project}
-            />
-          </div>
-        </div>
-
-        <p className="line-clamp-2 min-h-10 px-4 py-2 text-sm text-muted-foreground">
-          {project.description || "A shared space for internal git work."}
-        </p>
-
-        <div className="relative z-10 flex items-center px-4 pb-1">
-          <ProjectPeopleStack
-            profiles={profiles}
-            pubkeys={people}
-            workOwnerPubkey={project.owner}
-          />
-        </div>
-
-        <div className="mt-auto">
-          <div className="flex min-w-0 items-center px-4 pb-2 pt-1">
-            <ProjectStatsRow summary={summary} />
-          </div>
-          <div className="px-4 pb-3">
-            <ProjectActivityBar summary={summary} />
-          </div>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-function ProjectListRow({
-  project,
-  people,
-  profiles,
-  summary,
-  hasLocal,
-  canDelete,
-  deleteDisabled,
-  onDelete,
-  onOpen,
-  onOpenTerminal,
-}: {
-  project: Project;
-  people: string[];
-  profiles?: UserProfileLookup;
-  summary: ProjectActivitySummary | undefined;
-  hasLocal: boolean;
-  canDelete: boolean;
-  deleteDisabled: boolean;
-  onDelete: (project: Project) => Promise<void> | void;
-  onOpen: (project: Project) => void;
-  onOpenTerminal: (project: Project) => Promise<void> | void;
-}) {
-  return (
-    <div
-      className="group relative px-4 py-2.5 transition-colors duration-150 hover:bg-muted/20"
-      data-testid={`project-row-${project.dtag}`}
-    >
-      <ProjectCardButton onOpen={onOpen} project={project} />
-      <div className="flex min-w-0 items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="flex h-8 w-8 shrink-0 items-center justify-center border border-border/60 bg-muted/40">
-            <FolderGit2 className="h-4 w-4 text-muted-foreground" />
-          </span>
-          <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate text-sm font-semibold text-foreground">
-                {project.name}
-              </span>
-              <StatusPill status={project.status} />
-            </div>
-            <p className="line-clamp-1 text-sm text-muted-foreground">
-              {project.description || "A shared space for internal git work."}
-            </p>
-          </div>
-        </div>
-
-        <div className="relative z-10 flex shrink-0 items-center gap-3">
-          <div className="hidden items-center gap-3 md:flex">
-            <ProjectStatsRow fixedColumns summary={summary} />
-            <div className="w-20 shrink-0">
-              <ProjectActivityBar summary={summary} />
-            </div>
-          </div>
-          <div className="flex w-24 shrink-0 justify-end">
-            <ProjectPeopleStack
-              profiles={profiles}
-              pubkeys={people}
-              workOwnerPubkey={project.owner}
-            />
-          </div>
-          <div className="hidden w-24 shrink-0 text-right sm:block">
-            <ProjectUpdatedLabel
-              profiles={profiles}
-              project={project}
-              summary={summary}
-            />
-          </div>
-          <ProjectActionsMenu
-            canDelete={canDelete}
-            disabled={deleteDisabled}
-            hasLocal={hasLocal}
-            onDelete={onDelete}
-            onOpenTerminal={onOpenTerminal}
-            project={project}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
+const PROJECTS_CONTEXT_POD_MIN_VIEWPORT_PX = 1024;
 
 export function ProjectsView() {
   const { goProject } = useAppNavigation();
-  const { activeWorkspace } = useWorkspaces();
-  const mainInsetRef = useMainInsetRef();
-  const projectsHeaderChromeRef = useMeasuredCssVariable({
-    targetRef: mainInsetRef,
-    ...channelContentTopPaddingMeasurement,
-  });
+  const { activeCommunity } = useCommunities();
+  const relayOrigin = useRelayOrigin();
+  const sidebar = useOptionalSidebar();
+  const { handleContentScroll, scrollIndicatorRef } =
+    useProjectsScrollIndicator();
   const projectsQuery = useProjectsQuery();
   const identityQuery = useIdentityQuery();
-  const projects = projectsQuery.data ?? [];
-  const activitySummariesQuery = useProjectActivitySummariesQuery(projects);
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const projectReadModels = projectsQuery.data ?? [];
+  const projects = React.useMemo(
+    () => projectReadModels.filter(isExplicitProject),
+    [projectReadModels],
+  );
   const localRepositoriesQuery = useProjectLocalRepositoriesQuery(
-    activeWorkspace?.reposDir,
+    activeCommunity?.reposDir,
   );
-  const projectPullRequestsQuery = useProjectsPullRequestsQuery(projects);
-  const [filter, setFilter] = React.useState<ProjectsFilter>(() =>
-    readStoredFilter(),
+  const [filter, setFilter] = React.useState<ProjectsFilter>(() => {
+    const storedFilter = readStoredFilter();
+    return storedFilter === "mine" || storedFilter === "local"
+      ? "repositories"
+      : storedFilter;
+  });
+  const [searchQuery, setSearchQuery] = React.useState("");
+  const [overviewPanelOpen, setOverviewPanelOpen] = React.useState(true);
+  const [narrowContextOpen, setNarrowContextOpen] = React.useState(false);
+  const contextToggleRef = React.useRef<HTMLButtonElement | null>(null);
+  const selectionDrawerStateRef = React.useRef<{
+    narrow: boolean;
+    open: boolean;
+  } | null>(null);
+  const isNarrowProjectsLayout = useMediaBreakpoint(
+    PROJECTS_CONTEXT_POD_MIN_VIEWPORT_PX,
   );
-  const projectIssuesQuery = useProjectsIssuesQuery(
-    filter === "issues" ? projects : [],
+  const { activeRightPanelWidth: overviewAgentPanelWidth } =
+    useProjectPanelWidths("chat");
+  const activitySummariesQuery = useProjectActivitySummariesQuery(projects);
+  const repositoryActivitySummariesQuery = useRepositoryActivitySummariesQuery(
+    filter === "repositories" ? projectReadModels : [],
   );
-  // One blobless clone per unique repository — only scan while the overview
-  // header (filter === "all") is actually visible.
+  const workItemProjects = React.useMemo(
+    () => projectsWithWorkItemRepositories(projectReadModels),
+    [projectReadModels],
+  );
+  const projectsWorkItemsQuery = useProjectsWorkItemsQuery(workItemProjects);
+  // One blobless clone per primary Buzz repository, only while the overview
+  // header is visible.
   const snapshotProjects = React.useMemo(
-    () => (filter === "all" ? uniqueRepositories(projects) : []),
-    [filter, projects],
+    () =>
+      filter === "all"
+        ? projects.filter(
+            (project) =>
+              projectRepoHostForProject(project, relayOrigin).kind === "buzz",
+          )
+        : [],
+    [filter, projects, relayOrigin],
   );
   const repoSnapshotsQuery = useProjectsRepoSnapshotsQuery(
     snapshotProjects,
-    activeWorkspace?.reposDir,
+    activeCommunity?.reposDir,
   );
+  const memberChannelIds = useMemberChannelIds();
+  const repositoryUnavailableReasonFor = useRepositoryUnavailableReasonFor(
+    repoSnapshotsQuery.data?.unavailable,
+    memberChannelIds,
+  );
+  const [createProjectOpen, setCreateProjectOpen] = React.useState(false);
+  const [createChannelOpen, setCreateChannelOpen] = React.useState(false);
+  const [createRepositoryOpen, setCreateRepositoryOpen] = React.useState(false);
+  const [createIssueOpen, setCreateIssueOpen] = React.useState(false);
+  const [createPullRequestOpen, setCreatePullRequestOpen] =
+    React.useState(false);
   const [storedViewMode, setStoredViewMode] =
     React.useState<ProjectsViewMode | null>(() => readStoredViewMode());
   const [sort, setSort] = React.useState<ProjectsSort>(() => readStoredSort());
@@ -659,27 +193,90 @@ export function ProjectsView() {
       ...new Set(
         [
           ...projects.flatMap((project) =>
-            projectPeople(
-              project,
-              activitySummariesQuery.data?.[project.repoAddress],
-            ),
+            projectPeople(project, activitySummariesQuery.data?.[project.id]),
           ),
-          ...(projectPullRequestsQuery.data?.flatMap(({ pullRequest }) => [
-            pullRequest.author,
-            ...pullRequest.recipients,
-            ...pullRequest.comments.map((comment) => comment.author),
+          ...(projectsWorkItemsQuery.data?.pullRequests.items.flatMap(
+            ({ pullRequest }) => [
+              pullRequest.author,
+              ...pullRequest.recipients,
+              ...pullRequest.reviewers,
+              ...pullRequest.approvals.map((approval) => approval.author),
+              ...pullRequest.updates.map((update) => update.author),
+              ...pullRequest.comments.map((comment) => comment.author),
+            ],
+          ) ?? []),
+          ...(projectsWorkItemsQuery.data?.issues.items.flatMap(({ issue }) => [
+            issue.author,
+            ...issue.recipients,
+            ...issue.assignees,
+            ...issue.comments.map((comment) => comment.author),
           ]) ?? []),
         ].map(normalizePubkey),
       ),
     ],
-    [activitySummariesQuery.data, projectPullRequestsQuery.data, projects],
+    [activitySummariesQuery.data, projects, projectsWorkItemsQuery.data],
   );
   const profilesQuery = useUsersBatchQuery(projectPubkeys, {
     enabled: projectPubkeys.length > 0,
   });
   const profiles = profilesQuery.data?.profiles;
+  const activityDigestNow = useNow(600_000);
+  const activityDigest = React.useMemo(
+    () =>
+      buildProjectsActivityDigest({
+        issues: projectsWorkItemsQuery.data?.issues.items ?? [],
+        nowSeconds: Math.floor(activityDigestNow / 1_000),
+        projects,
+        pullRequests: projectsWorkItemsQuery.data?.pullRequests.items ?? [],
+        snapshots: repoSnapshotsQuery.data?.snapshots,
+        summaries: activitySummariesQuery.data,
+      }),
+    [
+      activityDigestNow,
+      activitySummariesQuery.data,
+      projects,
+      projectsWorkItemsQuery.data,
+      repoSnapshotsQuery.data?.snapshots,
+    ],
+  );
   const deleteProjectMutation = useDeleteProjectMutation();
   const currentPubkey = identityQuery.data?.pubkey;
+  const managedAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (managedAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [managedAgentsQuery.data],
+  );
+  const editableProjects = React.useMemo(() => {
+    if (!currentPubkey) return [];
+    const viewer = normalizePubkey(currentPubkey);
+    return projects.filter((project) => {
+      const owner = normalizePubkey(project.owner);
+      return (
+        owner === viewer ||
+        managedAgentPubkeys.has(owner) ||
+        ownsAuthorAgent(profiles?.[owner], currentPubkey)
+      );
+    });
+  }, [currentPubkey, managedAgentPubkeys, profiles, projects]);
+  const ownerControlAgentPubkeyFor = React.useCallback(
+    (project: Project) => {
+      const owner = normalizePubkey(project.owner);
+      if (
+        owner === normalizePubkey(currentPubkey ?? "") ||
+        managedAgentPubkeys.has(owner)
+      ) {
+        return undefined;
+      }
+      return ownsAuthorAgent(profiles?.[owner], currentPubkey)
+        ? project.owner
+        : undefined;
+    },
+    [currentPubkey, managedAgentPubkeys, profiles],
+  );
 
   const handleViewModeChange = React.useCallback(
     (nextViewMode: ProjectsViewMode) => {
@@ -688,11 +285,6 @@ export function ProjectsView() {
     },
     [],
   );
-
-  const handleFilterChange = React.useCallback((nextFilter: ProjectsFilter) => {
-    setFilter(nextFilter);
-    writeStoredFilter(nextFilter);
-  }, []);
 
   const handleSortChange = React.useCallback((nextSort: ProjectsSort) => {
     setSort(nextSort);
@@ -709,29 +301,27 @@ export function ProjectsView() {
     [localRepositoriesQuery.data],
   );
 
-  // Count projects with a checkout on this machine — matches what the
-  // "Local" filter actually lists, not every directory in the repos folder.
-  const localProjectCount = React.useMemo(
-    () =>
-      projects.filter((project) => hasLocalCheckout(project, localRepoNames))
-        .length,
-    [localRepoNames, projects],
-  );
-
   const visibleProjects = React.useMemo(() => {
-    // The PRs and Issues filters render dedicated lists
-    // (visiblePullRequests / visibleIssues), not project cards.
-    if (filter === "prs" || filter === "issues") {
+    if (filter !== "projects" && filter !== "agents" && filter !== "users") {
       return [];
     }
 
     const sortedProjects = projects
       .filter((project) => {
-        const summary = activitySummariesQuery.data?.[project.repoAddress];
+        if (
+          !matchesProjectsSearch(searchQuery, [
+            project.name,
+            project.description,
+            ...project.repositories.flatMap((repository) => [
+              repository.name,
+              repository.description,
+            ]),
+          ])
+        ) {
+          return false;
+        }
+        const summary = activitySummariesQuery.data?.[project.id];
         const people = projectPeople(project, summary);
-        if (filter === "mine") return isProjectMine(project, currentPubkey);
-        if (filter === "local")
-          return hasLocalCheckout(project, localRepoNames);
         if (filter === "agents") {
           return projectHasAgent(project, people, profiles);
         }
@@ -739,8 +329,8 @@ export function ProjectsView() {
         return true;
       })
       .sort((left, right) => {
-        const leftSummary = activitySummariesQuery.data?.[left.repoAddress];
-        const rightSummary = activitySummariesQuery.data?.[right.repoAddress];
+        const leftSummary = activitySummariesQuery.data?.[left.id];
+        const rightSummary = activitySummariesQuery.data?.[right.id];
         if (sort === "name") {
           return left.name.localeCompare(right.name);
         }
@@ -753,44 +343,134 @@ export function ProjectsView() {
         );
       });
 
-    return filter === "repositories"
-      ? uniqueRepositories(sortedProjects)
-      : sortedProjects;
+    return sortedProjects;
   }, [
     activitySummariesQuery.data,
-    currentPubkey,
     filter,
-    localRepoNames,
     profiles,
     projects,
+    searchQuery,
+    sort,
+  ]);
+
+  const visibleRepositories = React.useMemo(() => {
+    if (filter !== "repositories") return [];
+    const repositories = [
+      ...new Map(
+        projectReadModels
+          .flatMap((project) =>
+            project.repositories.map((repository) => ({
+              project,
+              repository,
+            })),
+          )
+          .map((item) => [item.repository.repoAddress, item]),
+      ).values(),
+    ];
+    return repositories
+      .filter(({ project, repository }) =>
+        matchesProjectsSearch(searchQuery, [
+          repository.name,
+          repository.description,
+          project.name,
+        ]),
+      )
+      .sort((left, right) => {
+        if (sort === "name") {
+          return left.repository.name.localeCompare(right.repository.name);
+        }
+        if (sort === "created") {
+          return right.repository.createdAt - left.repository.createdAt;
+        }
+        const leftUpdatedAt =
+          repositoryActivitySummariesQuery.data?.[left.repository.repoAddress]
+            ?.updatedAt ?? left.repository.createdAt;
+        const rightUpdatedAt =
+          repositoryActivitySummariesQuery.data?.[right.repository.repoAddress]
+            ?.updatedAt ?? right.repository.createdAt;
+        return rightUpdatedAt - leftUpdatedAt;
+      });
+  }, [
+    filter,
+    projectReadModels,
+    repositoryActivitySummariesQuery.data,
+    searchQuery,
     sort,
   ]);
 
   const visiblePullRequests = React.useMemo(() => {
-    const pullRequests = projectPullRequestsQuery.data ?? [];
-    return [...pullRequests].sort((left, right) => {
-      if (sort === "name") {
-        return left.pullRequest.title.localeCompare(right.pullRequest.title);
-      }
-      if (sort === "created") {
-        return right.pullRequest.createdAt - left.pullRequest.createdAt;
-      }
-      return right.pullRequest.updatedAt - left.pullRequest.updatedAt;
-    });
-  }, [projectPullRequestsQuery.data, sort]);
+    const pullRequests = projectsWorkItemsQuery.data?.pullRequests.items ?? [];
+    return pullRequests
+      .filter(({ project, pullRequest, repository }) =>
+        matchesProjectsSearch(searchQuery, [
+          pullRequest.title,
+          pullRequest.content,
+          pullRequest.status,
+          project.name,
+          repository.name,
+        ]),
+      )
+      .sort((left, right) => {
+        if (sort === "name") {
+          return left.pullRequest.title.localeCompare(right.pullRequest.title);
+        }
+        if (sort === "created") {
+          return right.pullRequest.createdAt - left.pullRequest.createdAt;
+        }
+        return right.pullRequest.updatedAt - left.pullRequest.updatedAt;
+      });
+  }, [projectsWorkItemsQuery.data, searchQuery, sort]);
 
   const visibleIssues = React.useMemo(() => {
-    const issues = projectIssuesQuery.data ?? [];
-    return [...issues].sort((left, right) => {
-      if (sort === "name") {
-        return left.issue.title.localeCompare(right.issue.title);
-      }
-      if (sort === "created") {
-        return right.issue.createdAt - left.issue.createdAt;
-      }
-      return right.issue.updatedAt - left.issue.updatedAt;
-    });
-  }, [projectIssuesQuery.data, sort]);
+    const issues = projectsWorkItemsQuery.data?.issues.items ?? [];
+    return issues
+      .filter(({ issue, project, repository }) =>
+        matchesProjectsSearch(searchQuery, [
+          issue.title,
+          issue.content,
+          issue.status,
+          project.name,
+          repository.name,
+        ]),
+      )
+      .sort((left, right) => {
+        if (sort === "name") {
+          return left.issue.title.localeCompare(right.issue.title);
+        }
+        if (sort === "created") {
+          return right.issue.createdAt - left.issue.createdAt;
+        }
+        return right.issue.updatedAt - left.issue.updatedAt;
+      });
+  }, [projectsWorkItemsQuery.data, searchQuery, sort]);
+  const {
+    agentContext: selectionAgentContext,
+    overviewContext: overviewAgentContext,
+    setAgentContext: setSelectionAgentContext,
+  } = useProjectsOverviewAgentContext({
+    filter,
+    issues: projectsWorkItemsQuery.data?.issues.items,
+    projects,
+    pullRequests: projectsWorkItemsQuery.data?.pullRequests.items,
+    snapshots: repoSnapshotsQuery.data?.snapshots,
+    visibleIssues,
+    visibleProjects,
+    visiblePullRequests,
+    visibleRepositories,
+  });
+  const handleFilterChange = React.useCallback(
+    (nextFilter: ProjectsFilter) => {
+      writeStoredFilter(nextFilter);
+      // Tab content swaps mount hundreds of rows/cards at once; a transition
+      // lets React keep the click responsive and paint the previous tab until
+      // the new tree is ready instead of blocking the main thread.
+      React.startTransition(() => {
+        setSelectionAgentContext(null);
+        setFilter(nextFilter);
+      });
+    },
+    [setSelectionAgentContext],
+  );
 
   // Route by the canonical `owner:dtag` project ID — a bare dtag is
   // ambiguous across owners (forks can share the same dtag).
@@ -801,45 +481,70 @@ export function ProjectsView() {
     [goProject],
   );
 
+  const handleOpenRepository = React.useCallback(
+    (project: Project, repository: Repository) => {
+      void goProject(project.id, { repositoryId: repository.id });
+    },
+    [goProject],
+  );
+
+  const handleOpenCommit = React.useCallback(
+    (project: Project, commitHash: string) => {
+      void goProject(project.id, { commitHash });
+    },
+    [goProject],
+  );
+
   const handleOpenPullRequest = React.useCallback(
-    (project: Project, pullRequest: ProjectPullRequest) => {
-      void goProject(project.id, { pullRequestId: pullRequest.id });
+    (
+      project: Project,
+      repository: Repository,
+      pullRequest: ProjectPullRequest,
+    ) => {
+      void goProject(project.id, {
+        pullRequestId: pullRequest.id,
+        repositoryId: repository.id,
+      });
     },
     [goProject],
   );
 
   const handleOpenIssue = React.useCallback(
-    (project: Project, issue: ProjectIssue) => {
-      void goProject(project.id, { issueId: issue.id });
+    (project: Project, repository: Repository, issue: ProjectIssue) => {
+      void goProject(project.id, {
+        issueId: issue.id,
+        repositoryId: repository.id,
+      });
     },
     [goProject],
   );
 
-  const openTerminal = useOpenProjectTerminal(activeWorkspace?.reposDir);
-  const handleOpenTerminal = React.useCallback(
-    (project: Project) =>
-      openTerminal(project, {
-        hasLocalCheckout: hasLocalCheckout(project, localRepoNames),
+  const openTerminal = useOpenProjectTerminal(activeCommunity?.reposDir);
+  const handleOpenTerminal = useOpenProjectTerminalHandler(
+    openTerminal,
+    localRepoNames,
+  );
+  const handleOpenRepositoryTerminal = React.useCallback(
+    (repository: Repository) =>
+      openTerminal(repository, {
+        hasLocalCheckout: hasLocalRepositoryCheckout(
+          repository,
+          localRepoNames,
+        ),
       }),
     [localRepoNames, openTerminal],
   );
 
-  const handleDeleteProject = React.useCallback(
-    async (project: Project) => {
-      try {
-        await deleteProjectMutation.mutateAsync(project);
-        toast.success("Project deleted");
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to delete project",
-        );
-      }
-    },
-    [deleteProjectMutation],
+  const handleDeleteProject = useDeleteProjectHandler(
+    deleteProjectMutation.mutateAsync,
+  );
+
+  const { contextIssues, contextPullRequests } = useContextWorkItems(
+    projectsWorkItemsQuery.data,
   );
 
   if (projectsQuery.isLoading) {
-    return null;
+    return <ViewLoadingFallback kind="projects" />;
   }
 
   if (projectsQuery.isError) {
@@ -857,139 +562,417 @@ export function ProjectsView() {
     );
   }
 
-  if (projects.length === 0) {
-    return <EmptyState />;
+  if (projectReadModels.length === 0) {
+    return (
+      <>
+        <ProjectCreationDialog
+          onOpenChange={setCreateProjectOpen}
+          open={createProjectOpen}
+        />
+        <EmptyState onCreateProject={() => setCreateProjectOpen(true)} />
+      </>
+    );
   }
 
+  const projectItems = (
+    <ProjectsOverviewProjectItems
+      currentPubkey={currentPubkey}
+      deleteDisabled={deleteProjectMutation.isPending}
+      localRepoNames={localRepoNames}
+      onDelete={handleDeleteProject}
+      onOpen={handleOpenProject}
+      onOpenTerminal={handleOpenTerminal}
+      profiles={profiles}
+      repositoryUnavailableReasonFor={repositoryUnavailableReasonFor}
+      summaries={activitySummariesQuery.data}
+      viewMode={viewMode}
+      visibleProjects={visibleProjects}
+    />
+  );
+
+  const repositoryItems = (
+    <ProjectsOverviewRepositoryItems
+      currentPubkey={currentPubkey}
+      localRepoNames={localRepoNames}
+      onOpen={handleOpenRepository}
+      onOpenTerminal={handleOpenRepositoryTerminal}
+      profiles={profiles}
+      summaries={repositoryActivitySummariesQuery.data}
+      viewMode={viewMode}
+      visibleRepositories={visibleRepositories}
+    />
+  );
+
+  const listHeaderBar = (
+    <ProjectsListHeaderBar
+      onViewModeChange={handleViewModeChange}
+      viewMode={viewMode}
+    />
+  );
+
+  const workItemFailedSections = [
+    ...new Set([
+      ...(projectsWorkItemsQuery.data?.issues.failedSections ?? []),
+      ...(projectsWorkItemsQuery.data?.pullRequests.failedSections ?? []),
+    ]),
+  ];
+  const activityFeed = (
+    <>
+      <ProjectsWorkItemsLoadNotice
+        error={projectsWorkItemsQuery.error}
+        failedSections={workItemFailedSections}
+        isRetrying={
+          projectsWorkItemsQuery.isFetching && !projectsWorkItemsQuery.isLoading
+        }
+        onRetry={() => void projectsWorkItemsQuery.refetch()}
+        subject="project activity"
+      />
+      <ProjectsActivityFeed
+        isLoading={
+          repoSnapshotsQuery.isLoading || projectsWorkItemsQuery.isLoading
+        }
+        issues={projectsWorkItemsQuery.data?.issues.items ?? EMPTY_ITEMS}
+        onOpenCommit={handleOpenCommit}
+        onOpenIssue={handleOpenIssue}
+        onOpenProject={handleOpenProject}
+        onOpenPullRequest={handleOpenPullRequest}
+        profiles={profiles}
+        projects={projects}
+        pullRequests={
+          projectsWorkItemsQuery.data?.pullRequests.items ?? EMPTY_ITEMS
+        }
+        searchQuery={searchQuery}
+        snapshots={repoSnapshotsQuery.data?.snapshots}
+      />
+    </>
+  );
+
+  const contextPanelProps = {
+    canCreateTarget: editableProjects.length > 0,
+    filter,
+    issues: contextIssues,
+    onAddChannel: () => setCreateChannelOpen(true),
+    onAddRepository: () => setCreateRepositoryOpen(true),
+    onChatWithAgent: (items: ProjectSelectionItem[]) =>
+      setSelectionAgentContext(buildProjectSelectionAgentContext(items)),
+    onCreateIssue: () => setCreateIssueOpen(true),
+    onCreateProject: () => setCreateProjectOpen(true),
+    onCreatePullRequest: () => setCreatePullRequestOpen(true),
+    profiles,
+    projectReadModels,
+    projects,
+    pullRequests: contextPullRequests,
+    repositorySummaries: repositoryActivitySummariesQuery.data,
+    summaries: activitySummariesQuery.data,
+  };
+  const contextOpen = isNarrowProjectsLayout
+    ? narrowContextOpen
+    : overviewPanelOpen;
+  const overviewChatOpen =
+    selectionAgentContext !== null && !isNarrowProjectsLayout;
+  const overviewContextOpen = overviewPanelOpen && !isNarrowProjectsLayout;
+  const overviewDetached = overviewContextOpen || overviewChatOpen;
+  const chromeActions = isNarrowProjectsLayout ? (
+    <ProjectsOverviewNarrowContextToggle
+      onToggle={() => setNarrowContextOpen((open) => !open)}
+      open={contextOpen}
+      ref={contextToggleRef}
+    />
+  ) : (
+    <ProjectsOverviewChromeActions
+      chatOpen={overviewChatOpen}
+      contextOpen={overviewPanelOpen}
+      onToggleChat={() =>
+        setSelectionAgentContext((context) =>
+          context ? null : overviewAgentContext,
+        )
+      }
+      onToggleContext={() => setOverviewPanelOpen((open) => !open)}
+      sectionTitle={projectsSectionTitle(filter)}
+    />
+  );
+
   return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+    <ProjectSelectionProvider
+      onClear={() => {
+        const previous = selectionDrawerStateRef.current;
+        selectionDrawerStateRef.current = null;
+        if (!previous) return;
+        if (previous.narrow) {
+          setNarrowContextOpen(previous.open);
+        } else {
+          setOverviewPanelOpen(previous.open);
+        }
+      }}
+      onSelect={() => {
+        if (selectionDrawerStateRef.current) return;
+        selectionDrawerStateRef.current = {
+          narrow: isNarrowProjectsLayout,
+          open: isNarrowProjectsLayout ? narrowContextOpen : overviewPanelOpen,
+        };
+        if (isNarrowProjectsLayout) {
+          setNarrowContextOpen(true);
+        } else {
+          setOverviewPanelOpen(true);
+        }
+      }}
+      resetKey={filter}
+    >
       <div
         className={cn(
-          "pointer-events-none relative z-30 overflow-hidden rounded-tl-xl bg-background/80 backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55",
-          channelChrome.negativeMargin,
-          topChromeInset.divider,
+          "relative flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden",
+          !isNarrowProjectsLayout && "bg-sidebar pb-2 pr-2 pt-px",
+          !isNarrowProjectsLayout && sidebar?.open === false && "pl-2",
         )}
-        ref={projectsHeaderChromeRef}
+        data-project-context-detached={
+          isNarrowProjectsLayout ? undefined : "true"
+        }
+        data-testid="projects-overview-layout"
       >
-        <ProjectsToolbar filter={filter} onFilterChange={handleFilterChange} />
-      </div>
-
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-4 pb-4">
-        <div className="pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1rem)]">
-          {filter === "all" ? (
-            <ProjectsOverviewPanel
-              localRepositoryCount={localProjectCount}
-              onSelectSection={handleFilterChange}
-              profiles={profiles}
+        <ProjectsWorkspaceChrome
+          actions={chromeActions}
+          onGoActivity={() => handleFilterChange("all")}
+          section={projectsSectionTitle(filter)}
+        />
+        <div
+          className={cn(
+            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+            !isNarrowProjectsLayout
+              ? "ml-px rounded-2xl bg-background"
+              : cn("rounded-tl-xl", topChromeInset.divider),
+          )}
+          data-testid={
+            overviewDetached ? "projects-overview-content-pod" : undefined
+          }
+        >
+          <ProjectCreationDialog
+            onOpenChange={setCreateProjectOpen}
+            open={createProjectOpen}
+          />
+          {createPullRequestOpen ? (
+            <CreatePullRequestDialog
+              onCreated={async (
+                createdProject,
+                createdRepository,
+                pullRequestId,
+              ) => {
+                await goProject(createdProject.id, {
+                  pullRequestId,
+                  repositoryId: createdRepository.id,
+                });
+              }}
+              onOpenChange={setCreatePullRequestOpen}
+              open
               projects={projects}
-              relayName={activeWorkspace?.name || "Relay"}
-              snapshots={repoSnapshotsQuery.data}
-              snapshotsLoading={repoSnapshotsQuery.isLoading}
-              summaries={activitySummariesQuery.data}
+              reposDir={activeCommunity?.reposDir}
             />
           ) : null}
-          <section className="space-y-3">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <h3 className="text-sm font-semibold text-foreground">
-                {filter === "prs"
-                  ? "Pull requests"
-                  : filter === "issues"
-                    ? "Issues"
-                    : "Repositories"}
-              </h3>
-              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
-                <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <span className="sr-only">Sort projects</span>
-                  <select
-                    className="h-8 rounded-md border border-border/60 bg-background px-2 text-xs text-foreground outline-hidden focus:ring-1 focus:ring-ring"
-                    onChange={(event) =>
-                      handleSortChange(event.target.value as ProjectsSort)
-                    }
-                    value={sort}
-                  >
-                    <option value="updated">Recent activity</option>
-                    <option value="created">Created date</option>
-                    <option value="name">Name</option>
-                  </select>
-                </label>
-                <ProjectsViewModeToggle
-                  onViewModeChange={handleViewModeChange}
-                  viewMode={viewMode}
-                />
+          <CreateProjectIssueDialog
+            onCreated={async (createdProject, createdRepository, issueId) => {
+              await goProject(createdProject.id, {
+                issueId,
+                repositoryId: createdRepository.id,
+              });
+            }}
+            onOpenChange={setCreateIssueOpen}
+            open={createIssueOpen}
+            projects={projects}
+          />
+          <ProjectsCategoryCreateDialogs
+            channelOpen={createChannelOpen}
+            editableProjects={editableProjects}
+            onChannelOpenChange={setCreateChannelOpen}
+            onRepositoryOpenChange={setCreateRepositoryOpen}
+            ownerControlAgentPubkeyFor={ownerControlAgentPubkeyFor}
+            repositoryOpen={createRepositoryOpen}
+          />
+          <div className="flex min-h-0 min-w-0 flex-1">
+            <div className="relative min-h-0 min-w-0 flex-1">
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute right-[3px] top-0 z-50 w-1 rounded-full bg-border/80 opacity-0 transition-opacity duration-200"
+                ref={scrollIndicatorRef}
+              />
+              <div
+                className="buzz-content-scrollbar h-full min-h-0 min-w-0 overflow-x-hidden overflow-y-scroll"
+                onScroll={handleContentScroll}
+              >
+                <div className="px-4 pb-4">
+                  <div className="w-full space-y-3">
+                    <div
+                      className={cn(
+                        "sticky top-0 z-30 -mx-4 flex h-13 min-w-0 items-center gap-1.5 px-4",
+                        PROJECT_COLUMN_HEADER_BACKDROP_CLASS,
+                        overviewDetached && "rounded-t-2xl",
+                      )}
+                      data-testid="projects-page-tabs"
+                    >
+                      <ProjectsSectionSearch
+                        filter={filter}
+                        onFilterChange={handleFilterChange}
+                        onQueryChange={setSearchQuery}
+                        onSortChange={handleSortChange}
+                        sort={sort}
+                      />
+                    </div>
+                    <div
+                      className={
+                        filter === "all" ? "mx-auto w-full max-w-6xl" : "w-full"
+                      }
+                    >
+                      {filter === "all" ? (
+                        <ProjectsOverviewPanel>
+                          <ProjectsActivityIntro digest={activityDigest} />
+                          <section className="space-y-3">
+                            {activityFeed}
+                          </section>
+                        </ProjectsOverviewPanel>
+                      ) : (
+                        <>
+                          <ProjectSectionHeader
+                            className="mb-2 rounded-md bg-muted/40"
+                            icon={projectsSectionIcon(filter)}
+                            testId="projects-page-header"
+                            title={projectsSectionTitle(filter)}
+                            trailing={
+                              filter === "channels" ? undefined : listHeaderBar
+                            }
+                          />
+                          <section>
+                            <div className="space-y-3">
+                              {filter === "prs" ? (
+                                <ProjectsPullRequestsList
+                                  embedded={viewMode === "list"}
+                                  emptyMessage={
+                                    searchQuery.trim()
+                                      ? "No matching reviews"
+                                      : undefined
+                                  }
+                                  error={projectsWorkItemsQuery.error}
+                                  failedSections={
+                                    projectsWorkItemsQuery.data?.pullRequests
+                                      .failedSections ?? []
+                                  }
+                                  isLoading={projectsWorkItemsQuery.isLoading}
+                                  isRetrying={
+                                    projectsWorkItemsQuery.isFetching &&
+                                    !projectsWorkItemsQuery.isLoading
+                                  }
+                                  onOpen={handleOpenPullRequest}
+                                  onRetry={() =>
+                                    void projectsWorkItemsQuery.refetch()
+                                  }
+                                  profiles={profiles}
+                                  pullRequests={visiblePullRequests}
+                                  viewMode={viewMode}
+                                />
+                              ) : filter === "issues" ? (
+                                <ProjectsIssuesList
+                                  embedded={viewMode === "list"}
+                                  emptyMessage={
+                                    searchQuery.trim()
+                                      ? "No matching tasks"
+                                      : undefined
+                                  }
+                                  error={projectsWorkItemsQuery.error}
+                                  failedSections={
+                                    projectsWorkItemsQuery.data?.issues
+                                      .failedSections ?? []
+                                  }
+                                  isLoading={projectsWorkItemsQuery.isLoading}
+                                  isRetrying={
+                                    projectsWorkItemsQuery.isFetching &&
+                                    !projectsWorkItemsQuery.isLoading
+                                  }
+                                  issues={visibleIssues}
+                                  onOpen={handleOpenIssue}
+                                  onRetry={() =>
+                                    void projectsWorkItemsQuery.refetch()
+                                  }
+                                  profiles={profiles}
+                                  viewMode={viewMode}
+                                />
+                              ) : filter === "channels" ? (
+                                <ProjectsChannelsList
+                                  projects={projectReadModels}
+                                  searchQuery={searchQuery}
+                                />
+                              ) : filter === "projects" ? (
+                                projectItems
+                              ) : (
+                                repositoryItems
+                              )}
+                            </div>
+                          </section>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
-            {filter === "prs" ? (
-              <ProjectsPullRequestsList
-                isLoading={projectPullRequestsQuery.isLoading}
-                onOpen={handleOpenPullRequest}
-                profiles={profiles}
-                pullRequests={visiblePullRequests}
-                viewMode={viewMode}
-              />
-            ) : filter === "issues" ? (
-              <ProjectsIssuesList
-                isLoading={projectIssuesQuery.isLoading}
-                issues={visibleIssues}
-                onOpen={handleOpenIssue}
-                profiles={profiles}
-                viewMode={viewMode}
-              />
-            ) : visibleProjects.length === 0 ? (
-              <EmptyFilteredState />
-            ) : viewMode === "grid" ? (
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                {visibleProjects.map((project) => {
-                  const summary =
-                    activitySummariesQuery.data?.[project.repoAddress];
-                  return (
-                    <ProjectGridCard
-                      canDelete={isProjectOwnedByCurrentUser(
-                        project,
-                        currentPubkey,
-                      )}
-                      deleteDisabled={deleteProjectMutation.isPending}
-                      hasLocal={hasLocalCheckout(project, localRepoNames)}
-                      key={project.id}
-                      onDelete={handleDeleteProject}
-                      onOpen={handleOpenProject}
-                      onOpenTerminal={handleOpenTerminal}
-                      people={projectPeople(project, summary)}
-                      profiles={profiles}
-                      project={project}
-                      summary={summary}
-                    />
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="-mx-4 divide-y divide-border/60 border-y border-border/60 bg-card">
-                {visibleProjects.map((project) => {
-                  const summary =
-                    activitySummariesQuery.data?.[project.repoAddress];
-                  return (
-                    <ProjectListRow
-                      canDelete={isProjectOwnedByCurrentUser(
-                        project,
-                        currentPubkey,
-                      )}
-                      deleteDisabled={deleteProjectMutation.isPending}
-                      hasLocal={hasLocalCheckout(project, localRepoNames)}
-                      key={project.id}
-                      onDelete={handleDeleteProject}
-                      onOpen={handleOpenProject}
-                      onOpenTerminal={handleOpenTerminal}
-                      people={projectPeople(project, summary)}
-                      profiles={profiles}
-                      project={project}
-                      summary={summary}
-                    />
-                  );
-                })}
-              </div>
-            )}
-          </section>
+          </div>
         </div>
+        <ProjectContextRail
+          open={overviewChatOpen}
+          panelWidthPx={overviewAgentPanelWidth.widthPx}
+          resizing={overviewAgentPanelWidth.isResizing}
+          testId="projects-overview-agent-rail"
+        >
+          {selectionAgentContext ? (
+            <ProjectAgentChatPanel
+              canResetWidth={overviewAgentPanelWidth.canReset}
+              constrainToAvailableSpace={false}
+              context={selectionAgentContext}
+              detached
+              onClose={() => setSelectionAgentContext(null)}
+              onResetWidth={overviewAgentPanelWidth.onResetWidth}
+              onResizeStart={overviewAgentPanelWidth.onResizeStart}
+              widthPx={overviewAgentPanelWidth.widthPx}
+            />
+          ) : null}
+        </ProjectContextRail>
+        <ProjectContextRail
+          open={overviewContextOpen}
+          panelWidthPx={PROJECT_CONTEXT_PANEL_DEFAULT_WIDTH_PX}
+          rounded={false}
+          testId="projects-overview-context-rail"
+        >
+          <aside
+            aria-label="Project context"
+            className="relative z-30 flex h-full flex-col overflow-hidden bg-sidebar text-sidebar-foreground"
+          >
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <ProjectsOverviewContextPanel
+                {...contextPanelProps}
+                onSelectSection={(section) => {
+                  handleFilterChange(section);
+                }}
+              />
+            </div>
+          </aside>
+        </ProjectContextRail>
+        {isNarrowProjectsLayout ? (
+          <ProjectsOverviewContextSheet
+            onCloseAutoFocus={(event) => {
+              // Return focus to the chrome toggle so the keyboard journey can
+              // continue where it started.
+              event.preventDefault();
+              contextToggleRef.current?.focus();
+            }}
+            onOpenChange={setNarrowContextOpen}
+            open={narrowContextOpen}
+          >
+            <ProjectsOverviewContextPanel
+              {...contextPanelProps}
+              onSelectSection={(section) => {
+                handleFilterChange(section);
+                setNarrowContextOpen(false);
+              }}
+            />
+          </ProjectsOverviewContextSheet>
+        ) : null}
       </div>
-    </div>
+    </ProjectSelectionProvider>
   );
 }

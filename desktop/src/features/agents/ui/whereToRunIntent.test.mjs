@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyProbeResult,
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
   providerConfigComplete,
@@ -26,87 +27,33 @@ function providerDraft(overrides = {}) {
   };
 }
 
-function meshDraft(overrides = {}) {
-  return {
-    ...emptyWhereToRunDraft,
-    runOn: "mesh",
-    meshModelId: "mesh/model:Q4",
-    meshTarget: { endpointAddr: "10.0.0.1:9337", modelId: "mesh/model:Q4" },
-    meshPatch: {
-      acpCommand: "buzz-acp",
-      agentCommand: "buzz-agent",
-      agentArgs: ["acp"],
-      mcpCommand: "",
-      model: "mesh/model:Q4",
-      envVars: {},
-    },
-    ...overrides,
-  };
-}
-
-// ── Stale-intent edge (Pinky pin 2) ─────────────────────────────────────────
-
-test("start toggle off discards a provider selection at submit", () => {
-  assert.equal(
-    resolveBackendIntent(providerDraft(), false),
-    null,
-    "definition-only create must never carry a backend intent",
-  );
-});
-
-test("start toggle off discards a mesh selection at submit", () => {
-  assert.equal(resolveBackendIntent(meshDraft(), false), null);
-});
-
-test("start toggle off always allows submit regardless of draft state", () => {
-  // Incomplete provider config with the toggle off: no instance is minted,
-  // so the draft must not block the definition-only create.
-  const incomplete = providerDraft({ providerConfig: {} });
-  assert.equal(canSubmitWhereToRun(incomplete, false), true);
-});
-
-// ── Submit gating carries over (Pinky pin 3) ────────────────────────────────
-
 test("provider selection blocks submit until the probe completes", () => {
-  const unprobed = providerDraft({ probedProvider: null });
-  assert.equal(canSubmitWhereToRun(unprobed, true), false);
+  assert.equal(
+    canSubmitWhereToRun(providerDraft({ probedProvider: null })),
+    false,
+  );
 });
 
 test("provider selection blocks submit while required config is missing", () => {
   const missing = providerDraft({ providerConfig: { size: "3" } });
-  assert.equal(canSubmitWhereToRun(missing, true), false);
+  assert.equal(canSubmitWhereToRun(missing), false);
   assert.equal(providerConfigComplete(missing), false);
 });
 
 test("complete provider config allows submit", () => {
-  assert.equal(canSubmitWhereToRun(providerDraft(), true), true);
-});
-
-test("mesh selection blocks submit without a concrete serve target", () => {
-  assert.equal(
-    canSubmitWhereToRun(meshDraft({ meshTarget: null }), true),
-    false,
-    "a model name alone is not a startable mesh selection",
-  );
-  assert.equal(
-    canSubmitWhereToRun(meshDraft({ meshModelId: "" }), true),
-    false,
-  );
-  assert.equal(canSubmitWhereToRun(meshDraft(), true), true);
+  assert.equal(canSubmitWhereToRun(providerDraft()), true);
 });
 
 test("local never gates submit", () => {
-  assert.equal(canSubmitWhereToRun(emptyWhereToRunDraft, true), true);
+  assert.equal(canSubmitWhereToRun(emptyWhereToRunDraft), true);
 });
 
-// ── Intent resolution ────────────────────────────────────────────────────────
-
 test("local draft resolves to null intent", () => {
-  assert.equal(resolveBackendIntent(emptyWhereToRunDraft, true), null);
+  assert.equal(resolveBackendIntent(emptyWhereToRunDraft), null);
 });
 
 test("provider draft resolves with coerced config values", () => {
-  const intent = resolveBackendIntent(providerDraft(), true);
+  const intent = resolveBackendIntent(providerDraft());
   assert.deepEqual(intent, {
     type: "provider",
     id: "blox",
@@ -114,21 +61,71 @@ test("provider draft resolves with coerced config values", () => {
   });
 });
 
-test("mesh draft resolves with target and patch", () => {
-  const intent = resolveBackendIntent(meshDraft(), true);
-  assert.equal(intent.type, "mesh");
-  assert.equal(intent.modelId, "mesh/model:Q4");
-  assert.equal(intent.target.endpointAddr, "10.0.0.1:9337");
-  assert.equal(intent.patch.agentCommand, "buzz-agent");
+// ── applyProbeResult: probe resolution must merge, not overwrite ─────────────
+//
+// Pins the seam that fixed the "Typewriter Eraser" (agent-create dialog's
+// provider config fields losing keystrokes): a probe resolution prefills
+// schema defaults *beneath* the user's in-flight config, never over it. The
+// effect in WhereToRunSection keys probing on the provider's binary path, so
+// the only probe writes that reach providerConfig are the ones pinned here.
+
+const probeWithDefaults = {
+  ok: true,
+  config_schema: {
+    properties: {
+      context: { type: "string", title: "Kubeconfig context" },
+      namespace: { type: "string", default: "buzz-agents-x1y2z3" },
+      inactivity_seconds: { type: "number", default: 1800 },
+    },
+    required: ["namespace"],
+  },
+};
+
+const unprobedDraft = {
+  ...emptyWhereToRunDraft,
+  runOn: "kubernetes",
+};
+
+test("probe resolution prefills schema defaults on a fresh draft", () => {
+  const next = applyProbeResult(unprobedDraft, probeWithDefaults);
+  assert.equal(next.probedProvider, probeWithDefaults);
+  assert.deepEqual(next.providerConfig, {
+    namespace: "buzz-agents-x1y2z3",
+    inactivity_seconds: "1800",
+  });
 });
 
-test("mesh draft without patch or target resolves to null, not a broken intent", () => {
+test("probe resolution keeps user-typed values over schema defaults", () => {
+  const typed = {
+    ...unprobedDraft,
+    providerConfig: { context: "prod-us-west", namespace: "my-ns" },
+  };
+  const next = applyProbeResult(typed, probeWithDefaults);
+  assert.deepEqual(next.providerConfig, {
+    context: "prod-us-west",
+    namespace: "my-ns",
+    inactivity_seconds: "1800",
+  });
+});
+
+test("probe resolution keeps a user-cleared field cleared", () => {
+  // "" is a deliberate user state — coerceConfigValues drops empty numerics
+  // and required-gating treats "" as incomplete; the probe must not undo it.
+  const cleared = { ...unprobedDraft, providerConfig: { namespace: "" } };
+  const next = applyProbeResult(cleared, probeWithDefaults);
+  assert.equal(next.providerConfig.namespace, "");
+});
+
+test("a schema-less probe result records the probe without touching config", () => {
+  const typed = { ...unprobedDraft, providerConfig: { context: "abc" } };
+  const next = applyProbeResult(typed, { ok: true });
+  assert.deepEqual(next.providerConfig, { context: "abc" });
+  assert.deepEqual(next.probedProvider, { ok: true });
+});
+
+test("probe resolution preserves unrelated draft fields", () => {
   assert.equal(
-    resolveBackendIntent(meshDraft({ meshPatch: null }), true),
-    null,
-  );
-  assert.equal(
-    resolveBackendIntent(meshDraft({ meshTarget: null }), true),
-    null,
+    applyProbeResult(unprobedDraft, probeWithDefaults).runOn,
+    "kubernetes",
   );
 });

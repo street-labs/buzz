@@ -1,18 +1,154 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { formatTimelineMessages } from "../../messages/lib/formatTimelineMessages.ts";
+import { getConfigNudgeAuthorPubkey } from "../../messages/ui/configNudgeAuthPubkey.ts";
 import {
+  filterInboxItems,
   getContextMessageDepth,
   getReactionTargetId,
+  hasInboxThreadContext,
   isInboxThreadContextEvent,
+  matchesInboxAllView,
   matchesInboxFilter,
+  toInboxContextMessage,
+  toTimelineMessage,
 } from "./inboxViewHelpers.ts";
+
+test("Inbox uses the dedicated reminder list instead of feed reminder rows", () => {
+  const message = { item: { kind: 9 } };
+  const reminder = { item: { kind: 40007 } };
+  const items = [message, reminder];
+
+  assert.deepEqual(filterInboxItems(items), [message]);
+});
+
+test("hasInboxThreadContext finds replies in the grouped row or loaded context", () => {
+  const root = { tags: [["h", "channel"]] };
+  const reply = {
+    tags: [
+      ["h", "channel"],
+      ["e", "root", "", "reply"],
+    ],
+  };
+
+  assert.equal(
+    hasInboxThreadContext({ item: root, groupItems: [root, reply] }),
+    true,
+  );
+  assert.equal(
+    hasInboxThreadContext({ item: root, groupItems: [root] }, [reply]),
+    true,
+  );
+});
+
+test("hasInboxThreadContext keeps standalone and broadcast activity unthreaded", () => {
+  const root = { tags: [["h", "channel"]] };
+  const broadcastReply = {
+    tags: [
+      ["h", "channel"],
+      ["e", "root", "", "reply"],
+      ["broadcast", "1"],
+    ],
+  };
+
+  assert.equal(
+    hasInboxThreadContext({ item: root, groupItems: [root] }),
+    false,
+  );
+  assert.equal(
+    hasInboxThreadContext({
+      item: broadcastReply,
+      groupItems: [broadcastReply],
+    }),
+    false,
+  );
+});
 
 // --- matchesInboxFilter ---
 
 test("matchesInboxFilter returns true for the 'all' filter regardless of categories", () => {
   assert.equal(matchesInboxFilter({ categories: [] }, "all"), true);
   assert.equal(matchesInboxFilter({ categories: ["mentions"] }, "all"), true);
+});
+
+test("Inbox All excludes generic top-level channel traffic", () => {
+  const owned = new Set(["owned-agent"]);
+  assert.equal(
+    matchesInboxAllView(
+      {
+        categories: ["activity"],
+        item: {
+          channelType: "stream",
+          pubkey: "human",
+          tags: [["h", "channel"]],
+        },
+      },
+      owned,
+    ),
+    false,
+  );
+});
+
+test("Inbox All includes each personally relevant message source", () => {
+  const owned = new Set(["owned-agent"]);
+  const cases = [
+    {
+      categories: ["activity"],
+      item: { channelType: "dm", pubkey: "human", tags: [] },
+    },
+    {
+      categories: ["mention"],
+      item: { channelType: "stream", pubkey: "human", tags: [] },
+    },
+    {
+      categories: ["needs_action"],
+      item: { channelType: "stream", pubkey: "human", tags: [] },
+    },
+    {
+      categories: ["activity"],
+      item: {
+        channelType: "stream",
+        pubkey: "human",
+        tags: [["e", "root", "", "reply"]],
+      },
+    },
+    {
+      categories: ["activity"],
+      item: { channelType: "stream", pubkey: "OWNED-AGENT", tags: [] },
+    },
+    {
+      categories: ["activity"],
+      item: {
+        channelType: null,
+        id: "project-pull-request",
+        kind: 1618,
+        pubkey: "human",
+        tags: [["a", `30617:${"a".repeat(64)}:buzz`]],
+      },
+    },
+  ];
+
+  for (const item of cases) {
+    assert.equal(matchesInboxAllView(item, owned), true);
+  }
+});
+
+test("Inbox All excludes generic updates from agents the user does not own", () => {
+  assert.equal(
+    matchesInboxAllView(
+      {
+        categories: ["agent_activity"],
+        item: {
+          channelType: "stream",
+          pubkey: "somebody-elses-agent",
+          tags: [],
+        },
+      },
+      new Set(["owned-agent"]),
+    ),
+    false,
+  );
 });
 
 test("matchesInboxFilter matches when the category is present", () => {
@@ -28,6 +164,32 @@ test("matchesInboxFilter is false when the category is absent", () => {
     false,
   );
   assert.equal(matchesInboxFilter({ categories: [] }, "mentions"), false);
+});
+
+test("owned-agent filtering uses the representative event author", () => {
+  const owned = new Set(["owned-agent"]);
+  assert.equal(
+    matchesInboxFilter(
+      {
+        categories: ["activity"],
+        item: { pubkey: "OWNED-AGENT" },
+      },
+      "agent_activity",
+      owned,
+    ),
+    true,
+  );
+  assert.equal(
+    matchesInboxFilter(
+      {
+        categories: ["agent_activity"],
+        item: { pubkey: "somebody-elses-agent" },
+      },
+      "agent_activity",
+      owned,
+    ),
+    false,
+  );
 });
 
 test("matchesInboxFilter matches thread rows by thread tags", () => {
@@ -254,5 +416,94 @@ test("isInboxThreadContextEvent keeps selected thread root, parent, selected eve
       selection,
     ),
     true,
+  );
+});
+
+// --- config-nudge pipeline: toInboxContextMessage → toTimelineMessage ---
+//
+// The inbox detail pane renders messages through two mappings that a real
+// event's `kind` and `signerPubkey` must survive: HomeView's
+// toInboxContextMessage and InboxMessageRow's toTimelineMessage. An earlier
+// version of the HomeView mapping dropped both fields, structurally
+// disabling the config-nudge card on the inbox surface (the raw
+// ```buzz:config-nudge fence rendered instead). These tests run a real event
+// through formatTimelineMessages and both mappings, then assert against the
+// same gate helper InboxMessageRow calls.
+
+const NUDGE_CHANNEL_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const NUDGE_AGENT_SIGNER =
+  "2222222222222222222222222222222222222222222222222222222222222222";
+const NUDGE_HUMAN_SIGNER =
+  "1111111111111111111111111111111111111111111111111111111111111111";
+
+function makeNudgeEvent(overrides = {}) {
+  return {
+    id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    pubkey: NUDGE_AGENT_SIGNER,
+    kind: 9,
+    created_at: 1_700_000_000,
+    content: "**Fizz** needs configuration.\n\n```buzz:config-nudge\n{}\n```",
+    tags: [["h", NUDGE_CHANNEL_ID]],
+    sig: "sig",
+    ...overrides,
+  };
+}
+
+function mapThroughInboxPipeline(event) {
+  const [formatted] = formatTimelineMessages([event], null, undefined, null);
+  const contextMessage = toInboxContextMessage(formatted, {
+    eventById: new Map([[event.id, event]]),
+    fallbackAuthorPubkey: event.pubkey,
+    profiles: undefined,
+    selectedItemId: event.id,
+  });
+  return toTimelineMessage(contextMessage);
+}
+
+test("inbox mappings preserve kind and signerPubkey so the nudge gate can pass", () => {
+  const message = mapThroughInboxPipeline(makeNudgeEvent());
+
+  assert.equal(message.kind, 9);
+  assert.equal(message.signerPubkey, NUDGE_AGENT_SIGNER);
+  assert.equal(message.createdAt, 1_700_000_000);
+  assert.equal(
+    getConfigNudgeAuthorPubkey(
+      message,
+      (pubkey) => pubkey === NUDGE_AGENT_SIGNER,
+    ),
+    NUDGE_AGENT_SIGNER,
+  );
+});
+
+test("inbox mappings ignore a spoofed actor tag", () => {
+  const message = mapThroughInboxPipeline(
+    makeNudgeEvent({
+      pubkey: NUDGE_HUMAN_SIGNER,
+      tags: [
+        ["h", NUDGE_CHANNEL_ID],
+        ["actor", NUDGE_AGENT_SIGNER],
+      ],
+    }),
+  );
+
+  // An untrusted actor tag cannot replace the display author. The signer also
+  // stays human, so the config-nudge gate rejects the message.
+  assert.equal(message.pubkey?.toLowerCase(), NUDGE_HUMAN_SIGNER);
+  assert.equal(message.signerPubkey, NUDGE_HUMAN_SIGNER);
+  assert.equal(
+    getConfigNudgeAuthorPubkey(
+      message,
+      (pubkey) => pubkey === NUDGE_AGENT_SIGNER,
+    ),
+    undefined,
+  );
+});
+
+test("inbox mappings: unknown signer never enables the card", () => {
+  const message = mapThroughInboxPipeline(makeNudgeEvent());
+
+  assert.equal(
+    getConfigNudgeAuthorPubkey(message, () => false),
+    undefined,
   );
 });

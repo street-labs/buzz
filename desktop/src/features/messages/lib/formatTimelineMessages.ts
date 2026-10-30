@@ -14,6 +14,7 @@ import {
   isBroadcastReply,
 } from "@/features/messages/lib/threading";
 import {
+  formatOwnerLabel,
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
@@ -37,11 +38,14 @@ import {
 } from "@/shared/constants/kinds";
 import { resolveEventAuthorPubkey } from "@/shared/lib/authors";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { channelRoleMap } from "@/shared/lib/rosterDerivations";
+
+const EMPTY_ROLE_MAP: ReadonlyMap<string, string> = new Map();
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 // Pure overlay helper lives in a sibling .mjs so node:test (no TS loader)
 // can exercise the exact same source the renderer uses.
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub } from "@/shared/lib/pubkey";
 
 const HEX_RE = /^[0-9a-f]+$/i;
 
@@ -135,11 +139,12 @@ function formatMessageAuthor(
   channel: Channel | null,
   currentPubkey: string | undefined,
   profiles: UserProfileLookup | undefined,
+  relaySelfPubkey: string | null | undefined,
 ) {
   const authorPubkey = resolveEventAuthorPubkey({
-    pubkey: event.pubkey,
-    tags: event.tags,
+    event,
     preferActorTag: true,
+    relaySelfPubkey,
     requireChannelTagForPTags: true,
   });
   const fallbackName =
@@ -179,6 +184,36 @@ function getAuthorAvatarUrl(input: {
   return profiles?.[authorPubkey.toLowerCase()]?.avatarUrl ?? null;
 }
 
+export function hasLinkPreviewSuppression(
+  tags: string[][] | undefined,
+): boolean {
+  return (
+    tags?.some(
+      (tag) =>
+        tag[0] === "link-preview" && tag[1] === "none" && tag.length === 2,
+    ) ?? false
+  );
+}
+
+function isAuthorizedMessageEdit(
+  edit: RelayEvent,
+  target: RelayEvent,
+  profiles: UserProfileLookup | undefined,
+  relaySelfPubkey?: string | null,
+): boolean {
+  const author = normalizePubkey(
+    resolveEventAuthorPubkey({
+      event: target,
+      preferActorTag: true,
+      relaySelfPubkey,
+      requireChannelTagForPTags: true,
+    }),
+  );
+  const signer = normalizePubkey(edit.pubkey);
+  if (signer === author) return true;
+  return normalizePubkey(profiles?.[author]?.ownerPubkey ?? "") === signer;
+}
+
 export function formatTimelineMessages(
   events: RelayEvent[],
   channel: Channel | null,
@@ -190,14 +225,15 @@ export function formatTimelineMessages(
   personaLookup?: Map<string, string>,
   /** Map from lowercase pubkey → respond-to mode for bot messages. */
   respondToLookup?: Map<string, RespondToMode>,
+  /** Active relay identity from NIP-11 `self`; absent or malformed fails closed to the signer. */
+  relaySelfPubkey?: string | null,
+  /** Profiles for verified agent owners, fetched in one batch by the surface. */
+  ownerProfiles?: UserProfileLookup,
 ): TimelineMessage[] {
   const currentPubkeyLower = currentPubkey?.toLowerCase();
-  const roleByPubkey = new Map<string, string>();
-  if (members) {
-    for (const member of members) {
-      roleByPubkey.set(member.pubkey.toLowerCase(), member.role);
-    }
-  }
+  // Identity-cached: rosters can be 10k+ members and this formatter re-runs
+  // on every live message; the map is computed once per distinct roster.
+  const roleByPubkey = members ? channelRoleMap(members) : EMPTY_ROLE_MAP;
   const deletedEventIds = new Set<string>();
   for (const event of events) {
     // Both kind:5 and kind:9005 are deletion markers; mirror the relay.
@@ -213,8 +249,14 @@ export function formatTimelineMessages(
     }
   }
 
-  // Build a map of latest edit per original message: targetId → { content, tags, createdAt }.
-  // When multiple edits exist for the same message, the most recent one wins.
+  const timelineEventsById = new Map(
+    events.filter(isTimelineContentEvent).map((event) => [event.id, event]),
+  );
+  const previewSuppressedTargetIds = new Set<string>();
+
+  // Build a map of latest authorized edit per original message. Preview
+  // suppression is monotonic: any authorized edit carrying the marker wins
+  // forever, independent of which edit supplies the latest body.
   // The edit's own tags are kept so the renderer can overlay imeta tags
   // (attachments) from the edit onto the original event — non-imeta tags on
   // the original (`h`, `p` mentions, etc.) stay untouched.
@@ -233,6 +275,16 @@ export function formatTimelineMessages(
     const targetId = getReactionTargetId(event.tags);
     if (!targetId || deletedEventIds.has(targetId)) {
       continue;
+    }
+    const target = timelineEventsById.get(targetId);
+    if (
+      !target ||
+      !isAuthorizedMessageEdit(event, target, profiles, relaySelfPubkey)
+    ) {
+      continue;
+    }
+    if (hasLinkPreviewSuppression(event.tags)) {
+      previewSuppressedTargetIds.add(targetId);
     }
 
     const existing = editsByTargetId.get(targetId);
@@ -271,9 +323,9 @@ export function formatTimelineMessages(
     }
 
     const actorPubkey = resolveEventAuthorPubkey({
-      pubkey: event.pubkey,
-      tags: event.tags,
+      event,
       preferActorTag: true,
+      relaySelfPubkey,
       requireChannelTagForPTags: true,
     }).toLowerCase();
     const emoji = event.content.trim() || "+";
@@ -335,7 +387,7 @@ export function formatTimelineMessages(
         ? "You"
         : profile?.displayName?.trim() ||
           profile?.nip05Handle?.trim() ||
-          truncatePubkey(actorPubkey);
+          truncateNpub(actorPubkey);
     existing.users.push({
       pubkey: actorPubkey,
       displayName,
@@ -358,12 +410,18 @@ export function formatTimelineMessages(
     }
 
     const authorPubkey = resolveEventAuthorPubkey({
-      pubkey: event.pubkey,
-      tags: event.tags,
+      event,
       preferActorTag: true,
+      relaySelfPubkey,
       requireChannelTagForPTags: true,
     });
-    const author = formatMessageAuthor(event, channel, currentPubkey, profiles);
+    const author = formatMessageAuthor(
+      event,
+      channel,
+      currentPubkey,
+      profiles,
+      relaySelfPubkey,
+    );
 
     authorPubkeyByEventId.set(event.id, authorPubkey);
     authorLabelByEventId.set(event.id, author);
@@ -406,14 +464,17 @@ export function formatTimelineMessages(
     const authorPubkey =
       authorPubkeyByEventId.get(event.id) ??
       resolveEventAuthorPubkey({
-        pubkey: event.pubkey,
-        tags: event.tags,
+        event,
         preferActorTag: true,
+        relaySelfPubkey,
         requireChannelTagForPTags: true,
       });
     const thread = getThreadReference(event.tags);
     const edit = editsByTargetId.get(event.id);
     const role = roleByPubkey.get(authorPubkey.toLowerCase());
+    const authorProfile = profiles?.[authorPubkey.toLowerCase()];
+    const isAgent = role === "bot" || authorProfile?.isAgent === true;
+    const ownerPubkey = isAgent ? (authorProfile?.ownerPubkey ?? null) : null;
     return {
       id: event.id,
       renderKey: event.localKey ?? event.id,
@@ -421,6 +482,11 @@ export function formatTimelineMessages(
       pubkey: authorPubkey,
       signerPubkey: normalizePubkey(event.pubkey),
       author,
+      isAgent,
+      ownerPubkey,
+      ownerLabel: isAgent
+        ? formatOwnerLabel(ownerPubkey, currentPubkey, ownerProfiles)
+        : null,
       avatarUrl: getAuthorAvatarUrl({
         authorPubkey,
         currentPubkey,
@@ -449,7 +515,18 @@ export function formatTimelineMessages(
       // imeta tags. All non-imeta tags on the original are preserved.
       // Logic lives in `applyEditTagOverlay.mjs` so prod and tests share
       // a single source.
-      tags: applyEditTagOverlay(event.tags, edit?.tags),
+      tags: (() => {
+        const effectiveTags = applyEditTagOverlay(event.tags, edit?.tags);
+        if (
+          hasLinkPreviewSuppression(event.tags) ||
+          previewSuppressedTargetIds.has(event.id)
+        ) {
+          return hasLinkPreviewSuppression(effectiveTags)
+            ? effectiveTags
+            : [...effectiveTags, ["link-preview", "none"]];
+        }
+        return effectiveTags;
+      })(),
       reactions: (() => {
         const reactions = reactionsByEventId.get(event.id);
         if (!reactions) return undefined;
@@ -487,7 +564,10 @@ function extractSystemMessagePubkeys(event: RelayEvent): string[] {
   }
 }
 
-export function collectReactionActorPubkeys(events: RelayEvent[]) {
+export function collectReactionActorPubkeys(
+  events: RelayEvent[],
+  relaySelfPubkey?: string | null,
+) {
   const deletedEventIds = new Set<string>();
   for (const event of events) {
     if (
@@ -511,9 +591,9 @@ export function collectReactionActorPubkeys(events: RelayEvent[]) {
     }
     pubkeys.add(
       resolveEventAuthorPubkey({
-        pubkey: event.pubkey,
-        tags: event.tags,
+        event,
         preferActorTag: true,
+        relaySelfPubkey,
         requireChannelTagForPTags: true,
       }).toLowerCase(),
     );
@@ -521,7 +601,10 @@ export function collectReactionActorPubkeys(events: RelayEvent[]) {
   return [...pubkeys];
 }
 
-export function collectMessageAuthorPubkeys(events: RelayEvent[]) {
+export function collectMessageAuthorPubkeys(
+  events: RelayEvent[],
+  relaySelfPubkey?: string | null,
+) {
   const pubkeys = new Set<string>();
 
   for (const event of events) {
@@ -534,11 +617,12 @@ export function collectMessageAuthorPubkeys(events: RelayEvent[]) {
         pubkeys.add(pk);
       }
     } else {
+      pubkeys.add(event.pubkey.toLowerCase());
       pubkeys.add(
         resolveEventAuthorPubkey({
-          pubkey: event.pubkey,
-          tags: event.tags,
+          event,
           preferActorTag: true,
+          relaySelfPubkey,
           requireChannelTagForPTags: true,
         }).toLowerCase(),
       );
@@ -563,4 +647,16 @@ export function collectMessageMentionPubkeys(
   }
 
   return [...pubkeys];
+}
+
+/** Every pubkey a channel surface needs profiles for: authors (signer +
+ *  attributed actor), mentions, and reaction actors, deduplicated. */
+export function collectMessageProfilePubkeys(events: RelayEvent[]) {
+  return [
+    ...new Set([
+      ...collectMessageAuthorPubkeys(events),
+      ...collectMessageMentionPubkeys(events),
+      ...collectReactionActorPubkeys(events),
+    ]),
+  ];
 }

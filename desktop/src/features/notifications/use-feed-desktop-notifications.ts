@@ -1,18 +1,18 @@
 import * as React from "react";
 
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub } from "@/shared/lib/pubkey";
 import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { getThreadReference } from "@/features/messages/lib/threading";
 import type { FeedItem, HomeFeedResponse } from "@/shared/api/types";
 import {
   collectHomeAlertItems,
   eligibleFeedNotificationItems,
-  notificationBody,
-  notificationTitle,
+  formatFeedNotification,
+  type NotificationChannel,
 } from "./lib/feed";
+import { buildFeedItemNotificationTarget } from "./lib/target";
 import {
   getDesktopNotificationPermissionState,
   requestDesktopNotificationAccess,
@@ -21,6 +21,7 @@ import {
 import {
   playNotificationSound,
   resolveSlotSound,
+  shouldPlayNotificationSound,
   slotForFeedKind,
 } from "./lib/sound";
 import type { NotificationSettings } from "./hooks";
@@ -72,8 +73,11 @@ export function useFeedDesktopNotifications(
   pubkey: string | undefined,
   settings: NotificationSettings,
   setDesktopEnabled: (enabled: boolean) => Promise<boolean>,
+  enabled: boolean,
   profiles?: UserProfileLookup,
   mutedChannelIds?: ReadonlySet<string>,
+  channels: readonly NotificationChannel[] = [],
+  silentChannelIds?: ReadonlySet<string>,
 ) {
   const normalizedPubkey = pubkey?.trim().toLowerCase() ?? "";
   const seenItemIdsRef = React.useRef<Set<string>>(
@@ -107,23 +111,17 @@ export function useFeedDesktopNotifications(
 
   const deliverFeedNotification = React.useEffectEvent(
     async (item: FeedItem, senderName?: string) => {
-      const threadRootId = getThreadReference(item.tags).rootId ?? null;
+      const { title, body } = formatFeedNotification(item, senderName);
       const didSend = await sendDesktopNotification({
-        body: notificationBody(item),
-        target: {
-          channelId: item.channelId,
-          channelName: item.channelName,
-          content: item.content,
-          createdAt: item.createdAt,
-          eventId: item.id,
-          kind: item.kind,
-          pubkey: item.pubkey,
-          threadRootId,
-        },
-        title: notificationTitle(item, senderName),
+        body,
+        target: buildFeedItemNotificationTarget(item),
+        title,
       });
 
-      if (didSend) {
+      if (
+        didSend &&
+        shouldPlayNotificationSound(item.channelId, silentChannelIds)
+      ) {
         const slot = slotForFeedKind(item.kind, item.category);
         playNotificationSound(resolveSlotSound(settings, slot));
       }
@@ -131,7 +129,7 @@ export function useFeedDesktopNotifications(
   );
 
   React.useEffect(() => {
-    if (!feed) {
+    if (!enabled || !feed) {
       return;
     }
 
@@ -157,10 +155,14 @@ export function useFeedDesktopNotifications(
 
     const nextSeenItemIds = new Set(seenItemIdsRef.current);
     const newItems = settings.desktopEnabled
-      ? eligibleFeedNotificationItems(feed, {
-          mentions: settings.slotAlertsEnabled.mention,
-          needsAction: settings.slotAlertsEnabled.needs_action,
-        })
+      ? eligibleFeedNotificationItems(
+          feed,
+          {
+            mentions: settings.slotAlertsEnabled.mention,
+            needsAction: settings.slotAlertsEnabled.needs_action,
+          },
+          channels,
+        )
           .filter((item) => !nextSeenItemIds.has(item.id))
           .filter(
             (item) =>
@@ -202,13 +204,15 @@ export function useFeedDesktopNotifications(
         : undefined;
       // Only use real display names, not truncated pubkey fallbacks.
       const senderName =
-        resolvedLabel && resolvedLabel !== truncatePubkey(item.pubkey)
+        resolvedLabel && resolvedLabel !== truncateNpub(item.pubkey)
           ? resolvedLabel
           : undefined;
       void deliverFeedNotification(item, senderName);
     }
   }, [
+    enabled,
     feed,
+    channels,
     mutedChannelIds,
     normalizedPubkey,
     profiles,

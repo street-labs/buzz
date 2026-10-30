@@ -4,27 +4,31 @@ use super::{
     validate_persona_deletion, BUILT_IN_PERSONAS, RETIRED_PERSONAS,
 };
 use crate::managed_agents::discovery::{default_agent_command, effective_agent_command};
-use crate::managed_agents::validate_team_id;
-use crate::managed_agents::PersonaRecord;
+use crate::managed_agents::AgentDefinition;
 
-fn custom_persona(id: &str, display_name: &str) -> PersonaRecord {
-    PersonaRecord {
+fn custom_persona(id: &str, display_name: &str) -> AgentDefinition {
+    AgentDefinition {
+        session_policy: Default::default(),
+        description: None,
         id: id.to_string(),
         display_name: display_name.to_string(),
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         system_prompt: "Custom prompt".to_string(),
+        acp_command: None,
         runtime: None,
         model: None,
         provider: None,
         name_pool: Vec::new(),
         is_builtin: false,
         is_active: true,
+        shared: false,
         source_team: None,
         source_team_persona_slug: None,
+        catalog_source: None,
+        team_catalog_source: None,
         env_vars: std::collections::BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
-        mcp_toolsets: None,
         parallelism: None,
         created_at: "2026-03-19T00:00:00Z".to_string(),
         updated_at: "2026-03-19T00:00:00Z".to_string(),
@@ -41,31 +45,20 @@ fn merge_personas_adds_missing_built_ins() {
     assert!(records
         .iter()
         .any(|record| record.id == "builtin:fizz" && record.runtime.is_none()));
-    assert!(records
-        .iter()
-        .any(|record| record.id == "builtin:product-strategist" && !record.is_active));
     let display_names: Vec<&str> = records
         .iter()
         .map(|record| record.display_name.as_str())
         .collect();
-    assert_eq!(
-        display_names,
-        vec![
-            "Fizz",
-            "Product Strategist",
-            "Implementation Partner",
-            "QA Reviewer",
-            "Work Coordinator",
-            "Support Guide",
-            "Experiment Designer"
-        ]
-    );
+    assert_eq!(display_names, vec!["Fizz", "Honey", "Pollen"]);
     let active_ids: Vec<&str> = records
         .iter()
         .filter(|record| record.is_active)
         .map(|record| record.id.as_str())
         .collect();
-    assert_eq!(active_ids, vec!["builtin:fizz"]);
+    assert_eq!(
+        active_ids,
+        vec!["builtin:fizz", "builtin:honey", "builtin:bumble"]
+    );
 }
 
 #[test]
@@ -78,12 +71,33 @@ fn merge_personas_preserves_custom_records() {
 }
 
 #[test]
-fn merge_personas_restores_builtin_defaults() {
+fn merge_personas_preserves_builtin_edits() {
     let mut edited_builtin = custom_persona("builtin:fizz", "My Fizz");
     edited_builtin.is_builtin = true;
     edited_builtin.is_active = true;
-    let original_created_at = edited_builtin.created_at.clone();
-    let original_updated_at = edited_builtin.updated_at.clone();
+    edited_builtin.system_prompt = "User-edited instructions".to_string();
+    edited_builtin.name_pool = vec!["User-edited name".to_string()];
+    edited_builtin.env_vars =
+        std::collections::BTreeMap::from([("USER_SETTING".to_string(), "value".to_string())]);
+
+    let (records, changed) = merge_personas(vec![edited_builtin.clone()], "2026-03-19T00:00:00Z");
+
+    assert!(changed); // The remaining seeded built-ins are added.
+    let fizz = records
+        .iter()
+        .find(|record| record.id == "builtin:fizz")
+        .expect("fizz built-in should exist");
+    assert_eq!(fizz.display_name, edited_builtin.display_name);
+    assert_eq!(fizz.system_prompt, edited_builtin.system_prompt);
+    assert_eq!(fizz.name_pool, edited_builtin.name_pool);
+    assert_eq!(fizz.env_vars, edited_builtin.env_vars);
+    assert_eq!(fizz.is_active, edited_builtin.is_active);
+}
+
+#[test]
+fn merge_personas_restores_builtin_marker_without_resetting_edits() {
+    let mut edited_builtin = custom_persona("builtin:fizz", "My Fizz");
+    edited_builtin.is_builtin = false;
 
     let (records, changed) = merge_personas(vec![edited_builtin], "2026-03-19T00:00:00Z");
 
@@ -92,71 +106,8 @@ fn merge_personas_restores_builtin_defaults() {
         .iter()
         .find(|record| record.id == "builtin:fizz")
         .expect("fizz built-in should exist");
-    let canonical = BUILT_IN_PERSONAS
-        .iter()
-        .find(|persona| persona.id == "builtin:fizz")
-        .expect("fizz built-in definition should exist");
-    assert_eq!(fizz.display_name, canonical.display_name);
-    assert_eq!(fizz.avatar_url.as_deref(), canonical.avatar_url,);
-    assert_eq!(fizz.created_at, original_created_at);
-    assert_eq!(fizz.updated_at, original_updated_at);
-    assert!(fizz.is_active);
-}
-
-#[test]
-fn merge_personas_restores_builtin_env_vars() {
-    // A hand-edited built-in record with stray env vars should be reset to
-    // the canonical (empty) env on merge. Built-ins are intended immutable —
-    // if a user wants per-persona credentials, they create or duplicate to a
-    // custom persona.
-    let mut tampered = custom_persona("builtin:fizz", "Fizz");
-    tampered.is_builtin = true;
-    tampered.avatar_url = None;
-    tampered.is_active = true;
-    tampered.env_vars =
-        std::collections::BTreeMap::from([("ANTHROPIC_API_KEY".to_string(), "leaked".to_string())]);
-
-    let (records, changed) = merge_personas(vec![tampered], "2026-03-19T00:00:00Z");
-
-    assert!(changed);
-    let fizz = records
-        .iter()
-        .find(|record| record.id == "builtin:fizz")
-        .expect("fizz built-in should exist");
-    // Built-in persona definitions have no `env_vars` field — they are
-    // always empty. The merge reset should clear the tampered key entirely.
-    assert!(
-        fizz.env_vars.is_empty(),
-        "expected empty, got {:?}",
-        fizz.env_vars
-    );
-}
-
-#[test]
-fn merge_personas_restores_builtin_name_pool_and_preserves_is_active() {
-    let mut fizz = custom_persona("builtin:fizz", "Fizz");
-    fizz.is_builtin = true;
-    fizz.avatar_url = None;
-    fizz.is_active = true;
-    fizz.name_pool = vec!["Definitely Not Fizz".to_string()];
-
-    let (records, changed) = merge_personas(vec![fizz], "2026-03-19T00:00:00Z");
-
-    assert!(changed);
-    let fizz = records
-        .iter()
-        .find(|record| record.id == "builtin:fizz")
-        .expect("fizz built-in should exist");
-    let expected_name_pool = BUILT_IN_PERSONAS
-        .iter()
-        .find(|persona| persona.id == "builtin:fizz")
-        .expect("fizz built-in definition should exist")
-        .name_pool
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(fizz.name_pool, expected_name_pool);
-    assert!(fizz.is_active);
+    assert!(fizz.is_builtin);
+    assert_eq!(fizz.display_name, "My Fizz");
 }
 
 #[test]
@@ -226,10 +177,7 @@ fn ensure_persona_is_active_rejects_inactive_personas() {
 
     let err = ensure_persona_is_active(&[persona], "builtin:fizz").unwrap_err();
 
-    assert_eq!(
-        err,
-        "Fizz is not in My Agents. Choose it from Agent Catalog first."
-    );
+    assert_eq!(err, "Fizz is not in My Agents.");
 }
 
 #[test]
@@ -322,61 +270,6 @@ fn validate_persona_deletion_allows_safe_custom_personas() {
     assert!(validate_persona_deletion(&persona, false).is_ok());
 }
 
-// ── validate_team_id ──────────────────────────────────────────────────────────
-
-#[test]
-fn pack_id_valid_reverse_dns() {
-    assert!(validate_team_id("com.example.security-team").is_ok());
-}
-
-#[test]
-fn pack_id_valid_simple() {
-    assert!(validate_team_id("my-pack").is_ok());
-}
-
-#[test]
-fn pack_id_rejects_empty() {
-    assert!(validate_team_id("").is_err());
-}
-
-#[test]
-fn pack_id_rejects_dot_dot_path_traversal() {
-    // Critical regression test: ".." must never pass validation.
-    // A pack with id ".." would write into the parent directory.
-    assert!(validate_team_id("..").is_err());
-}
-
-#[test]
-fn pack_id_rejects_single_dot() {
-    assert!(validate_team_id(".").is_err());
-}
-
-#[test]
-fn pack_id_rejects_leading_dot() {
-    assert!(validate_team_id(".hidden").is_err());
-}
-
-#[test]
-fn pack_id_rejects_slashes() {
-    assert!(validate_team_id("../etc/passwd").is_err());
-    assert!(validate_team_id("foo/bar").is_err());
-}
-
-#[test]
-fn pack_id_rejects_no_alphanumeric() {
-    assert!(validate_team_id("---").is_err());
-    assert!(validate_team_id("___").is_err());
-}
-
-#[test]
-fn pack_id_rejects_too_long() {
-    let long_id = "a".repeat(129);
-    assert!(validate_team_id(&long_id).is_err());
-    // 128 chars is fine
-    let max_id = "a".repeat(128);
-    assert!(validate_team_id(&max_id).is_ok());
-}
-
 // ── migrate_retired_personas ──────────────────────────────────────────────────
 
 #[test]
@@ -384,9 +277,10 @@ fn migrate_retires_unmodified_personas() {
     let now = "2026-04-01T00:00:00Z";
     // Simulate a store from before the Fizz transition: all 6
     // retired personas with original system prompts.
-    let mut stored: Vec<PersonaRecord> = RETIRED_PERSONAS
+    let mut stored: Vec<AgentDefinition> = RETIRED_PERSONAS
         .iter()
-        .map(|(id, prompt)| PersonaRecord {
+        .map(|(id, prompt)| AgentDefinition {
+            session_policy: Default::default(),
             id: id.to_string(),
             system_prompt: prompt.to_string(),
             is_builtin: false, // already demoted by merge_personas
@@ -421,12 +315,14 @@ fn migrate_retires_unmodified_personas() {
 #[test]
 fn migrate_preserves_customized_personas() {
     let now = "2026-04-01T00:00:00Z";
-    let mut stored = vec![PersonaRecord {
+    let mut stored = vec![AgentDefinition {
+        session_policy: Default::default(),
         id: "builtin:researcher".to_string(),
         display_name: "My Researcher".to_string(),
         system_prompt: "My custom research workflow with special instructions".to_string(),
         is_builtin: false,
         is_active: true,
+        shared: false,
         ..custom_persona("builtin:researcher", "My Researcher")
     }];
 
@@ -454,12 +350,14 @@ fn migrate_is_idempotent() {
     assert_eq!(stored.len(), 1);
 
     // 2. Already-retired persona (display_name ends with " (retired)") — no-op.
-    let mut stored_with_retired = vec![PersonaRecord {
+    let mut stored_with_retired = vec![AgentDefinition {
+        session_policy: Default::default(),
         id: "builtin:researcher".to_string(),
         display_name: "Researcher (retired)".to_string(),
         system_prompt: "My custom prompt".to_string(),
         is_builtin: false,
         is_active: false,
+        shared: false,
         ..custom_persona("builtin:researcher", "Researcher (retired)")
     }];
     assert!(
@@ -469,12 +367,14 @@ fn migrate_is_idempotent() {
 
     // 3. Retired persona still marked is_builtin: true (pre-demotion).
     // migrate_retired_personas should still soft-deprecate it.
-    let mut stored_pre_demotion = vec![PersonaRecord {
+    let mut stored_pre_demotion = vec![AgentDefinition {
+        session_policy: Default::default(),
         id: "builtin:reviewer".to_string(),
         display_name: "Reviewer".to_string(),
         system_prompt: "Custom review prompt".to_string(),
         is_builtin: true,
         is_active: true,
+        shared: false,
         ..custom_persona("builtin:reviewer", "Reviewer")
     }];
     assert!(migrate_retired_personas(&mut stored_pre_demotion, now));

@@ -1,42 +1,59 @@
 #![deny(unsafe_code)]
 
+mod git;
+#[cfg(all(test, unix))]
+mod git_runtime_tests;
+
 mod acp;
 mod config;
+mod edit_routing;
 mod engram_fetch;
 mod filter;
+mod isolated_execution;
 mod observer;
 mod pool;
+mod pool_lifecycle;
+mod prompt_framing;
+mod prompt_project;
 mod queue;
+mod recovery_wake;
 mod relay;
+mod run_task;
+mod runtime;
+use runtime::{AgentRuntime, PoolStartup, SessionMode};
+mod scope;
 mod setup_mode;
 mod usage;
 
 pub use usage::TurnUsage;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
     OBSERVER_MAX_PLAINTEXT_LEN,
 };
 use clap::Parser;
-use config::{Config, DedupMode, ModelsArgs, MultipleEventHandling, RespondTo, SubscribeMode};
+use config::{
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
+    MultipleEventHandling, RespondTo, SubscribeMode,
+};
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState,
+    PromptResult, PromptSource, SessionState, TimeoutKind,
 };
-use queue::{CancelReason, EventQueue, QueuedEvent, ThreadTags};
+use pool_lifecycle::PoolLifecycle;
+use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
@@ -46,7 +63,7 @@ use uuid::Uuid;
 ///
 /// This avoids clap rejecting harness flags (like `--private-key`) that aren't
 /// declared on the subcommand's `Parser`. The `models` path has its own
-/// `ModelsArgs` parser; the default path uses the existing `CliArgs`.
+/// dedicated parser; the default path uses the existing `CliArgs`.
 ///
 /// **Constraint**: subcommand must be argv[1] — flags before the subcommand
 /// name (e.g., `buzz-acp --verbose models`) are not supported.
@@ -54,13 +71,33 @@ fn is_subcommand(name: &str) -> bool {
     std::env::args().nth(1).map(|a| a == name).unwrap_or(false)
 }
 
-/// Timeout for the `buzz-acp models` subcommand (spawn + init + session/new).
+/// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
+/// human interaction, so it must not share the short probe timeout.
+const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Resolve the process working directory for ACP session metadata and prompts.
+///
+/// `std::env::current_dir()` returns an absolute path on every supported
+/// platform. Keep the explicit invariant check so a future source cannot
+/// silently introduce a relative path, and surface resolution failures instead
+/// of substituting a misleading Unix-specific fallback.
+fn current_working_directory() -> Result<String> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    ensure!(
+        cwd.is_absolute(),
+        "current working directory is not absolute: {}",
+        cwd.display()
+    );
+    Ok(cwd.to_string_lossy().into_owned())
+}
 
 /// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
-/// Ephemeral kinds (20000-29999) are rejected by the HTTP bridge, so presence
-/// updates must be routed through the WS path.
+/// The HTTP bridge rejects presence (kind:20001); typing (kind:20002) is the
+/// only ephemeral kind it accepts. Presence updates must use the WS path.
 ///
 /// Content is a bare status string (`"online"`, `"away"`, `"offline"`) matching
 /// the desktop client's format. The relay stores this in Redis and synthesizes
@@ -79,6 +116,30 @@ async fn publish_presence(
         .map_err(|e| relay::RelayError::Http(format!("presence sign error: {e}")))?;
     publisher.publish_event(event).await?;
     Ok(())
+}
+
+fn emit_runtime_lifecycle(
+    observer: Option<&observer::ObserverHandle>,
+    start_nonce: &str,
+    pubkey: &str,
+    relay_url: &str,
+    lifecycle: &str,
+    error: Option<&str>,
+) {
+    if let Some(observer) = observer {
+        observer.emit(
+            "managed_agent_runtime_lifecycle",
+            None,
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "pubkey": pubkey,
+                "relayUrl": relay_url,
+                "startNonce": start_nonce,
+                "lifecycle": lifecycle,
+                "error": error,
+            }),
+        );
+    }
 }
 
 /// Resolve the agent's owner pubkey at startup.
@@ -109,24 +170,80 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
     config.agent_owner.clone()
 }
 
+/// Base delay before re-consulting the relay about an author whose last
+/// sibling lookup was [`SiblingVerdict::Indeterminate`]. Doubles per
+/// consecutive indeterminate result up to [`SIBLING_RETRY_MAX`].
+///
+/// The lookup awaits inline in the sole inbound-event loop (2s timeout), so an
+/// unthrottled retry-per-event under a persistent `/query` outage would let a
+/// chatty sibling stall ingress for the owner too. With this backoff a dead
+/// relay costs at most one inline lookup per author per minute.
+const SIBLING_RETRY_BASE: Duration = Duration::from_secs(5);
+/// Ceiling for the indeterminate-lookup retry backoff.
+const SIBLING_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// One author's entry in the sibling cache.
+#[derive(Debug, Clone, Copy)]
+enum SiblingEntry {
+    /// Relay-proven verdict; immutable for the process lifetime.
+    Proven(bool),
+    /// Last lookup was indeterminate: denied without a relay call until
+    /// `retry_at`. `failures` counts consecutive indeterminate results and
+    /// drives the exponential backoff.
+    Indeterminate {
+        retry_at: std::time::Instant,
+        failures: u32,
+    },
+}
+
+/// What the cache can say about an author before any relay call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingCacheState {
+    /// Relay-proven verdict.
+    Proven(bool),
+    /// An indeterminate verdict is still inside its retry deadline: deny
+    /// this event without consulting the relay.
+    Throttled,
+    /// Never seen, or the retry deadline has passed: consult the relay.
+    Unknown,
+}
+
 /// Cache for the agent's owner pubkey.
 ///
 /// Owner is now provided via `--agent-owner` config flag (no REST lookup).
 /// Cache for the agent's owner pubkey + sibling lookups.
 ///
 /// Siblings are other agents whose NIP-OA auth tag proves the same owner.
-/// Lookup results are cached for the process lifetime (attestations are immutable).
+/// Only *proven* verdicts are cached for the process lifetime (attestations
+/// are immutable). A lookup that failed because the relay was unreachable is
+/// [`SiblingVerdict::Indeterminate`]: it is remembered only as a bounded retry
+/// deadline ([`SiblingEntry::Indeterminate`]) — never as a verdict — so one
+/// relay blip cannot make this agent ignore a same-owner sibling until
+/// restart, and a persistent outage cannot turn every sibling event into an
+/// inline relay round-trip.
 struct OwnerCache {
     pubkey: Option<String>,
-    /// author_hex → is_sibling (true = same owner, false = not)
-    siblings: std::sync::Mutex<HashMap<String, bool>>,
+    siblings: std::sync::Mutex<HashMap<String, SiblingEntry>>,
+    retry_base: Duration,
+    retry_max: Duration,
 }
 
 impl OwnerCache {
     fn new(initial: Option<String>) -> Self {
+        Self::with_retry_backoff(initial, SIBLING_RETRY_BASE, SIBLING_RETRY_MAX)
+    }
+
+    /// Construct with an explicit indeterminate-retry backoff (tests shorten it).
+    fn with_retry_backoff(
+        initial: Option<String>,
+        retry_base: Duration,
+        retry_max: Duration,
+    ) -> Self {
         Self {
             pubkey: initial,
             siblings: std::sync::Mutex::new(HashMap::new()),
+            retry_base,
+            retry_max,
         }
     }
 
@@ -135,27 +252,134 @@ impl OwnerCache {
         self.pubkey.as_deref()
     }
 
-    /// Check if author is a known sibling (cached result).
-    fn is_known_sibling(&self, author: &str) -> Option<bool> {
-        self.siblings.lock().ok()?.get(author).copied()
-    }
-
-    /// Cache a sibling lookup result.
-    fn cache_sibling(&self, author: String, is_sibling: bool) {
-        if let Ok(mut map) = self.siblings.lock() {
-            // Cap at 256 entries to prevent unbounded growth.
-            if map.len() >= 256 {
-                map.clear();
+    /// What is known about `author` right now, without touching the relay.
+    fn sibling_state(&self, author: &str) -> SiblingCacheState {
+        let Ok(map) = self.siblings.lock() else {
+            return SiblingCacheState::Unknown;
+        };
+        match map.get(author) {
+            None => SiblingCacheState::Unknown,
+            Some(SiblingEntry::Proven(is_sibling)) => SiblingCacheState::Proven(*is_sibling),
+            Some(SiblingEntry::Indeterminate { retry_at, .. }) => {
+                if std::time::Instant::now() < *retry_at {
+                    SiblingCacheState::Throttled
+                } else {
+                    SiblingCacheState::Unknown
+                }
             }
-            map.insert(author, is_sibling);
         }
     }
+
+    /// The relay-proven verdict for `author`, if one has been cached.
+    #[cfg(test)]
+    fn proven_verdict(&self, author: &str) -> Option<bool> {
+        match self.sibling_state(author) {
+            SiblingCacheState::Proven(is_sibling) => Some(is_sibling),
+            _ => None,
+        }
+    }
+
+    /// Cache a proven sibling verdict.
+    fn cache_sibling(&self, author: String, is_sibling: bool) {
+        self.insert(author, SiblingEntry::Proven(is_sibling));
+    }
+
+    /// Record an indeterminate lookup for `author` and return the backoff
+    /// during which further events from them are denied without a relay call.
+    fn note_indeterminate(&self, author: &str) -> Duration {
+        let failures = match self
+            .siblings
+            .lock()
+            .ok()
+            .and_then(|map| map.get(author).copied())
+        {
+            Some(SiblingEntry::Indeterminate { failures, .. }) => failures.saturating_add(1),
+            _ => 1,
+        };
+        let backoff = self
+            .retry_base
+            .saturating_mul(1u32 << (failures - 1).min(16))
+            .min(self.retry_max);
+        self.insert(
+            author.to_string(),
+            SiblingEntry::Indeterminate {
+                retry_at: std::time::Instant::now() + backoff,
+                failures,
+            },
+        );
+        backoff
+    }
+
+    /// Number of cached authors at the eviction threshold.
+    const SIBLING_CACHE_CAP: usize = 256;
+
+    /// Insert or replace `author`'s entry under the bounded-size policy.
+    ///
+    /// Replacing an author already present never evicts anything — a retry
+    /// deadline being re-armed at capacity must not wipe the other entries,
+    /// or a saturated cache under a `/query` outage would collapse every
+    /// sibling back to a serial inline lookup per event. A previously absent
+    /// author at capacity evicts exactly one entry — the space the newcomer
+    /// needs: the longest-expired retry record if there is one, else an
+    /// arbitrary entry. Expired records are not purged wholesale because their
+    /// `failures` counter is the author's backoff tier; dropping it would
+    /// restart every affected author at the base delay after its next failed
+    /// lookup and multiply serial relay calls during the same outage.
+    fn insert(&self, author: String, entry: SiblingEntry) {
+        let Ok(mut map) = self.siblings.lock() else {
+            return;
+        };
+        if !map.contains_key(&author) && map.len() >= Self::SIBLING_CACHE_CAP {
+            let now = std::time::Instant::now();
+            let victim = map
+                .iter()
+                .filter_map(|(cached, existing)| match existing {
+                    SiblingEntry::Indeterminate { retry_at, .. } if *retry_at <= now => {
+                        Some((cached, *retry_at))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|(_, retry_at)| *retry_at)
+                .map(|(cached, _)| cached.clone())
+                .or_else(|| map.keys().next().cloned());
+            if let Some(victim) = victim {
+                map.remove(&victim);
+            }
+        }
+        map.insert(author, entry);
+    }
+
+    /// Number of authors currently cached (proven or throttled).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.siblings.lock().map(|map| map.len()).unwrap_or(0)
+    }
+}
+
+/// Outcome of one sibling profile verification attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingVerdict {
+    /// kind:0 fetched and its NIP-OA auth tag cryptographically proves the
+    /// same owner.
+    Sibling,
+    /// The relay returned the author's profile and it does not prove the
+    /// same owner.
+    NotSibling,
+    /// Nothing was attested either way: the relay could not be consulted
+    /// (timeout, network, or HTTP error), answered with a malformed body, or
+    /// has no kind:0 for the author yet — a sibling's profile may simply not
+    /// have been published or replicated, so its absence is not a verdict.
+    Indeterminate,
 }
 
 /// Check if `author` is the owner OR a sibling (same owner via NIP-OA).
 ///
 /// For unknown authors, queries their kind:0 profile to extract the NIP-OA
-/// auth tag and verify the owner matches. Result is cached.
+/// auth tag and verify the owner matches. Only proven verdicts are cached as
+/// verdicts; an [`SiblingVerdict::Indeterminate`] lookup fails closed for the
+/// current event and arms a bounded retry deadline, so a transient relay
+/// outage cannot poison a sibling for the process lifetime and a persistent
+/// one cannot turn every sibling event into an inline relay round-trip.
 async fn is_owner_or_sibling(
     author: &str,
     owner_cache: &OwnerCache,
@@ -172,51 +396,665 @@ async fn is_owner_or_sibling(
     }
 
     // Check sibling cache.
-    if let Some(cached) = owner_cache.is_known_sibling(author) {
-        return cached;
+    match owner_cache.sibling_state(author) {
+        SiblingCacheState::Proven(is_sibling) => return is_sibling,
+        SiblingCacheState::Throttled => {
+            tracing::debug!(
+                author,
+                "sibling check throttled after an indeterminate lookup — denying without a relay query"
+            );
+            return false;
+        }
+        SiblingCacheState::Unknown => {}
     }
 
     // Query the author's kind:0 profile to check for NIP-OA auth tag.
-    let is_sibling = check_sibling_via_profile(author, my_owner, rest_client).await;
-    owner_cache.cache_sibling(author.to_string(), is_sibling);
-    is_sibling
+    match check_sibling_via_profile(author, my_owner, rest_client).await {
+        SiblingVerdict::Sibling => {
+            owner_cache.cache_sibling(author.to_string(), true);
+            true
+        }
+        SiblingVerdict::NotSibling => {
+            owner_cache.cache_sibling(author.to_string(), false);
+            false
+        }
+        SiblingVerdict::Indeterminate => {
+            let backoff = owner_cache.note_indeterminate(author);
+            tracing::warn!(
+                author,
+                retry_after_secs = backoff.as_secs(),
+                "sibling check indeterminate — relay profile query failed; \
+                 dropping this event without a proven verdict, retrying after backoff"
+            );
+            false
+        }
+    }
 }
 
-/// Inbound author gate decision: does this author's event fire a turn?
+/// Return the workflow owner attributed by a relay-signed workflow message.
 ///
-/// Coarse security policy applied before subscription rules. Both `OwnerOnly`
-/// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
-/// additionally accepts the explicit external pubkey list.
-async fn author_allowed(
+/// `buzz:workflow-owner` alone is not authority: any ordinary event author can
+/// forge custom tags. Attribution is accepted only for a cryptographically
+/// valid kind:9 event signed by the active relay's NIP-11 `self` key, with
+/// exactly one canonical workflow marker and owner pubkey. The current agent
+/// must also have exactly one canonical `buzz:workflow-mention` tag; legacy `p`
+/// tags are deliberately ignored as author-gate authority because workflows
+/// retain an owner `p` tag for mentions-feed compatibility.
+fn verified_workflow_owner(
+    event: &nostr::Event,
+    relay_self: Option<&str>,
+    agent_pubkey_hex: &str,
+) -> Option<String> {
+    if event.kind.as_u16() as u32 != KIND_STREAM_MESSAGE {
+        return None;
+    }
+
+    let relay_self = nostr::PublicKey::from_hex(relay_self?).ok()?;
+    if event.pubkey != relay_self || event.verify().is_err() {
+        return None;
+    }
+
+    let markers: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .filter(|values| values.first().map(String::as_str) == Some("buzz:workflow"))
+        .collect();
+    if markers.as_slice() != [["buzz:workflow", "true"]] {
+        return None;
+    }
+
+    let owners: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .filter(|values| values.first().map(String::as_str) == Some("buzz:workflow-owner"))
+        .collect();
+    let [owner_tag] = owners.as_slice() else {
+        return None;
+    };
+    let [_, owner_value] = owner_tag else {
+        return None;
+    };
+    let owner = nostr::PublicKey::from_hex(owner_value).ok()?.to_hex();
+    if owner_value.as_str() != owner {
+        return None;
+    }
+
+    let agent_pubkey = nostr::PublicKey::from_hex(agent_pubkey_hex).ok()?.to_hex();
+    let workflow_mentions: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice())
+        .filter(|values| values.first().map(String::as_str) == Some("buzz:workflow-mention"))
+        .collect();
+    let mut mentioned_pubkeys = HashSet::with_capacity(workflow_mentions.len());
+    for mention_tag in workflow_mentions {
+        let [_, mention_value] = mention_tag else {
+            return None;
+        };
+        let mention = nostr::PublicKey::from_hex(mention_value).ok()?.to_hex();
+        if mention_value.as_str() != mention || !mentioned_pubkeys.insert(mention) {
+            return None;
+        }
+    }
+    if !mentioned_pubkeys.contains(&agent_pubkey) {
+        return None;
+    }
+
+    Some(owner)
+}
+
+/// Resolve the author principal used by the inbound author gate.
+fn effective_prompt_author(
+    event: &nostr::Event,
+    relay_self: Option<&str>,
+    agent_pubkey_hex: &str,
+) -> String {
+    verified_workflow_owner(event, relay_self, agent_pubkey_hex)
+        .unwrap_or_else(|| event.pubkey.to_hex())
+}
+
+/// Owns the verified relay signing identity for a listener's lifetime and
+/// applies the inbound author gate to each event.
+///
+/// The relay identity is deliberately *not* a per-event parameter, and this
+/// type deliberately lives in its own module with private fields so the only
+/// way to obtain one is [`InboundAuthorGate::connect`], which loads the
+/// identity.
+///
+/// Two earlier revisions of this code were mutable-with-impunity: the first
+/// threaded a local `Option<String>` into every gate call, and the second kept
+/// a free `evaluate_inbound_author_gate(.., relay_self, ..)` alongside the
+/// method. In both cases a listener could be rewired to pass `None` — silently
+/// disabling every delegated workflow wake — while all 848 tests stayed green.
+/// Encapsulation, not a test, is what closes that seam: `InboundAuthorGate {
+/// relay_self: None, .. }` is now a privacy error outside this module, and
+/// dropping the load inside it fails the construction regressions.
+mod inbound_author_gate {
+    use super::{
+        effective_prompt_author, is_dm_channel, is_owner_or_sibling, pool, refresh_relay_self,
+        relay, OwnerCache, RespondTo,
+    };
+    use std::collections::HashSet;
+
+    pub(crate) struct InboundAuthorGateDecision {
+        pub(crate) effective_author: String,
+        pub(crate) allowed: bool,
+        pub(crate) is_dm: bool,
+    }
+
+    /// An event that passed the complete listener author boundary.
+    ///
+    /// The event is moved into the gate before policy evaluation and can only
+    /// be recovered through this private-field capability. Both production
+    /// loops therefore have to consume the gate's verdict before they can use
+    /// or publish the event; replacing the call with a raw signer or a local
+    /// `allowed = true` no longer type-checks.
+    pub(crate) struct AuthorizedListenerEvent {
+        buzz_event: relay::BuzzEvent,
+        effective_author: String,
+    }
+
+    impl AuthorizedListenerEvent {
+        pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
+            (self.buzz_event, self.effective_author)
+        }
+    }
+
+    /// Apply the configured raw-author policy after trusted workflow attribution.
+    ///
+    /// This stays private to the gate module so neither listener can bypass
+    /// workflow attribution by calling the raw-signer policy directly.
+    async fn author_allowed(
+        respond_to: &RespondTo,
+        allowlist: &HashSet<String>,
+        author: &str,
+        is_dm: bool,
+        owner_cache: &OwnerCache,
+        rest_client: &relay::RestClient,
+    ) -> bool {
+        if is_dm {
+            return match respond_to {
+                RespondTo::Nobody => false,
+                _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
+            };
+        }
+        match respond_to {
+            RespondTo::Anyone => true,
+            RespondTo::Nobody => false,
+            RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
+            RespondTo::Allowlist => {
+                allowlist.contains(author)
+                    || is_owner_or_sibling(author, owner_cache, rest_client).await
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn test_author_allowed(
+        respond_to: &RespondTo,
+        allowlist: &HashSet<String>,
+        author: &str,
+        is_dm: bool,
+        owner_cache: &OwnerCache,
+        rest_client: &relay::RestClient,
+    ) -> bool {
+        author_allowed(
+            respond_to,
+            allowlist,
+            author,
+            is_dm,
+            owner_cache,
+            rest_client,
+        )
+        .await
+    }
+
+    pub(crate) struct InboundAuthorGate {
+        agent_pubkey_hex: String,
+        relay_self: Option<String>,
+        // None means no authoritative NIP-11 result yet, including at startup.
+        refreshed_generation: Option<u64>,
+    }
+
+    pub(crate) fn refresh_needed(refreshed_generation: Option<u64>, event_generation: u64) -> bool {
+        refreshed_generation.is_none_or(|generation| event_generation > generation)
+    }
+
+    impl InboundAuthorGate {
+        /// Load the relay signing identity for a freshly connected listener.
+        pub(crate) async fn connect(
+            rest_client: &relay::RestClient,
+            agent_pubkey_hex: &str,
+            context: &str,
+        ) -> Self {
+            let (relay_self, completed) = refresh_relay_self(rest_client, None, context).await;
+            Self {
+                agent_pubkey_hex: agent_pubkey_hex.to_string(),
+                relay_self,
+                refreshed_generation: completed.then_some(0),
+            }
+        }
+
+        /// Whether delegated workflow attribution is currently available.
+        ///
+        /// Test-only: production code never branches on this.
+        /// `refresh_relay_self` already logs why attribution is unavailable, and
+        /// every runtime path treats a missing identity by falling back to the
+        /// raw signer.
+        #[cfg(test)]
+        pub(crate) fn has_relay_identity(&self) -> bool {
+            self.relay_self.is_some()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn relay_identity_for_test(&self) -> Option<&str> {
+            self.relay_self.as_deref()
+        }
+
+        /// Refresh relay identity, resolve channel trust, and apply trusted
+        /// workflow attribution and author policy for one listener event.
+        ///
+        /// Both production listeners call this exact boundary. Identity refresh
+        /// cannot be omitted independently of authorization; the raw-author
+        /// policy and relay identity are private to this module.
+        pub(crate) async fn evaluate_listener_event(
+            &mut self,
+            buzz_event: &relay::BuzzEvent,
+            respond_to: &RespondTo,
+            allowlist: &HashSet<String>,
+            owner_cache: &OwnerCache,
+            channel_info: &pool::ChannelInfoResolver,
+            rest_client: &relay::RestClient,
+        ) -> InboundAuthorGateDecision {
+            // Retry failed startup discovery on generation 0 as well as failed
+            // reconnect refreshes. Only an authoritative result completes the
+            // generation; transient failure retains the last verified key.
+            if refresh_needed(self.refreshed_generation, buzz_event.connection_generation) {
+                let (relay_self, completed) =
+                    refresh_relay_self(rest_client, self.relay_self.take(), "listener").await;
+                self.relay_self = relay_self;
+                if completed {
+                    self.refreshed_generation = Some(buzz_event.connection_generation);
+                }
+            }
+            let is_dm = is_dm_channel(buzz_event.channel_id, channel_info).await;
+            self.evaluate_with_channel_trust(
+                &buzz_event.event,
+                respond_to,
+                allowlist,
+                is_dm,
+                owner_cache,
+                rest_client,
+            )
+            .await
+        }
+
+        async fn evaluate_with_channel_trust(
+            &self,
+            event: &nostr::Event,
+            respond_to: &RespondTo,
+            allowlist: &HashSet<String>,
+            is_dm: bool,
+            owner_cache: &OwnerCache,
+            rest_client: &relay::RestClient,
+        ) -> InboundAuthorGateDecision {
+            let effective_author =
+                effective_prompt_author(event, self.relay_self.as_deref(), &self.agent_pubkey_hex);
+            let allowed = author_allowed(
+                respond_to,
+                allowlist,
+                &effective_author,
+                is_dm,
+                owner_cache,
+                rest_client,
+            )
+            .await;
+            InboundAuthorGateDecision {
+                effective_author,
+                allowed,
+                is_dm,
+            }
+        }
+
+        pub(crate) async fn authorize_listener_event(
+            &mut self,
+            buzz_event: relay::BuzzEvent,
+            respond_to: &RespondTo,
+            allowlist: &HashSet<String>,
+            owner_cache: &OwnerCache,
+            channel_info: &pool::ChannelInfoResolver,
+            rest_client: &relay::RestClient,
+        ) -> Option<AuthorizedListenerEvent> {
+            let decision = self
+                .evaluate_listener_event(
+                    &buzz_event,
+                    respond_to,
+                    allowlist,
+                    owner_cache,
+                    channel_info,
+                    rest_client,
+                )
+                .await;
+            if !decision.allowed {
+                // INFO, not debug: under owner-only fleets a dropped event is
+                // the whole story of "the agent never answered", and the
+                // default log filter hides debug.
+                tracing::info!(
+                    channel_id = %buzz_event.channel_id,
+                    raw_author = %buzz_event.event.pubkey.to_hex(),
+                    effective_author = %decision.effective_author,
+                    mode = %respond_to,
+                    is_dm = decision.is_dm,
+                    "inbound author gate — dropping event"
+                );
+                return None;
+            }
+            Some(AuthorizedListenerEvent {
+                buzz_event,
+                effective_author: decision.effective_author,
+            })
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn evaluate_for_test(
+            &self,
+            event: &nostr::Event,
+            respond_to: &RespondTo,
+            allowlist: &HashSet<String>,
+            is_dm: bool,
+            owner_cache: &OwnerCache,
+            rest_client: &relay::RestClient,
+        ) -> InboundAuthorGateDecision {
+            self.evaluate_with_channel_trust(
+                event,
+                respond_to,
+                allowlist,
+                is_dm,
+                owner_cache,
+                rest_client,
+            )
+            .await
+        }
+    }
+}
+
+use inbound_author_gate::{AuthorizedListenerEvent, InboundAuthorGate};
+
+struct AuthorizedNormalListenerEvent(AuthorizedListenerEvent);
+
+struct NormalListenerIngress {
+    buzz_event: relay::BuzzEvent,
+    effective_author: String,
+    prompt_tag: String,
+    /// Original-message routing for an admitted edit; see
+    /// [`NormalListenerIngress::resolve_edit_routing`].
+    edit: Option<queue::ResolvedEdit>,
+}
+
+impl AuthorizedNormalListenerEvent {
+    async fn match_subscription(
+        self,
+        rules: &[SubscriptionRule],
+        agent_pubkey_hex: &str,
+    ) -> Option<NormalListenerIngress> {
+        let (buzz_event, effective_author) = self.0.into_parts();
+        let matched = filter::match_event(
+            &buzz_event.event,
+            buzz_event.channel_id,
+            rules,
+            agent_pubkey_hex,
+        )
+        .await?;
+        Some(NormalListenerIngress {
+            buzz_event,
+            effective_author,
+            prompt_tag: matched.prompt_tag,
+            edit: None,
+        })
+    }
+}
+
+struct QueuedNormalListenerEvent {
+    accepted: bool,
+    scope: scope::SessionScope,
+    effective_author: String,
+    /// Visible message that owns this event's lifecycle reactions: the
+    /// original for an edit, otherwise the event itself.
+    reaction_target_id: String,
+    /// The admitted event as a native steer would render it, including an
+    /// edit's resolved original-message routing.
+    steer_event: queue::BatchEvent,
+    /// The listener's DM classification of the channel (unresolved counts as
+    /// a DM); see [`EventQueue::in_flight_accepts_steer`].
+    channel_is_dm: bool,
+}
+
+impl QueuedNormalListenerEvent {
+    fn mark_seen(&self, rest_client: &relay::RestClient) {
+        if !self.accepted {
+            return;
+        }
+        let rest_client = rest_client.clone();
+        let event_id = self.reaction_target_id.clone();
+        tokio::spawn(async move {
+            pool::reaction_add(&rest_client, &event_id, "👀").await;
+        });
+    }
+
+    fn steer_or_interrupt(
+        self,
+        handling: MultipleEventHandling,
+        owner: Option<&str>,
+        pool: &mut AgentPool,
+        queue: &mut EventQueue,
+        steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
+    ) {
+        if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
+            return;
+        }
+        let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
+            return;
+        };
+        // A native steer keeps the running turn's `<context>`, so it may only
+        // carry a message that replies in the same place. A channel-policy or
+        // DM session spans several destinations; a message for another one
+        // takes the cancel+merge path, whose re-prompt carries its own
+        // `<context>`. The DM rule applies only when the running turn's
+        // prompt itself was rendered as a DM.
+        let same_reply_route = queue.in_flight_accepts_steer(
+            &self.scope,
+            &self.steer_event.reply_route(),
+            self.channel_is_dm,
+        );
+        let native_attempted = matches!(signal, ControlSignal::Steer)
+            && same_reply_route
+            && try_native_steer(
+                pool,
+                queue,
+                self.scope.clone(),
+                self.steer_event,
+                steer_ack_tx,
+            );
+        if !native_attempted {
+            signal_in_flight_task_for_scope(pool, &self.scope, signal);
+        }
+    }
+}
+
+impl NormalListenerIngress {
+    /// Resolve an admitted edit's original message once, before its session
+    /// scope is derived, so scope, reactions, prompt, typing, steering, and
+    /// failure notices all share one routing authority. The lookup is bounded
+    /// and only runs for kind:40003 events that already matched a rule (by
+    /// default: edits that newly mention this agent).
+    async fn resolve_edit_routing(mut self, rest_client: &relay::RestClient) -> Self {
+        self.edit = edit_routing::resolve_edit(
+            &self.buzz_event.event,
+            self.buzz_event.channel_id,
+            rest_client,
+        )
+        .await;
+        self
+    }
+
+    fn session_scope(&self, policy: scope::SessionPolicy, is_dm: bool) -> scope::SessionScope {
+        scope::SessionScope::derive_routed(
+            policy,
+            self.buzz_event.channel_id,
+            is_dm,
+            &self.buzz_event.event,
+            self.edit.as_ref(),
+        )
+    }
+
+    fn push(
+        self,
+        queue: &mut EventQueue,
+        session_scope: scope::SessionScope,
+        channel_is_dm: bool,
+    ) -> QueuedNormalListenerEvent {
+        let Self {
+            buzz_event,
+            effective_author,
+            prompt_tag,
+            edit,
+        } = self;
+        let reaction_target_id = queue::reaction_target_id(&buzz_event.event);
+        let received_at = std::time::Instant::now();
+        let steer_event = queue::BatchEvent {
+            event: buzz_event.event.clone(),
+            prompt_tag: prompt_tag.clone(),
+            received_at,
+            edit: edit.clone(),
+        };
+        let channel_id = buzz_event.channel_id;
+        let accepted = queue.push(QueuedEvent {
+            channel_id,
+            scope: session_scope.clone(),
+            event: buzz_event.event,
+            received_at,
+            prompt_tag,
+            edit,
+        });
+        QueuedNormalListenerEvent {
+            accepted,
+            scope: session_scope,
+            effective_author,
+            reaction_target_id,
+            steer_event,
+            channel_is_dm,
+        }
+    }
+}
+
+/// Apply the complete normal-listener author boundary for one relay event.
+///
+/// The event is consumed here, so the production loop cannot recover it except
+/// from the gate's private authorized capability.
+async fn authorize_normal_listener_event(
+    author_gate: &mut InboundAuthorGate,
+    buzz_event: relay::BuzzEvent,
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
-    author: &str,
     owner_cache: &OwnerCache,
+    channel_info: &pool::ChannelInfoResolver,
     rest_client: &relay::RestClient,
+) -> Option<AuthorizedListenerEvent> {
+    author_gate
+        .authorize_listener_event(
+            buzz_event,
+            respond_to,
+            allowlist,
+            owner_cache,
+            channel_info,
+            rest_client,
+        )
+        .await
+}
+
+/// Refresh the relay signing identity, logging why delegated workflow
+/// attribution is unavailable. A transient fetch error keeps the last verified
+/// key so a reconnect blip cannot disable workflow wakes. That availability
+/// tradeoff creates a bounded-by-success revocation window: a rotated-away key
+/// remains trusted while NIP-11 refreshes keep failing, then is replaced or
+/// cleared by the next successful response. Refresh runs at startup and before
+/// authorization on a new or still-pending generation; a completed generation
+/// is not refreshed again until a reconnect.
+async fn refresh_relay_self(
+    rest_client: &relay::RestClient,
+    current: Option<String>,
+    context: &str,
+) -> (Option<String>, bool) {
+    match rest_client.relay_self().await {
+        Ok(Some(pubkey)) => (Some(pubkey), true),
+        Ok(None) => {
+            tracing::warn!(
+                %context,
+                "relay NIP-11 document has no `self` key — workflow attribution remains fail-closed"
+            );
+            (None, true)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %context,
+                %error,
+                retaining_previous_identity = current.is_some(),
+                "failed to refresh relay NIP-11 identity"
+            );
+            (current, false)
+        }
+    }
+}
+
+/// Resolve whether `channel_id` is a DM, for the inbound author gate.
+///
+/// Resolution order:
+/// 1. Startup discovery metadata (`startup_info`) — covers channels known at
+///    process start.
+/// 2. Per-loop resolution cache (`cache`) — covers channels resolved since.
+/// 3. Lazy REST fetch of the channel's kind:39000 metadata — covers channels
+///    the agent was added to *after* startup (the exploit path: an
+///    agent-initiated DM is exactly such a channel).
+///
+/// Fail-closed: if the fetch fails or times out, the channel is treated as a
+/// DM for this event and the result is NOT cached, so a later event retries
+/// the fetch instead of pinning a mis-classification.
+pub(crate) async fn is_dm_channel(
+    channel_id: Uuid,
+    channel_info: &pool::ChannelInfoResolver,
 ) -> bool {
-    match respond_to {
-        RespondTo::Anyone => true,
-        RespondTo::Nobody => false,
-        RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
-        RespondTo::Allowlist => {
-            allowlist.contains(author)
-                || is_owner_or_sibling(author, owner_cache, rest_client).await
+    match channel_info.resolve_channel_metadata(channel_id).await {
+        Some(info) => info.channel_type == "dm",
+        None => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                "channel type unresolved — treating as DM for author gate (fail closed)"
+            );
+            true
         }
     }
 }
 
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
 /// proves the same owner as us.
+///
+/// Only a *fetched* profile yields a verdict the caller may cache: a
+/// profile with no verifying tag is definitively [`SiblingVerdict::NotSibling`],
+/// while a failed query or a missing profile is
+/// [`SiblingVerdict::Indeterminate`] and retried under the bounded backoff.
 async fn check_sibling_via_profile(
     author: &str,
     expected_owner: &str,
     rest_client: &relay::RestClient,
-) -> bool {
+) -> SiblingVerdict {
     let filter = nostr::Filter::new()
         .kind(nostr::Kind::Metadata)
         .author(match nostr::PublicKey::from_hex(author) {
             Ok(pk) => pk,
-            Err(_) => return false,
+            // A malformed author key can never verify — definitively not a sibling.
+            Err(_) => return SiblingVerdict::NotSibling,
         })
         .limit(1);
 
@@ -224,28 +1062,39 @@ async fn check_sibling_via_profile(
         .await
     {
         Ok(Ok(v)) => v,
-        _ => return false, // timeout or error — fail closed
+        Ok(Err(e)) => {
+            tracing::debug!(author, "sibling profile query failed: {e}");
+            return SiblingVerdict::Indeterminate;
+        }
+        Err(_) => {
+            tracing::debug!(author, "sibling profile query timed out");
+            return SiblingVerdict::Indeterminate;
+        }
     };
 
     // Look for an "auth" tag in the profile event.
     let events = match resp.as_array() {
         Some(arr) => arr,
-        None => return false,
+        // Non-array body is a server anomaly, not proof of absence.
+        None => return SiblingVerdict::Indeterminate,
     };
     let event = match events.first() {
         Some(e) => e,
-        None => return false,
+        // No kind:0 yet — not published, or not replicated to this relay.
+        // Not a verdict: the bounded backoff retries it, so a profile that
+        // appears later is picked up without a restart.
+        None => return SiblingVerdict::Indeterminate,
     };
     let tags = match event.get("tags").and_then(|t| t.as_array()) {
         Some(t) => t,
-        None => return false,
+        None => return SiblingVerdict::NotSibling,
     };
 
     // Find ["auth", owner_pk, conditions, sig] and verify the Schnorr signature.
     // Don't trust the relay — verify ourselves.
     let agent_pk = match nostr::PublicKey::from_hex(author) {
         Ok(pk) => pk,
-        Err(_) => return false,
+        Err(_) => return SiblingVerdict::NotSibling,
     };
 
     for tag in tags {
@@ -269,7 +1118,7 @@ async fn check_sibling_via_profile(
         match buzz_sdk::nip_oa::verify_auth_tag(&tag_json, &agent_pk) {
             Ok(_) => {
                 tracing::debug!(author, expected_owner, "sibling verified via NIP-OA");
-                return true;
+                return SiblingVerdict::Sibling;
             }
             Err(e) => {
                 tracing::debug!(author, "NIP-OA auth tag verification failed: {e}");
@@ -277,7 +1126,246 @@ async fn check_sibling_via_profile(
         }
     }
 
-    false
+    SiblingVerdict::NotSibling
+}
+
+/// Observer frames are published at a global rate of AT MOST ONE relay frame
+/// per tick — not one per channel, and not one per drain. Everything that
+/// accumulates between ticks waits in [`ObserverPublishQueue`] as events and
+/// is packed greedily into that single frame. One update per second is smooth
+/// enough for a human watching the session viewer, and the global budget is
+/// what makes the relay cost model flat: observer frames bill the agent's
+/// `LimitType::Messages` quota (`agent_standard_messages_per_min` = 120,
+/// enforced in relay `connection.rs::enforce_ws_admission`), shared with the
+/// agent's real chat messages. At 1 frame/s telemetry spends at most 60/min —
+/// half that budget — regardless of how many channels are active. A slower
+/// tick (e.g. 2s → 30/min) would leave more quota headroom for chat at the
+/// price of doubled viewer latency; this constant is the knob.
+const OBSERVER_PUBLISH_TICK: Duration = Duration::from_secs(1);
+
+/// Byte budget for EVERYTHING retained while awaiting a publish slot: the
+/// event FIFO (serialized, post-`fit_observer_event_to_budget` bytes) PLUS
+/// the chunk coalescer's pending buffer (serialized event skeletons + raw
+/// accumulated text). Both stores count against this one cap — a
+/// high-cardinality chunk flood (many distinct coalescer keys) is bounded
+/// exactly like a plain event flood; neither buffer is a bypass around the
+/// other. Lossless-ness is bounded by this budget: each publish slot packs
+/// one ~64KB frame, gathered queue-wide for the front channel, so a single
+/// channel drains at ~64KB/s and 4 MiB buys roughly **64 seconds** of
+/// sustained over-production before the oldest items are dropped WITH
+/// accounting (a warn carrying the dropped-event count). With C channels
+/// producing concurrently the slots round-robin between them, so the
+/// per-channel drain is ~64KB/Cs and the budget shortens accordingly —
+/// still bytes-per-slot, never events-per-slot (see
+/// [`ObserverPublishQueue::next_frame`]). Beyond-budget floods therefore
+/// degrade to designed, visible loss — strictly better than the
+/// pre-batching pacer's silent 90/min drop.
+const OBSERVER_PENDING_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Observer event kind for a batch envelope wrapping multiple events.
+///
+/// The payload is `{"events": [<ObserverEvent>, ...]}` with every inner event
+/// carrying its own `seq`/`timestamp`, so consumers process inner events
+/// exactly as they would unbatched ones. Single pending events are published
+/// unwrapped, so the envelope only appears when there is something to batch.
+const OBSERVER_BATCH_KIND: &str = "batch";
+
+/// Collects observer events awaiting a publish slot.
+///
+/// Chunk-type events ride the [`ObserverChunkCoalescer`]; everything else is
+/// appended in arrival order, force-flushing pending chunks first — the same
+/// ordering rule the pre-batching publisher enforced, so merged chunk text can
+/// never leapfrog a tool call that arrived mid-stream.
+///
+/// Events wait here as EVENTS, not pre-sealed frames: each publish slot packs
+/// one frame at publish time ([`Self::next_frame`]), so a backlog keeps
+/// compacting into full frames instead of freezing into a frame queue.
+///
+/// The queue is bounded by [`OBSERVER_PENDING_QUEUE_MAX_BYTES`]. When a
+/// sustained flood outruns the one-frame-per-tick drain for longer than the
+/// budget, the OLDEST events are dropped (the viewer wants recent state) with
+/// accounting: a warning carrying the dropped-event count, and
+/// `dropped_events` for tests.
+#[derive(Default)]
+struct ObserverPublishQueue {
+    coalescer: ObserverChunkCoalescer,
+    /// `(serialized_len, source_events, event)`, oldest first. Length is
+    /// captured at enqueue (post-fit) so byte accounting never re-serializes
+    /// on eviction; `source_events` is how many GENERATED observer events the
+    /// entry represents (a merged chunk carries every chunk it absorbed), so
+    /// eviction accounting stays in source units after flush.
+    events: VecDeque<(usize, u64, observer::ObserverEvent)>,
+    pending_bytes: usize,
+    /// SOURCE observer events lost to byte-budget eviction. Counted in
+    /// generated-event units, not retained entries: a coalesced entry that
+    /// merged N chunks accounts for N when evicted. A PUBLISHED merged entry
+    /// delivers all N sources' text in one event, so the invariant is
+    /// `ingested == dropped_events + Σ source_events over published events`.
+    dropped_events: u64,
+}
+
+impl ObserverPublishQueue {
+    fn ingest(&mut self, event: observer::ObserverEvent) {
+        // ObserverChunkCoalescer::ingest returns immediately-publishable events
+        // (force-flushed pending chunks + non-chunk passthrough, or a pending
+        // set displaced by the 60KB pre-flush); they join the queue in the
+        // order the coalescer emitted them, each carrying the count of source
+        // events it represents.
+        for (source_events, ready) in self.coalescer.ingest(event) {
+            self.enqueue(source_events, ready);
+        }
+        self.enforce_byte_budget();
+    }
+
+    fn enqueue(&mut self, source_events: u64, mut event: observer::ObserverEvent) {
+        // Pre-trim at enqueue so (a) byte accounting reflects what will ship
+        // and (b) one oversized leaf cannot force every frame it touches into
+        // whole-envelope elision downstream.
+        fit_observer_event_to_budget(&mut event);
+        let bytes = serialized_len(&event);
+        self.pending_bytes += bytes;
+        self.events.push_back((bytes, source_events, event));
+    }
+
+    /// Total bytes retained across BOTH stores — the event FIFO and the
+    /// coalescer's pending chunk buffer. The budget binds this sum; counting
+    /// only the FIFO would let a high-cardinality chunk flood (many distinct
+    /// coalescer keys, nothing ever flushing) grow unbounded outside the cap.
+    fn total_pending_bytes(&self) -> usize {
+        self.pending_bytes + self.coalescer.pending_bytes
+    }
+
+    /// Enforce [`OBSERVER_PENDING_QUEUE_MAX_BYTES`] over the total, dropping
+    /// OLDEST items first with accounting in SOURCE-event units. Global age
+    /// order across the two stores is structural: every enqueue path flushes
+    /// the coalescer first, so every pending coalescer entry is strictly newer
+    /// than every queued event — eviction is queue front, then coalescer
+    /// front. The `> 1` guard never drops the sole remaining item (any single
+    /// fitted event or pre-flush-capped chunk entry is far under the budget).
+    fn enforce_byte_budget(&mut self) {
+        let mut dropped = 0u64;
+        while self.total_pending_bytes() > OBSERVER_PENDING_QUEUE_MAX_BYTES
+            && self.events.len() + self.coalescer.pending.len() > 1
+        {
+            if let Some((bytes, source_events, _)) = self.events.pop_front() {
+                self.pending_bytes -= bytes;
+                dropped += source_events;
+            } else {
+                dropped += self.coalescer.drop_oldest().expect("guard ensures an item");
+            }
+        }
+        if dropped > 0 {
+            self.dropped_events += dropped;
+            tracing::warn!(
+                dropped,
+                total_dropped = self.dropped_events,
+                pending_bytes = self.total_pending_bytes(),
+                "observer publish queue over byte budget; dropped oldest events"
+            );
+        }
+    }
+
+    /// True when nothing is waiting anywhere — the event queue AND the
+    /// coalescer's pending chunk buffer.
+    fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.coalescer.pending.is_empty()
+    }
+
+    /// Pack and remove AT MOST ONE publishable frame: the front event's
+    /// channel, gathered queue-wide in FIFO order (packed greedily until
+    /// adding the next event would push the envelope over
+    /// `OBSERVER_MAX_PLAINTEXT_LEN`). Singletons ship unwrapped.
+    ///
+    /// Two invariants bound the gather:
+    /// - A frame never mixes channels (the desktop archive indexes a frame
+    ///   under its decrypted top-level `channelId`), and events keep their
+    ///   FIFO order *within* each channel. Cross-channel frame order MAY
+    ///   differ from arrival order — the desktop tolerates that everywhere:
+    ///   the transcript store sorts + rebuilds on out-of-order arrival, the
+    ///   archive is per-channel by construction, and the turn store's
+    ///   watermark is keyed per (agent, channel).
+    /// - A NULL-channel event is a BARRIER nothing gathers across: null-scope
+    ///   events (`agent_panic`-class) can causally couple to any channel, so
+    ///   their relative order against every channel is preserved exactly.
+    ///   Null-channel events themselves ship only as their contiguous front
+    ///   run.
+    ///
+    /// Gathering queue-wide (not just the front run) is what keeps the drain
+    /// rate in BYTES per slot rather than front-run-length events per slot:
+    /// with round-robin producers (channel A, B, A, B, ...) a front-run
+    /// packer degrades to ~1 event per slot regardless of size, silently
+    /// growing latency without ever tripping the byte budget.
+    ///
+    /// Pending coalesced chunks are flushed into the queue first, so a
+    /// publish slot never leaves merged chunk text stranded behind the tick.
+    fn next_frame(&mut self) -> Option<observer::ObserverEvent> {
+        for (source_events, ready) in self.coalescer.flush() {
+            self.enqueue(source_events, ready);
+        }
+        let channel = self.events.front()?.2.channel_id.clone();
+
+        let mut picked: Vec<observer::ObserverEvent> = Vec::new();
+        let mut kept: VecDeque<(usize, u64, observer::ObserverEvent)> =
+            VecDeque::with_capacity(self.events.len());
+        let mut gathering = true;
+        while let Some((bytes, source_events, event)) = self.events.pop_front() {
+            if gathering && event.channel_id == channel {
+                picked.push(event);
+                if picked.len() > 1
+                    && serialized_len(&batch_envelope(&picked)) > OBSERVER_MAX_PLAINTEXT_LEN
+                {
+                    // Frame full: the overflow event stays queued and leads
+                    // its channel's next slot.
+                    let event = picked.pop().expect("len > 1");
+                    kept.push_back((bytes, source_events, event));
+                    gathering = false;
+                } else {
+                    self.pending_bytes -= bytes;
+                }
+            } else {
+                if gathering && (channel.is_none() || event.channel_id.is_none()) {
+                    // Null-channel barrier (or, for a null-channel frame, the
+                    // end of its contiguous front run): stop gathering.
+                    gathering = false;
+                }
+                kept.push_back((bytes, source_events, event));
+            }
+        }
+        self.events = kept;
+        Some(seal_batch(picked))
+    }
+}
+
+/// A single event ships unwrapped; two or more get the batch envelope.
+fn seal_batch(mut events: Vec<observer::ObserverEvent>) -> observer::ObserverEvent {
+    if events.len() == 1 {
+        return events.pop().expect("len == 1");
+    }
+    batch_envelope(&events)
+}
+
+/// Build the batch envelope for a set of same-channel events.
+///
+/// Envelope metadata mirrors the LAST inner event — the same convention the
+/// chunk coalescer uses for merged chunks — so `(timestamp, seq)` ordering and
+/// the desktop's latest-live-session tracking see the newest state.
+fn batch_envelope(events: &[observer::ObserverEvent]) -> observer::ObserverEvent {
+    let last = events
+        .last()
+        .expect("batch envelope needs at least 1 event");
+    observer::ObserverEvent {
+        seq: last.seq,
+        timestamp: last.timestamp.clone(),
+        kind: OBSERVER_BATCH_KIND.to_string(),
+        agent_index: last.agent_index,
+        channel_id: last.channel_id.clone(),
+        session_id: last.session_id.clone(),
+        turn_id: last.turn_id.clone(),
+        started_at: last.started_at.clone(),
+        payload: serde_json::json!({
+            "events": serde_json::to_value(events).unwrap_or_default(),
+        }),
+    }
 }
 
 fn spawn_relay_observer_publisher(
@@ -289,79 +1377,112 @@ fn spawn_relay_observer_publisher(
     owner_pubkey: PublicKey,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut coalescer = ObserverChunkCoalescer::default();
-        for event in observer.snapshot() {
-            for event in coalescer.ingest(event) {
-                publish_relay_observer_event(
-                    &publisher,
-                    &keys,
-                    &agent_pubkey_hex,
-                    &owner_pubkey_hex,
-                    &owner_pubkey,
-                    event,
-                )
-                .await;
-            }
-        }
-
-        let mut rx = observer.subscribe();
-        let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(500));
-        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                result = rx.recv() => {
-                    match result {
-                        Ok(event) => {
-                            for event in coalescer.ingest(event) {
-                                publish_relay_observer_event(
-                                    &publisher, &keys, &agent_pubkey_hex,
-                                    &owner_pubkey_hex, &owner_pubkey, event,
-                                ).await;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                            for event in coalescer.flush() {
-                                publish_relay_observer_event(
-                                    &publisher, &keys, &agent_pubkey_hex,
-                                    &owner_pubkey_hex, &owner_pubkey, event,
-                                ).await;
-                            }
-                            tracing::warn!(dropped = count, "relay observer publisher lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            for event in coalescer.flush() {
-                                publish_relay_observer_event(
-                                    &publisher, &keys, &agent_pubkey_hex,
-                                    &owner_pubkey_hex, &owner_pubkey, event,
-                                ).await;
-                            }
-                            break;
-                        }
-                    }
-                }
-                _ = flush_interval.tick() => {
-                    // Periodic flush ensures live streaming even during continuous chunk delivery.
-                    for event in coalescer.flush() {
-                        publish_relay_observer_event(
-                            &publisher, &keys, &agent_pubkey_hex,
-                            &owner_pubkey_hex, &owner_pubkey, event,
-                        ).await;
-                    }
-                }
-            }
-        }
+        // Subscribe BEFORE snapshotting so an event emitted between the two
+        // calls is never lost: it lands in the snapshot, the live receiver, or
+        // both. The overlap is deduped in the run loop via the snapshot's
+        // high-water `seq` (monotonic, assigned at emit).
+        let rx = observer.subscribe();
+        let snapshot = observer.snapshot();
+        run_relay_observer_publisher(
+            snapshot,
+            rx,
+            publisher,
+            keys,
+            agent_pubkey_hex,
+            owner_pubkey_hex,
+            owner_pubkey,
+        )
+        .await;
     })
+}
+
+async fn run_relay_observer_publisher(
+    snapshot: Vec<observer::ObserverEvent>,
+    mut rx: tokio::sync::broadcast::Receiver<observer::ObserverEvent>,
+    publisher: RelayEventPublisher,
+    keys: nostr::Keys,
+    agent_pubkey_hex: String,
+    owner_pubkey_hex: String,
+    owner_pubkey: PublicKey,
+) {
+    let mut queue = ObserverPublishQueue::default();
+    let max_snapshot_seq = snapshot.iter().map(|event| event.seq).max().unwrap_or(0);
+    for event in snapshot {
+        queue.ingest(event);
+    }
+
+    // Global pacer: AT MOST ONE relay frame per tick, no matter how many
+    // channels are active or how large the backlog is. `interval_at` starts
+    // the first tick a full period out, so a pre-loaded snapshot (up to the
+    // 1,000-event replay buffer on reconnect) cannot burst at t=0 — the old
+    // pacer's explicit "no initial burst" property, restored.
+    let mut publish_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + OBSERVER_PUBLISH_TICK,
+        OBSERVER_PUBLISH_TICK,
+    );
+    publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut closed = false;
+    loop {
+        tokio::select! {
+            result = rx.recv(), if !closed => {
+                match result {
+                    Ok(event) => {
+                        // Skip live events already delivered via the snapshot
+                        // (the subscribe-before-snapshot overlap).
+                        if event.seq <= max_snapshot_seq {
+                            continue;
+                        }
+                        queue.ingest(event);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!(dropped = count, "relay observer publisher lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Producer gone: stop selecting on the receiver and let
+                        // the tick arm drain what remains — still one frame per
+                        // tick. An unpaced final drain would be a burst bypass
+                        // around everything the pacer exists to prevent.
+                        closed = true;
+                    }
+                }
+            }
+            _ = publish_tick.tick() => {
+                if let Some(frame) = queue.next_frame() {
+                    publish_relay_observer_event(
+                        &publisher, &keys, &agent_pubkey_hex,
+                        &owner_pubkey_hex, &owner_pubkey, frame,
+                    ).await;
+                }
+                if closed && queue.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
 struct ObserverChunkCoalescer {
     pending: Vec<PendingObserverChunk>,
+    /// Approximate serialized bytes retained in `pending` (each entry's
+    /// serialized skeleton at creation plus appended chunk text). Counted
+    /// against [`OBSERVER_PENDING_QUEUE_MAX_BYTES`] by the owning
+    /// [`ObserverPublishQueue`] so this buffer can never grow outside the
+    /// queue's byte budget (a distinct-key chunk flood parks everything here
+    /// and nothing would otherwise bound it).
+    pending_bytes: usize,
 }
 
 struct PendingObserverChunk {
     key: ObserverChunkKey,
     event: observer::ObserverEvent,
     text: String,
+    /// Bytes this entry contributes to `pending_bytes`.
+    bytes: usize,
+    /// GENERATED observer events merged into this entry (1 at creation, +1
+    /// per absorbed chunk). Evicting the entry loses this many source events,
+    /// so drop accounting must charge this count, not 1.
+    source_events: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,10 +1503,13 @@ struct ObserverChunkKey {
 const OBSERVER_CHUNK_MAX_TEXT_BYTES: usize = 60_000;
 
 impl ObserverChunkCoalescer {
-    fn ingest(&mut self, event: observer::ObserverEvent) -> Vec<observer::ObserverEvent> {
+    /// Returns immediately-publishable events, each paired with the number of
+    /// SOURCE observer events it represents (merged chunks carry the count of
+    /// every chunk they absorbed; passthrough events are always 1).
+    fn ingest(&mut self, event: observer::ObserverEvent) -> Vec<(u64, observer::ObserverEvent)> {
         let Some((key, text)) = observer_chunk_key_and_text(&event) else {
             let mut events = self.flush();
-            events.push(event);
+            events.push((1, event));
             return events;
         };
 
@@ -394,25 +1518,64 @@ impl ObserverChunkCoalescer {
             if pending.text.len() + text.len() >= OBSERVER_CHUNK_MAX_TEXT_BYTES {
                 let events = self.flush();
                 // Start a new pending entry with the current chunk.
-                self.pending.push(PendingObserverChunk { key, event, text });
+                self.push_pending(key, event, text);
                 return events;
             }
             pending.text.push_str(&text);
+            pending.bytes += text.len();
+            pending.source_events += 1;
+            self.pending_bytes += text.len();
             pending.event.seq = event.seq;
             pending.event.timestamp = event.timestamp;
             return Vec::new();
         }
 
-        self.pending.push(PendingObserverChunk { key, event, text });
+        self.push_pending(key, event, text);
         Vec::new()
     }
 
-    fn flush(&mut self) -> Vec<observer::ObserverEvent> {
+    fn push_pending(
+        &mut self,
+        key: ObserverChunkKey,
+        event: observer::ObserverEvent,
+        text: String,
+    ) {
+        // The entry RETAINS the first chunk's text twice until flush: once
+        // inside the serialized skeleton (`event.payload` still carries it)
+        // and once as the extracted `text` copy that appends grow. Both are
+        // real memory, so both count — charging only `serialized_len` lets a
+        // high-cardinality flood retain up to 2x the byte budget (each entry
+        // undercounts by exactly its first chunk's length).
+        let bytes = serialized_len(&event) + text.len();
+        self.pending_bytes += bytes;
+        self.pending.push(PendingObserverChunk {
+            key,
+            event,
+            text,
+            bytes,
+            source_events: 1,
+        });
+    }
+
+    /// Evict the OLDEST pending entry for byte-budget enforcement. Returns
+    /// the number of SOURCE events the entry represented (its merged chunk
+    /// count), or `None` when there is nothing to drop.
+    fn drop_oldest(&mut self) -> Option<u64> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let removed = self.pending.remove(0);
+        self.pending_bytes -= removed.bytes;
+        Some(removed.source_events)
+    }
+
+    fn flush(&mut self) -> Vec<(u64, observer::ObserverEvent)> {
+        self.pending_bytes = 0;
         self.pending
             .drain(..)
             .map(|mut pending| {
                 set_observer_chunk_text(&mut pending.event.payload, pending.text);
-                pending.event
+                (pending.source_events, pending.event)
             })
             .collect()
     }
@@ -676,6 +1839,7 @@ fn handle_relay_observer_control_event(
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
+    event_publisher: RelayEventPublisher,
 ) {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -721,10 +1885,160 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("publish_project_owner_announcements") => {
+            handle_publish_project_owner_announcements_control(
+                &payload,
+                keys,
+                observer,
+                event_publisher,
+            );
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectOwnerAnnouncementControl {
+    request_id: String,
+    announcements: Vec<ProjectOwnerAnnouncementTemplate>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectOwnerAnnouncementTemplate {
+    kind: u16,
+    content: String,
+    created_at: Option<u64>,
+    tags: Vec<Vec<String>>,
+}
+
+fn handle_publish_project_owner_announcements_control(
+    payload: &serde_json::Value,
+    keys: &nostr::Keys,
+    observer: Option<&observer::ObserverHandle>,
+    publisher: RelayEventPublisher,
+) {
+    let Ok(control) = serde_json::from_value::<ProjectOwnerAnnouncementControl>(payload.clone())
+    else {
+        tracing::warn!("project announcement control frame has an invalid payload");
+        return;
+    };
+    if Uuid::parse_str(&control.request_id).is_err()
+        || control.announcements.is_empty()
+        || control.announcements.len() > 2
+    {
+        tracing::warn!("project announcement control frame has invalid request metadata");
+        return;
+    }
+
+    let keys = keys.clone();
+    let observer = observer.cloned();
+    tokio::spawn(async move {
+        let events = match build_project_owner_announcement_events(control.announcements, &keys) {
+            Ok(events) => events,
+            Err(error) => {
+                emit_project_owner_control_result(
+                    observer.as_ref(),
+                    &control.request_id,
+                    "error",
+                    &[],
+                    Some(error.to_string()),
+                );
+                return;
+            }
+        };
+        let mut published_events = Vec::with_capacity(events.len());
+        for event in events {
+            if let Err(error) = publisher.publish_event(event.clone()).await {
+                emit_project_owner_control_result(
+                    observer.as_ref(),
+                    &control.request_id,
+                    "error",
+                    &published_events,
+                    Some(format!("publish project announcement: {error}")),
+                );
+                return;
+            }
+            published_events.push(event);
+        }
+        emit_project_owner_control_result(
+            observer.as_ref(),
+            &control.request_id,
+            "ok",
+            &published_events,
+            None,
+        );
+    });
+}
+
+fn build_project_owner_announcement_events(
+    announcements: Vec<ProjectOwnerAnnouncementTemplate>,
+    keys: &nostr::Keys,
+) -> Result<Vec<nostr::Event>> {
+    let now = nostr::Timestamp::now().as_secs();
+    announcements
+        .into_iter()
+        .map(|template| {
+            if !matches!(template.kind, 30_617 | 30_621) {
+                anyhow::bail!("unsupported project announcement kind");
+            }
+            if !template.tags.iter().any(|tag| {
+                tag.first().is_some_and(|value| value == "d")
+                    && tag.get(1).is_some_and(|value| !value.trim().is_empty())
+            }) {
+                anyhow::bail!("project announcement is missing its address");
+            }
+            let tags = template
+                .tags
+                .into_iter()
+                .map(|tag| {
+                    nostr::Tag::parse(tag)
+                        .map_err(|error| anyhow::anyhow!("invalid project tag: {error}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let created_at = template.created_at.unwrap_or(now);
+            if created_at > now.saturating_add(300) {
+                anyhow::bail!("project announcement timestamp is too far in the future");
+            }
+            nostr::EventBuilder::new(nostr::Kind::Custom(template.kind), template.content)
+                .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(created_at))
+                .sign_with_keys(keys)
+                .map_err(|error| anyhow::anyhow!("sign project announcement: {error}"))
+        })
+        .collect()
+}
+
+fn emit_project_owner_control_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    status: &str,
+    events: &[nostr::Event],
+    error: Option<String>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: None,
+            turn_id: None,
+            started_at: None,
+        },
+        serde_json::json!({
+            "type": "publish_project_owner_announcements",
+            "requestId": request_id,
+            "status": status,
+            "events": events,
+            "error": error,
+        }),
+    );
 }
 
 /// Handle a `cancel_turn` control frame: signal the in-flight task to cancel.
@@ -742,8 +2056,13 @@ fn handle_cancel_turn_control(
         return;
     };
 
-    let fired = signal_in_flight_task(pool, channel_id, ControlSignal::Cancel);
-    let status = if fired { "sent" } else { "no_active_turn" };
+    let status = if pool.channel_control_is_ambiguous(channel_id) {
+        "ambiguous_target"
+    } else if signal_in_flight_task(pool, channel_id, ControlSignal::Cancel) {
+        "sent"
+    } else {
+        "no_active_turn"
+    };
     if let Some(observer) = observer {
         observer.emit(
             "control_result",
@@ -752,10 +2071,12 @@ fn handle_cancel_turn_control(
                 channel_id: Some(channel_id.to_string()),
                 session_id: None,
                 turn_id: None,
+                started_at: None,
             },
             serde_json::json!({
                 "type": "cancel_turn",
                 "status": status,
+                "requestId": payload.get("requestId"),
             }),
         );
     }
@@ -789,6 +2110,13 @@ fn handle_switch_model_control(
         tracing::warn!("observer switch_model control frame missing modelId");
         return;
     };
+    // Opaque per-pick correlator, echoed on every result frame so the Desktop
+    // can ignore a replayed result for an earlier pick. Optional: absent on
+    // older Desktop clients, in which case the frames simply carry no id.
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
 
     // A turn is in flight for this channel iff a task_map entry exists. The
     // agent is moved out of the pool during a turn, so the control oneshot is
@@ -798,14 +2126,21 @@ fn handle_switch_model_control(
         .values()
         .any(|m| m.channel_id == Some(channel_id));
 
-    let status = if turn_in_flight {
+    let status = if pool.channel_control_is_ambiguous(channel_id) {
+        // The Desktop protocol names channels, not sessions. Never switch one
+        // arbitrary sibling and report a channel-wide success.
+        "ambiguous_target"
+    } else if turn_in_flight {
         // Busy path: deliver over the oneshot. `false` means the oneshot was
         // already consumed this turn (a prior cancel/interrupt) — the turn is
         // already ending, so the switch cannot land on it.
         if signal_in_flight_task(
             pool,
             channel_id,
-            ControlSignal::SwitchModel(model_id.to_string()),
+            ControlSignal::SwitchModel {
+                model_id: model_id.to_string(),
+                request_id: request_id.clone(),
+            },
         ) {
             "sent"
         } else {
@@ -813,7 +2148,8 @@ fn handle_switch_model_control(
         }
     } else {
         // Idle path: validate against the cached catalog before invalidating.
-        match pool.switch_idle_agent_model(channel_id, model_id) {
+        match pool.switch_idle_agent_model(channel_id, model_id, request_id.clone()) {
+            IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
             IdleSwitchResult::Switched => "switched",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
@@ -828,11 +2164,15 @@ fn handle_switch_model_control(
                 channel_id: Some(channel_id.to_string()),
                 session_id: None,
                 turn_id: None,
+                started_at: None,
             },
             serde_json::json!({
                 "type": "switch_model",
                 "status": status,
                 "modelId": model_id,
+                // Echo the correlator on the immediate ack so a `sent` /
+                // `turn_ending` / idle-path terminal frame matches the pick.
+                "requestId": request_id,
             }),
         );
     }
@@ -974,10 +2314,8 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
 /// Result of a background respawn task.
 struct RespawnResult {
     index: usize,
-    /// Tuple: (initialized client, protocol version, supports_goose_steer).
-    /// The third element is always `true` — the supervisor uses
-    /// try-and-tolerate for the steer extension.
-    result: Result<(AcpClient, u32, bool)>,
+    /// Tuple: (initialized client, protocol version, agent name).
+    result: Result<(AcpClient, u32, String)>,
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -991,6 +2329,9 @@ struct RespawnResult {
 /// `event_id` is the hex id of the single event the steer carried.
 struct SteerAckEvent {
     channel_id: Uuid,
+    /// Session scope of the steered event — the queue-side withhold/release
+    /// and deadline extension target this, not the whole channel.
+    scope: scope::SessionScope,
     event_id: String,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
@@ -1021,7 +2362,7 @@ impl RespawnGuard {
     /// Send the result and disarm the guard. Uses `try_send` (sync) so there
     /// is no await boundary between marking `sent` and actually enqueueing —
     /// cancellation cannot slip between the two.
-    fn send(mut self, result: Result<(AcpClient, u32, bool)>) {
+    fn send(mut self, result: Result<(AcpClient, u32, String)>) {
         // Invariant: try_send succeeds because the channel capacity equals the
         // slot count, and respawn_in_flight guarantees at most one outstanding
         // result per slot. If this ever fails, the channel sizing or the
@@ -1064,8 +2405,335 @@ impl Drop for RespawnGuard {
 // sync entry point — `std::env::set_var` is only safe before tokio spawns
 // worker threads (Rust 2024 edition safety requirement).
 
+fn inactivity_expired(
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    turn_in_flight: bool,
+) -> bool {
+    !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
+}
+
+/// Whether a woken lazy pool may be torn back down to the empty-slot state.
+///
+/// True only when the pool is ready, the idle bound has elapsed with no
+/// dispatched turn or heartbeat in flight and no in-flight prompt tasks, no
+/// work is queued, and no wake/respawn task is running. The queue and task
+/// gates make teardown race-safe with enqueue/wake: an event that landed in
+/// the queue (or a wake/respawn already in flight) blocks this decision, so a
+/// queued batch is never stranded — the caller's next loop iteration will
+/// dispatch or wake it instead.
+#[allow(clippy::too_many_arguments)]
+fn idle_pool_sleep_due(
+    pool_ready: bool,
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    turn_in_flight: bool,
+    prompt_tasks_in_flight: bool,
+    work_queued: bool,
+    wake_or_respawn_in_flight: bool,
+) -> bool {
+    pool_ready
+        && !work_queued
+        && !prompt_tasks_in_flight
+        && !wake_or_respawn_in_flight
+        && inactivity_expired(last_activity, now, bound, turn_in_flight)
+}
+
+#[cfg(test)]
+mod inactivity_tests {
+    use super::*;
+
+    #[test]
+    fn zero_disables_expiry_and_in_flight_turns_defer_it() {
+        let started = tokio::time::Instant::now();
+        let after_bound = started + Duration::from_secs(61);
+
+        assert!(!inactivity_expired(
+            started,
+            after_bound,
+            Duration::ZERO,
+            false
+        ));
+        assert!(!inactivity_expired(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            true
+        ));
+        assert!(inactivity_expired(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+
+    #[test]
+    fn dispatched_activity_restarts_the_inactivity_bound() {
+        let started = tokio::time::Instant::now();
+        let dispatched = started + Duration::from_secs(50);
+        let checked = started + Duration::from_secs(61);
+
+        assert!(!inactivity_expired(
+            dispatched,
+            checked,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+}
+
+#[cfg(test)]
+mod idle_pool_sleep_tests {
+    use super::*;
+
+    // The all-clear baseline: pool ready, bound elapsed, nothing busy or
+    // queued. Every negative case below flips exactly one gate off this.
+    fn ready_after_bound() -> (tokio::time::Instant, tokio::time::Instant, Duration) {
+        let started = tokio::time::Instant::now();
+        (
+            started,
+            started + Duration::from_secs(61),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn sleeps_when_ready_idle_and_quiet() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(idle_pool_sleep_due(
+            true, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn zero_bound_never_sleeps() {
+        let (last, now, _) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            Duration::ZERO,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn not_ready_never_sleeps() {
+        // A still-sleeping (or waking) pool must not "re-sleep".
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            false, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn active_turn_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn in_flight_prompt_task_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn queued_work_at_boundary_defers_sleep() {
+        // Enqueue-at-teardown protection: a batch sitting in the queue blocks
+        // teardown so it is never stranded — the loop dispatches it instead.
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn wake_or_respawn_in_flight_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn recent_activity_defers_sleep() {
+        // Activity 50s ago under a 60s bound: not yet idle.
+        let started = tokio::time::Instant::now();
+        let recent = started + Duration::from_secs(50);
+        let now = started + Duration::from_secs(59);
+        assert!(!idle_pool_sleep_due(
+            true,
+            recent,
+            now,
+            Duration::from_secs(60),
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    fn slot(respawn_in_flight: bool) -> SlotCircuit {
+        SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight,
+        }
+    }
+
+    // The call-site signal for the `wake_or_respawn_in_flight` gate is
+    // `any_respawn_in_flight(&crash_history)`, NOT `!respawn_tasks.is_empty()`.
+    // Regression for the PR #5682 review blocker: completed respawn tasks are
+    // never joined from the `respawn_tasks` JoinSet (their payloads arrive
+    // out-of-band via `respawn_rx`), so `!is_empty()` stays true forever after
+    // the first refill/crash recovery and the pool could never re-sleep. The
+    // authoritative signal clears per-slot when the payload is received.
+    #[test]
+    fn respawn_in_flight_signal_gates_then_clears_for_sleep() {
+        let (last, now, bound) = ready_after_bound();
+
+        // A respawn in flight for any slot defers sleep.
+        let busy = [slot(false), slot(true), slot(false)];
+        assert!(any_respawn_in_flight(&busy));
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            bound,
+            false,
+            false,
+            false,
+            any_respawn_in_flight(&busy),
+        ));
+
+        // Once the respawn completes (payload received → flag cleared), the
+        // signal goes false and the otherwise-quiet pool becomes sleep-eligible
+        // — even though a naive `!JoinSet.is_empty()` would still be stuck true.
+        let quiet = [slot(false), slot(false), slot(false)];
+        assert!(!any_respawn_in_flight(&quiet));
+        assert!(idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            bound,
+            false,
+            false,
+            false,
+            any_respawn_in_flight(&quiet),
+        ));
+    }
+
+    // The reaper (`respawn_tasks.join_next().now_or_never()` loop) must drain
+    // completed handles so the JoinSet does not grow without bound and so
+    // `!respawn_tasks.is_empty()` cannot become a permanent busy bit if anyone
+    // ever reintroduces it as the gate signal.
+    #[tokio::test]
+    async fn completed_respawn_tasks_are_reaped_from_the_joinset() {
+        let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        respawn_tasks.spawn(async {});
+        respawn_tasks.spawn(async {});
+        // Let both tasks run to completion.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The reaper drains finished handles non-blockingly.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
+
+        assert!(
+            respawn_tasks.is_empty(),
+            "completed respawn tasks must be reaped so the set does not wedge \
+             the idle-sleep gate or grow unbounded"
+        );
+    }
+}
+
+/// Oldest a caller-supplied replay floor may reach back from startup. Bounds
+/// the stale-event burst when a spawn request sat around (e.g. the desktop
+/// slept between the send and this spawn actually running).
+const REPLAY_FLOOR_MAX_AGE_SECS: u64 = 15 * 60;
+
+/// Resolve the startup watermark from process-start time and an optional
+/// replay floor (`--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR`).
+///
+/// A publish-first mention send publishes the triggering message BEFORE this
+/// harness spawns, so the watermark must reach back to the send timestamp for
+/// the first REQ (`since = watermark − 5s`) to replay that message. Floors
+/// older than [`REPLAY_FLOOR_MAX_AGE_SECS`] clamp to that bound; floors in
+/// the future clamp to `now` (a skewed sender must not push the watermark
+/// forward past startup and re-open the blind spot the watermark closes).
+fn startup_watermark_with_floor(now_unix: u64, replay_floor: Option<u64>) -> u64 {
+    match replay_floor {
+        Some(floor) => floor.clamp(now_unix.saturating_sub(REPLAY_FLOOR_MAX_AGE_SECS), now_unix),
+        None => now_unix,
+    }
+}
+
+#[cfg(test)]
+mod replay_floor_tests {
+    use super::{startup_watermark_with_floor, REPLAY_FLOOR_MAX_AGE_SECS};
+
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn no_floor_keeps_startup_time() {
+        assert_eq!(startup_watermark_with_floor(NOW, None), NOW);
+    }
+
+    #[test]
+    fn recent_floor_moves_watermark_back_to_the_send_timestamp() {
+        // The publish-first case: message sent 4s before the harness booted.
+        assert_eq!(startup_watermark_with_floor(NOW, Some(NOW - 4)), NOW - 4);
+    }
+
+    #[test]
+    fn stale_floor_clamps_to_the_max_age_bound() {
+        assert_eq!(
+            startup_watermark_with_floor(NOW, Some(NOW - REPLAY_FLOOR_MAX_AGE_SECS - 1)),
+            NOW - REPLAY_FLOOR_MAX_AGE_SECS
+        );
+    }
+
+    #[test]
+    fn future_floor_is_ignored() {
+        assert_eq!(startup_watermark_with_floor(NOW, Some(NOW + 60)), NOW);
+    }
+
+    #[test]
+    fn early_epoch_now_does_not_underflow() {
+        assert_eq!(startup_watermark_with_floor(10, Some(0)), 0);
+    }
+}
+
 pub fn run() -> Result<()> {
+    let argv0 = std::env::args().next().unwrap_or_default();
+    match std::path::Path::new(&argv0)
+        .file_stem()
+        .and_then(|name| name.to_str())
+    {
+        Some("git-credential-nostr") => std::process::exit(git_credential_nostr::run()),
+        Some("git-sign-nostr") => std::process::exit(git_sign_nostr::run()),
+        _ => {}
+    }
     config::propagate_legacy_env_vars();
+    if is_subcommand("run") {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let code = runtime.block_on(run_task::run());
+        // stdin/file reads can leave a blocking worker pending (for example an
+        // open pipe). Bound runtime shutdown; process exit retires those workers.
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        std::process::exit(code);
+    }
     tokio_main()
 }
 
@@ -1076,8 +2744,8 @@ async fn tokio_main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
     if is_subcommand("models") {
-        // Strip the "models" token so clap doesn't reject it as a positional.
-        // Keeps argv[0] (binary name) and passes everything after "models".
+        // Strip the subcommand token so clap doesn't reject it as a positional.
+        // Keeps argv[0] (binary name) and passes everything after the subcommand.
         let filtered: Vec<String> = std::env::args()
             .enumerate()
             .filter(|(i, _)| *i != 1)
@@ -1087,14 +2755,37 @@ async fn tokio_main() -> Result<()> {
         return run_models(args).await;
     }
 
+    if is_subcommand("auth-methods") {
+        let filtered: Vec<String> = std::env::args()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, a)| a)
+            .collect();
+        let args = AuthMethodsArgs::parse_from(&filtered);
+        return run_auth_methods(args).await;
+    }
+
+    if is_subcommand("authenticate") {
+        let filtered: Vec<String> = std::env::args()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, a)| a)
+            .collect();
+        let args = AuthenticateArgs::parse_from(&filtered);
+        return run_authenticate(args).await;
+    }
+
+    // Stdout is the ACP transport when buzz-acp is launched as an agent command.
+    // Keep every harness diagnostic on stderr so logging can never corrupt NDJSON.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info")),
         )
         .compact()
         .init();
 
-    let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    let config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
@@ -1107,6 +2798,51 @@ async fn tokio_main() -> Result<()> {
         tracing::info!("buzz-acp: setup payload present, entering setup-listener mode");
         return setup_mode::run_setup_listener(config, payload).await;
     }
+
+    // Register termination before creating temporary key material or spawning
+    // adapters. During startup cancellation drops the pool and key guard; once
+    // ready, the existing main-loop shutdown drains active work first.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+    #[cfg(unix)]
+    let signals = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+        )
+    };
+    let tx = shutdown_tx.clone();
+    let signal_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let (mut interrupt, mut terminate) = signals;
+            tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = tx.send(());
+    });
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let harness = run_harness(config, shutdown_tx, shutdown_rx.clone(), ready_tx);
+    tokio::pin!(harness);
+    let result = tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => Ok(()),
+        result = &mut harness => result,
+        _ = &mut ready_rx => harness.await,
+    };
+    signal_task.abort();
+    result
+}
+
+async fn run_harness(
+    config: Config,
+    shutdown_tx: watch::Sender<()>,
+    mut shutdown_rx: watch::Receiver<()>,
+    startup_ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<()> {
+    let runtime = AgentRuntime::prepare(config)?;
+    let config = runtime.config();
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
@@ -1128,104 +2864,37 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    //
-    // Finding #10: one agent failing to start must not kill the whole pool.
-    // We attempt each spawn under a 60-second timeout; failures are logged and
-    // skipped. If ALL agents fail we return an error. A partial pool is valid —
-    // the harness continues with reduced capacity and logs a warning.
-    let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(config.agents as usize);
-    for i in 0..config.agents as usize {
-        // Spawn OUTSIDE the timeout so we always own the child for cleanup.
-        // This matches the run_models pattern and prevents zombie leaks on
-        // init timeout (the cancelled future would drop the AcpClient via
-        // Drop which is best-effort only).
-        let spawn_result = AcpClient::spawn(
-            &config.agent_command,
-            &config.agent_args,
-            &config.persona_env_vars,
-        )
-        .await;
-        match spawn_result {
-            Ok(mut acp) => {
-                acp.set_observer(observer.clone(), i);
-                match tokio::time::timeout(Duration::from_secs(60), acp.initialize()).await {
-                    Ok(Ok(init_result)) => {
-                        tracing::info!(agent = i, "agent initialized: {init_result}");
-                        let protocol_version =
-                            init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
-                        tracing::info!(
-                            agent = i,
-                            name = init_result
-                                .get("agentInfo")
-                                .or_else(|| init_result.get("serverInfo"))
-                                .and_then(|info| info.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown"),
-                            "agent initialized — non-cancelling steer enabled (try-and-tolerate)"
-                        );
-                        acp.observe(
-                            "agent_initialized",
-                            serde_json::json!({
-                                "agentIndex": i,
-                                "initializeResult": init_result,
-                            }),
-                        );
-                        agent_slots.push(Some(OwnedAgent {
-                            index: i,
-                            acp,
-                            state: SessionState::default(),
-                            model_capabilities: None,
-                            desired_model: config.model.clone(),
-                            model_overridden: false,
-                            protocol_version,
-                        }));
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!(agent = i, "agent initialize failed: {e}");
-                        acp.shutdown().await;
-                        agent_slots.push(None);
-                    }
-                    Err(_) => {
-                        tracing::error!(agent = i, "agent timed out during init (60s)");
-                        acp.shutdown().await;
-                        agent_slots.push(None);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(agent = i, "agent failed to spawn: {e}");
-                agent_slots.push(None);
-            }
-        }
-    }
-    let live_count = agent_slots.iter().filter(|s| s.is_some()).count();
-    if live_count == 0 {
-        return Err(anyhow::anyhow!(
-            "all {} agents failed to start — cannot continue",
-            config.agents
-        ));
-    }
-    if live_count < config.agents as usize {
-        tracing::warn!(
-            "started {}/{} agents — continuing with reduced pool",
-            live_count,
-            config.agents
-        );
-    }
-    tracing::info!("agent_pool_ready agents={}", live_count);
-    let mut pool = AgentPool::from_slots(agent_slots);
+    let mut pool = if config.lazy_pool {
+        AgentPool::from_slots((0..config.agents).map(|_| None).collect())
+    } else {
+        initialize_agent_pool(&runtime.startup(observer.clone()), None).await?
+    };
+    let mut pool_ready = !config.lazy_pool;
+    let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
 
+    // Capture a startup watermark BEFORE connecting to the relay. This timestamp
+    // is used for membership notification replay (via startup_watermark) and as
+    // the initial subscribe_since for channels discovered at startup. The Subscribe
+    // handler falls back to subscribe_since when last_seen is None, closing the
+    // blind spot between "agents ready" and "first REQ sent".
     //
-    // Finding #22: capture a startup watermark BEFORE connecting to the relay.
-    // This timestamp is used for membership notification replay (via
-    // startup_watermark) and as the initial subscribe_since for channels
-    // discovered at startup. The Subscribe handler falls back to
-    // subscribe_since when last_seen is None, closing the blind spot
-    // between "agents ready" and "first REQ sent".
-    let startup_watermark: u64 = std::time::SystemTime::now()
+    // A publish-first mention send passes the triggering message's send
+    // timestamp as a replay floor (`--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR`):
+    // the message is already on the relay when this process spawns, so the
+    // watermark must reach back to it for the first REQ to replay it — however
+    // long the spawn took.
+    let now_unix: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let startup_watermark = startup_watermark_with_floor(now_unix, config.replay_floor_unix);
+    if let Some(floor) = config.replay_floor_unix {
+        tracing::info!(
+            floor,
+            startup_watermark,
+            "applying replay floor to startup watermark"
+        );
+    }
 
     let pubkey_hex = config.keys.public_key().to_hex();
 
@@ -1240,7 +2909,7 @@ async fn tokio_main() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
-    // Finding #22: tell the relay background task the watermark so it can use
+    // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
     // Best-effort: a failure here is non-fatal (we just lose the startup window
     // protection, which is the same as the pre-fix behaviour).
@@ -1250,6 +2919,10 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("connected to relay at {}", config.relay_url);
 
+    let relay_rest_client = relay.rest_client();
+    let mut author_gate_ctx =
+        InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
+
     relay
         .subscribe_membership_notifications()
         .await
@@ -1258,15 +2931,9 @@ async fn tokio_main() -> Result<()> {
 
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
-    if config.presence_enabled {
-        match publish_presence(&presence_publisher, &presence_keys, "online").await {
-            Ok(_) => tracing::info!("presence set to online"),
-            Err(e) => tracing::warn!("failed to set initial presence: {e}"),
-        }
-    }
 
     // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
-    let startup_owner: Option<String> = resolve_agent_owner(&config);
+    let startup_owner: Option<String> = resolve_agent_owner(config);
     if let Some(ref owner) = startup_owner {
         tracing::info!("agent owner: {owner}");
     } else {
@@ -1295,13 +2962,14 @@ async fn tokio_main() -> Result<()> {
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
+    let mut relay_observer_publisher = None;
     if config.relay_observer {
         if let (Some(observer), Some(owner_pubkey_hex)) =
             (observer.clone(), owner_cache.pubkey.clone())
         {
             match PublicKey::from_hex(&owner_pubkey_hex) {
                 Ok(owner_pubkey) => {
-                    relay_observer_publisher_task = Some(spawn_relay_observer_publisher(
+                    relay_observer_publisher = Some((
                         observer,
                         relay.event_publisher(),
                         config.keys.clone(),
@@ -1336,91 +3004,66 @@ async fn tokio_main() -> Result<()> {
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
-    let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
-        SubscribeMode::Mentions => {
-            vec![SubscriptionRule {
-                name: "mentions".into(),
-                channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_else(|| {
-                    vec![
-                        KIND_STREAM_MESSAGE,
-                        KIND_WORKFLOW_APPROVAL_REQUESTED,
-                        KIND_STREAM_REMINDER,
-                    ]
-                }),
-                require_mention: !config.no_mention_filter,
-                filter: None,
-                compiled_filter: None,
-                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                prompt_tag: Some("@mention".into()),
-            }]
-        }
-        SubscribeMode::All => {
-            vec![SubscriptionRule {
-                name: "all".into(),
-                channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_default(),
-                require_mention: false,
-                filter: None,
-                compiled_filter: None,
-                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                prompt_tag: Some("all".into()),
-            }]
-        }
-        SubscribeMode::Config => {
-            // load_rules() already warns if the config file has zero rules.
-            config::load_rules(&config.config_path)?
-        }
-    };
+    let rules = startup_subscription_rules(config)?;
 
-    let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    let channel_filters = config::resolve_channel_filters(config, &channel_ids, &rules);
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
+    let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
     for (channel_id, filter) in &channel_filters {
         if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
+            subscribed_channel_ids.insert(*channel_id);
             tracing::info!("subscribed to channel {channel_id}");
         }
     }
 
-    let dedup_mode = config.dedup_mode;
-    let mut queue = EventQueue::new(dedup_mode);
+    if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
+        relay_observer_publisher.take()
+    {
+        relay_observer_publisher_task = Some(spawn_relay_observer_publisher(
+            observer,
+            publisher,
+            keys,
+            agent_pubkey,
+            owner_pubkey,
+            owner,
+        ));
+    }
 
-    let base_prompt_content = config.base_prompt_content.take();
-    let ctx = Arc::new(PromptContext {
-        mcp_servers: build_mcp_servers(&config),
-        initial_message: config.initial_message.clone(),
-        idle_timeout: Duration::from_secs(config.idle_timeout_secs),
-        max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
-        turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
-        dedup_mode: config.dedup_mode,
-        system_prompt: config.system_prompt.clone(),
-        base_prompt: if config.no_base_prompt {
-            None
-        } else if let Some(content) = base_prompt_content {
-            Some(Box::leak(content.into_boxed_str()))
-        } else {
-            Some(include_str!("base_prompt.md"))
-        },
-        heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd: std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string(),
-        rest_client: relay.rest_client(),
-        channel_info: channel_info_map,
-        context_message_limit: config.context_message_limit,
-        max_turns_per_session: config.max_turns_per_session,
-        permission_mode: config.permission_mode,
-        agent_keys: config.keys.clone(),
-        agent_owner_pubkey: startup_owner
-            .as_deref()
-            .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
-        memory_enabled: config.memory_enabled,
-        harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
-    });
+    let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    let dedup_mode = config.dedup_mode;
+    let mut queue =
+        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+
+    // Online means the harness can receive work, not merely that its socket is
+    // connected. Publishing after channel subscriptions gives desktop callers
+    // a durable readiness boundary before they send a startup mention.
+    if config.presence_enabled {
+        match publish_presence(&presence_publisher, &presence_keys, "online").await {
+            Ok(_) => tracing::info!("presence set to online"),
+            Err(e) => tracing::warn!("failed to set initial presence: {e}"),
+        }
+    }
+
+    if config.lazy_pool {
+        emit_runtime_lifecycle(
+            observer.as_ref(),
+            &runtime_start_nonce,
+            &pubkey_hex,
+            &config.relay_url,
+            "listening",
+            None,
+        );
+    }
+
+    let ctx = Arc::new(runtime.prompt_context(
+        relay.rest_client(),
+        channel_info_map,
+        SessionMode::Conversation,
+    )?);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -1459,8 +3102,44 @@ async fn tokio_main() -> Result<()> {
     } else {
         None
     };
-    let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
+    let mut typing_channels: HashMap<scope::SessionScope, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Independent of pool readiness: a never-mentioned lazy agent must still
+    // self-terminate. The watch interval is capped so small configured bounds
+    // remain reasonably precise without waking long-lived agents frequently.
+    let inactivity_bound = Duration::from_secs(config.exit_after_inactivity_secs);
+    let mut last_activity = tokio::time::Instant::now();
+    let mut inactivity_reaper = if inactivity_bound.is_zero() {
+        None
+    } else {
+        let interval = inactivity_bound.min(Duration::from_secs(30));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + interval,
+            interval,
+        ))
+    };
+
+    // Idle pool re-sleep: tear a woken lazy pool back down to the empty-slot
+    // state after `idle_pool_sleep_bound` of quiet, releasing worker
+    // subprocesses. The next accepted event re-wakes it through the same lazy
+    // path. Only meaningful under `lazy_pool`; the tick arm additionally gates
+    // on `pool_ready`, so a still-sleeping pool never re-sleeps. Reuses the
+    // `last_activity` clock the dispatch path already maintains.
+    let idle_pool_sleep_bound = if config.lazy_pool {
+        Duration::from_secs(config.idle_pool_sleep_secs)
+    } else {
+        Duration::ZERO
+    };
+    let mut idle_pool_sleep_reaper = if idle_pool_sleep_bound.is_zero() {
+        None
+    } else {
+        let interval = idle_pool_sleep_bound.min(Duration::from_secs(30));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + interval,
+            interval,
+        ))
+    };
 
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
@@ -1473,6 +3152,8 @@ async fn tokio_main() -> Result<()> {
     let (respawn_tx, mut respawn_rx) = mpsc::channel::<RespawnResult>(config.agents as usize);
     // JoinSet for respawn tasks so shutdown can abort them.
     let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let (wake_tx, mut wake_rx) = mpsc::channel::<(u32, Result<AgentPool, String>)>(1);
+    let mut wake_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     // Channel for non-cancelling steer ack watchers to forward outcomes back
     // to the main loop. Each `pool.send_steer(...) == Ok(())` spawns a
@@ -1486,25 +3167,8 @@ async fn tokio_main() -> Result<()> {
     //      `IN_FLIGHT_DEADLINE_SECS` expires.
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
 
-    // ── Step 7: Shutdown signal ───────────────────────────────────────────────
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(());
-
-    let tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        let _ = tx.send(());
-    });
-
-    #[cfg(unix)]
-    {
-        let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            sigterm.recv().await;
-            let _ = tx.send(());
-        });
-    }
+    // Startup is complete; the main loop now owns graceful shutdown.
+    let _ = startup_ready.send(());
 
     // Track the newest membership notification timestamp per channel.
     // On reconnect the relay replays events newest-first, so the first event
@@ -1559,10 +3223,49 @@ async fn tokio_main() -> Result<()> {
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
+        Wake(u32, Result<AgentPool, String>),
+        HoldDeadline,
+        Recovery(recovery_wake::RecoveryWake),
     }
 
     loop {
-        if last_maintenance.elapsed() >= maintenance_interval {
+        // Whether buffered work is waiting on a lazy pool. Also gates the
+        // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
+        // (possibly past) `retry_at` until the next wake, so sleeping on it
+        // unconditionally would complete instantly on every iteration — a
+        // busy spin — whenever the queued work drained after a failed wake.
+        let mut lazy_wake_work_pending = false;
+        if config.lazy_pool && !pool_ready {
+            lazy_wake_work_pending = queue.has_flushable_work();
+            if let Some(attempt) = pool_lifecycle
+                .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
+            {
+                emit_runtime_lifecycle(
+                    observer.as_ref(),
+                    &runtime_start_nonce,
+                    &pubkey_hex,
+                    &config.relay_url,
+                    "waking",
+                    None,
+                );
+                let startup = runtime.startup(observer.clone());
+                let wake_tx = wake_tx.clone();
+                let wake_shutdown = shutdown_rx.clone();
+                wake_tasks.spawn(async move {
+                    let result = initialize_agent_pool(&startup, Some(wake_shutdown))
+                        .await
+                        .map_err(|error| error.to_string());
+                    if let Err(error) = wake_tx.send((attempt, result)).await {
+                        let (_attempt, result) = error.0;
+                        if let Ok(mut abandoned_pool) = result {
+                            shutdown_agent_pool(&mut abandoned_pool).await;
+                        }
+                    }
+                });
+            }
+        }
+
+        if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
@@ -1581,10 +3284,11 @@ async fn tokio_main() -> Result<()> {
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
+                let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, idx, observer).await;
+                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
                     guard.send(result);
                 });
             }
@@ -1595,53 +3299,55 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
                 }
             }
         }
 
-        let mut respawn_collected = false;
-        while let Ok(rr) = respawn_rx.try_recv() {
-            crash_history[rr.index].respawn_in_flight = false;
-            match rr.result {
-                Ok((acp, protocol_version, _)) => {
-                    let agent = OwnedAgent {
-                        index: rr.index,
-                        acp,
-                        state: SessionState::default(),
-                        model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
-                        protocol_version,
-                    };
-                    pool.return_agent(agent);
-                    tracing::info!(agent = rr.index, "respawn complete");
-                    respawn_collected = true;
-                }
-                Err(e) => {
-                    crash_history[rr.index].mark_spawn_failed();
-                    tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
-                }
-            }
-        }
-        // Flush requeued events that were waiting for a live agent. Without
-        // this, batches requeued during crash recovery sit idle until the
-        // next relay event arrives — which can be minutes on quiet channels.
-        if respawn_collected {
-            for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                typing_channels.insert(channel_id, thread_tags);
-            }
-        }
+        // Reap completed respawn handles from the JoinSet. Payloads are
+        // delivered out-of-band through `respawn_rx` (selected below), so the
+        // JoinSet is never joined by the normal flow — Tokio retains finished
+        // tasks until `join_next`, so without this the set grows on every
+        // refill/crash recovery and `!respawn_tasks.is_empty()` would stay true
+        // forever. Non-blocking (`now_or_never`), same pattern as
+        // `drain_ready_join_results` for `pool.join_set`. The authoritative
+        // in-flight signal is `any_respawn_in_flight(&crash_history)` (each
+        // slot's `respawn_in_flight` is cleared when its payload is received),
+        // not JoinSet occupancy.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
+        // Retry deadlines are actionable only with idle capacity. A busy pool
+        // wakes on its result/respawn instead of spinning on an expired retry.
+        let retry_at = if pool_ready && pool.any_idle() {
+            queue.next_retry_deadline()
+        } else {
+            None
+        };
+        let maintenance_at = pool_ready.then_some(last_maintenance + maintenance_interval);
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
+        pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
+        let hold_deadline = pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT);
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
-                // Finding #24: recv() returning None means all senders dropped
-                // (pool was torn down). Break cleanly instead of panicking.
-                r = result_rx.recv() => match r {
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("shutting down");
+                    break;
+                }
+                wake = recovery_wake::wait(&mut respawn_rx, retry_at, maintenance_at) => {
+                    Some(PoolEvent::Recovery(wake))
+                }
+                // recv() returning None means all senders dropped (pool was torn down).
+                // Break cleanly instead of panicking.
+                r = result_rx.recv(), if pool_ready => match r {
                     Some(result) => Some(PoolEvent::Result(Box::new(result))),
                     None => {
                         tracing::info!("result channel closed — exiting main loop");
@@ -1662,6 +3368,44 @@ async fn tokio_main() -> Result<()> {
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
                 }
+                Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
+                    Some(PoolEvent::Wake(attempt, result))
+                }
+                // Gated on pending work: with an empty queue there is nothing
+                // for the retry to dispatch, and a past `retry_at` would
+                // otherwise complete instantly on every iteration (busy spin).
+                // The next accepted event re-enables the arm.
+                _ = async {
+                    match pool_lifecycle.retry_at() {
+                        Some(retry_at) if lazy_wake_work_pending => {
+                            tokio::time::sleep_until(retry_at).await
+                        }
+                        _ => std::future::pending().await,
+                    }
+                } => None,
+                _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
+                    Some(PoolEvent::HoldDeadline)
+                },
+                Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
+                    if let Some(attempt) = pool_lifecycle.waking_attempt() {
+                        let message = format!("pool wake task failed: {error}");
+                        if pool_lifecycle.cancel_wake(
+                            attempt,
+                            message.clone(),
+                            tokio::time::Instant::now(),
+                        ) {
+                            emit_runtime_lifecycle(
+                                observer.as_ref(),
+                                &runtime_start_nonce,
+                                &pubkey_hex,
+                                &config.relay_url,
+                                "failed",
+                                Some(&message),
+                            );
+                        }
+                    }
+                    None
+                }
                 control_event = async {
                     match relay_observer_control_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -1672,7 +3416,14 @@ async fn tokio_main() -> Result<()> {
                     match control_event {
                         Some(event) => {
                             if let Some(ref owner_hex) = owner_cache.pubkey {
-                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex);
+                                handle_relay_observer_control_event(
+                                    &config.keys,
+                                    event,
+                                    &mut pool,
+                                    observer.as_ref(),
+                                    owner_hex,
+                                    relay.event_publisher(),
+                                );
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -1748,15 +3499,20 @@ async fn tokio_main() -> Result<()> {
                                     // stripped for a legitimately re-added channel.
                                     removed_channels.remove(&ch);
 
-                                    if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
+                                    if subscribed_channel_ids.contains(&ch) {
+                                        tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
+                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
+                                        } else {
+                                            subscribed_channel_ids.insert(ch);
                                         }
                                     } else {
                                         tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
                                     }
                                 } else {
+                                    subscribed_channel_ids.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
@@ -1766,11 +3522,17 @@ async fn tokio_main() -> Result<()> {
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
-                                    let invalidated = pool.invalidate_channel_sessions(ch);
+                                    let invalidated = if pool_ready {
+                                        pool.invalidate_channel_sessions(ch)
+                                    } else {
+                                        0
+                                    };
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
-                                    typing_channels.remove(&ch);
+                                    // Drop every thread scope's typing entry for
+                                    // the removed channel.
+                                    typing_channels.retain(|scope, _| scope.channel_id() != ch);
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
                                     // emitting the notification, so this DELETE may
@@ -1842,21 +3604,36 @@ async fn tokio_main() -> Result<()> {
                                 &pubkey_hex,
                             );
                             if is_cancel {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        let fired = signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            ControlSignal::Cancel,
+                                let from_owner = owner_cache.get().is_some_and(|owner| {
+                                    buzz_event.event.pubkey.to_hex() == *owner
+                                });
+                                if from_owner {
+                                    // Scope-exact: an owner's !cancel in thread A
+                                    // must cancel thread A's turn, never a sibling
+                                    // thread running in the same channel. Under
+                                    // the default channel policy the scope is the
+                                    // channel's sole conversation, so this is
+                                    // byte-for-byte the prior behavior.
+                                    let scope = scope::SessionScope::derive(
+                                        config.session_policy,
+                                        buzz_event.channel_id,
+                                        is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await,
+                                        &buzz_event.event,
+                                    );
+                                    let fired = signal_in_flight_task_for_scope(
+                                        &mut pool,
+                                        &scope,
+                                        ControlSignal::Cancel,
+                                    );
+                                    if !fired {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            scope = %scope.telemetry_label(),
+                                            "!cancel received but no in-flight task — no-op"
                                         );
-                                        if !fired {
-                                            tracing::warn!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!cancel received but no in-flight task — no-op"
-                                            );
-                                        }
-                                        continue; // consume event — do NOT push to queue
                                     }
+                                    continue; // consume event — do NOT push to queue
                                 }
                                 // Not from owner — fall through to normal prompt handling.
                             }
@@ -1880,28 +3657,44 @@ async fn tokio_main() -> Result<()> {
                                 &pubkey_hex,
                             );
                             if is_rotate {
-                                if let Some(owner) = owner_cache.get() {
-                                    if buzz_event.event.pubkey.to_hex() == *owner {
-                                        let fired = signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            ControlSignal::Rotate,
+                                let from_owner = owner_cache.get().is_some_and(|owner| {
+                                    buzz_event.event.pubkey.to_hex() == *owner
+                                });
+                                if from_owner {
+                                    // Scope-exact: rotate only the thread the
+                                    // owner's !rotate belongs to. Under the
+                                    // default channel policy the scope is the
+                                    // channel's sole conversation, matching the
+                                    // prior channel-wide rotate.
+                                    let scope = scope::SessionScope::derive(
+                                        config.session_policy,
+                                        buzz_event.channel_id,
+                                        is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                            .await,
+                                        &buzz_event.event,
+                                    );
+                                    let fired = signal_in_flight_task_for_scope(
+                                        &mut pool,
+                                        &scope,
+                                        ControlSignal::Rotate,
+                                    );
+                                    if fired {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            scope = %scope.telemetry_label(),
+                                            "!rotate received — cancelling in-flight turn and rotating session"
                                         );
-                                        if fired {
-                                            tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                "!rotate received — cancelling in-flight turn and rotating session"
-                                            );
-                                        } else {
-                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
-                                            tracing::info!(
-                                                channel_id = %buzz_event.channel_id,
-                                                invalidated,
-                                                "!rotate received — invalidated idle channel session(s)"
-                                            );
-                                        }
-                                        continue; // consume event — do NOT push to queue
+                                    } else {
+                                        let invalidated =
+                                            pool.invalidate_scope_session(&scope);
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            scope = %scope.telemetry_label(),
+                                            invalidated,
+                                            "!rotate received — invalidated idle session for scope"
+                                        );
                                     }
+                                    continue; // consume event — do NOT push to queue
                                 }
                                 // Not from owner — fall through to normal prompt handling.
                             }
@@ -1917,117 +3710,74 @@ async fn tokio_main() -> Result<()> {
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
-                            {
-                                let author = buzz_event.event.pubkey.to_hex();
-                                let allowed = author_allowed(
-                                    &config.respond_to,
-                                    &config.respond_to_allowlist,
-                                    &author,
-                                    &owner_cache,
-                                    &ctx.rest_client,
-                                )
-                                .await;
-                                if !allowed {
-                                    tracing::debug!(
-                                        channel_id = %buzz_event.channel_id,
-                                        author = %buzz_event.event.pubkey.to_hex(),
-                                        mode = %config.respond_to,
-                                        "inbound author gate — dropping event"
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
-                                None => {
-                                    tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
-                                    continue;
-                                }
+                            let Some(authorized_event) = authorize_normal_listener_event(
+                                &mut author_gate_ctx,
+                                buzz_event,
+                                &config.respond_to,
+                                &config.respond_to_allowlist,
+                                &owner_cache,
+                                &ctx.channel_info,
+                                &ctx.rest_client,
+                            )
+                            .await
+                            else {
+                                continue;
                             };
-                            // Capture author pubkey before queue.push() moves
-                            // buzz_event.event (needed for mode gate below).
-                            let author_hex = buzz_event.event.pubkey.to_hex();
-                            let event_id_hex = buzz_event.event.id.to_hex();
-                            // Clone for the non-cancelling steer fork, which
-                            // needs the event to render the steer body. The
-                            // clone is unconditional because we don't know
-                            // yet whether the mode gate will demand a steer
-                            // — checking `multiple_event_handling` here
-                            // would couple the queueing path to the mode
-                            // and break the existing invariant that every
-                            // accepted event goes through `queue.push`
-                            // first. `nostr::Event::clone` is cheap (Arc-
-                            // backed payload) so the cost is negligible.
-                            let event_for_steer = buzz_event.event.clone();
-                            let prompt_tag_for_steer = prompt_tag.clone();
-                            let accepted = queue.push(QueuedEvent {
-                                channel_id: buzz_event.channel_id,
-                                event: buzz_event.event,
-                                received_at: std::time::Instant::now(),
-                                prompt_tag,
-                            });
+                            let Some(ingress) =
+                                AuthorizedNormalListenerEvent(authorized_event)
+                                    .match_subscription(&rules, &pubkey_hex)
+                                    .await
+                            else {
+                                tracing::debug!("authorized event matched no rule — dropping");
+                                continue;
+                            };
+                            let ingress = ingress.resolve_edit_routing(&ctx.rest_client).await;
+                            // Derive the session scope once, at admission, from
+                            // the operator policy, DM status, and NIP-10 thread
+                            // tags. Under the default `channel` policy this is
+                            // always a conversation scope, preserving today's
+                            // channel-keyed routing. Telemetry only for now —
+                            // queue/pool partitioning by scope lands in a
+                            // follow-up (see ticket outline steps 2–4).
+                            let channel_is_dm = is_dm_channel(
+                                ingress.buzz_event.channel_id,
+                                &ctx.channel_info,
+                            )
+                            .await;
+                            let session_scope =
+                                ingress.session_scope(config.session_policy, channel_is_dm);
+                            tracing::debug!(
+                                channel_id = %session_scope.channel_id(),
+                                scope = %session_scope.telemetry_label(),
+                                thread_scoped = session_scope.is_thread(),
+                                thread_root = session_scope.root_event_id().unwrap_or("-"),
+                                policy = %config.session_policy,
+                                "admitted event — resolved session scope"
+                            );
+                            let queued = ingress.push(&mut queue, session_scope, channel_is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            if accepted {
-                                let rc = ctx.rest_client.clone();
-                                let eid = event_id_hex.clone();
-                                tokio::spawn(async move {
-                                    pool::reaction_add(&rc, &eid, "👀").await;
-                                });
-                            }
-                            // Event is already queued. If mode requires it AND
-                            // the channel has an in-flight task, fire cancel —
-                            // OR take the non-cancelling (ACP steer) fork for Steer signals.
-                            if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
-                                // Author eligibility (owner ∪ allowlist ∪ siblings)
-                                // is already enforced by the inbound author gate
-                                // above, so the mid-turn signal fires for every
-                                // event that reaches here.
-                                let signal = mode_gate_signal(
-                                    config.multiple_event_handling,
-                                    &author_hex,
-                                    owner_cache.get(),
-                                );
-                                if let Some(signal) = signal {
-                                    // Try-and-tolerate fork: when the mode
-                                    // wants a Steer, attempt the non-cancelling
-                                    // path first for any agent. On accept,
-                                    // withhold the queued event and spawn an
-                                    // ack watcher; the main loop's
-                                    // `PoolEvent::SteerAck` arm decides
-                                    // success/release/fallback. On reject
-                                    // (including `-32601 method_not_found`
-                                    // from agents that don't implement the
-                                    // extension), fall through to the universal
-                                    // cancel+merge `Steer` signal so the event
-                                    // still reaches the agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
-                                        && try_native_steer(
-                                            &mut pool,
-                                            &mut queue,
-                                            buzz_event.channel_id,
-                                            event_for_steer,
-                                            prompt_tag_for_steer,
-                                            &steer_ack_tx,
-                                        );
-                                    if !native_attempted {
-                                        signal_in_flight_task(
-                                            &mut pool,
-                                            buzz_event.channel_id,
-                                            signal,
-                                        );
-                                    }
+                            queued.mark_seen(&ctx.rest_client);
+                            // Event is already queued. The authorized ingress
+                            // retains its verified author, resolved scope, and
+                            // event data through the optional steer/interrupt
+                            // decision.
+                            queued.steer_or_interrupt(
+                                config.multiple_event_handling,
+                                owner_cache.get(),
+                                &mut pool,
+                                &mut queue,
+                                &steer_ack_tx,
+                            );
+                            if pool_ready {
+                                for (scope, thread_tags) in
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
+                                {
+                                    typing_channels.insert(scope, thread_tags);
                                 }
-                            }
-                            for (channel_id, thread_tags) in
-                                dispatch_pending(&mut pool, &mut queue, &ctx)
-                            {
-                                typing_channels.insert(channel_id, thread_tags);
                             }
                         }
                         None => {
@@ -2042,18 +3792,91 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 _ = async {
+                    match inactivity_reaper.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    if inactivity_expired(
+                        last_activity,
+                        tokio::time::Instant::now(),
+                        inactivity_bound,
+                        queue.has_in_flight() || heartbeat_in_flight,
+                    ) {
+                        tracing::info!(
+                            inactivity_seconds = config.exit_after_inactivity_secs,
+                            "inactivity bound reached — exiting gracefully"
+                        );
+                        let _ = shutdown_tx.send(());
+                    }
+                    None
+                }
+                _ = async {
+                    match idle_pool_sleep_reaper.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx; // end split borrow before touching pool
+                    // A wake in flight (pool not yet ready) is covered by the
+                    // pool_ready gate; respawn tasks and in-flight prompt tasks
+                    // are the remaining "busy" signals. Never sleep mid-work:
+                    // `has_undispatched_work()` (not `has_flushable_work()`)
+                    // keeps `work_queued` true for a retry-throttled batch too,
+                    // so a failed turn awaiting backoff is never stranded — the
+                    // next iteration dispatches or re-wakes it.
+                    if idle_pool_sleep_due(
+                        pool_ready,
+                        last_activity,
+                        tokio::time::Instant::now(),
+                        idle_pool_sleep_bound,
+                        queue.has_in_flight() || heartbeat_in_flight,
+                        !pool.join_set.is_empty(),
+                        queue.has_undispatched_work(),
+                        !wake_tasks.is_empty()
+                            || any_respawn_in_flight(&crash_history),
+                    ) {
+                        tracing::info!(
+                            idle_pool_sleep_seconds = config.idle_pool_sleep_secs,
+                            "idle pool sleep bound reached — tearing pool back to lazy state"
+                        );
+                        shutdown_agent_pool(&mut pool).await;
+                        // Return to the exact pre-wake lazy state: empty slots,
+                        // Listening lifecycle. The top-of-loop wake path re-wakes
+                        // on the next accepted event. No second lifecycle.
+                        pool = AgentPool::from_slots(
+                            (0..config.agents).map(|_| None).collect(),
+                        );
+                        pool_ready = false;
+                        pool_lifecycle = PoolLifecycle::listening();
+                        last_activity = tokio::time::Instant::now();
+                        emit_runtime_lifecycle(
+                            observer.as_ref(),
+                            &runtime_start_nonce,
+                            &pubkey_hex,
+                            &config.relay_url,
+                            "listening",
+                            None,
+                        );
+                    }
+                    None
+                }
+                _ = async {
                     match heartbeat.as_mut() {
                         Some(hb) => hb.tick().await,
                         None => std::future::pending().await,
                     }
                 } => {
                     let _ = result_rx;
-                    if queue.has_flushable_work() {
+                    if !pool_ready {
+                        tracing::debug!("heartbeat_skipped_pool_not_ready");
+                    } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
-                        for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                        for (scope, thread_tags) in
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
                         {
-                            typing_channels.insert(channel_id, thread_tags);
+                            typing_channels.insert(scope, thread_tags);
                         }
                     } else if pool.any_idle() {
                         dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
@@ -2092,7 +3915,8 @@ async fn tokio_main() -> Result<()> {
                     // Use try_publish (non-blocking) for typing indicators —
                     // they're ephemeral and must not block the main loop during
                     // relay reconnection (#35).
-                    for (&ch, thread_tags) in &typing_channels {
+                    for (scope, thread_tags) in &typing_channels {
+                        let ch = scope.channel_id();
                         if let Ok(event) = relay.build_typing_event(
                             ch,
                             thread_tags.root_event_id.as_deref(),
@@ -2105,23 +3929,67 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("shutting down");
-                    break;
-                }
             }
         };
 
         match pool_event {
+            Some(PoolEvent::Recovery(wake)) => {
+                match wake {
+                    recovery_wake::RecoveryWake::Respawn(rr) => {
+                        crash_history[rr.index].respawn_in_flight = false;
+                        match rr.result {
+                            Ok((acp, protocol_version, agent_name)) => {
+                                let agent = OwnedAgent {
+                                    index: rr.index,
+                                    acp,
+                                    state: SessionState::default(),
+                                    model_capabilities: None,
+                                    desired_model: config.model.clone(),
+                                    model_overridden: false,
+                                    desired_model_request_id: None,
+                                    desired_model_pending_ack: false,
+                                    startup_effort: config.effort_level.clone(),
+                                    agent_name,
+                                    goose_system_prompt_supported: None,
+                                    protocol_version,
+                                };
+                                pool.return_agent(agent);
+                                tracing::info!(agent = rr.index, "respawn complete");
+                            }
+                            Err(e) => {
+                                crash_history[rr.index].mark_spawn_failed();
+                                tracing::warn!(
+                                    agent = rr.index,
+                                    "respawn failed: {e} — circuit re-opened"
+                                );
+                            }
+                        }
+                    }
+                    // Maintenance runs at the top of the next iteration.
+                    recovery_wake::RecoveryWake::Maintenance => continue,
+                    recovery_wake::RecoveryWake::Retry => {}
+                }
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
             Some(PoolEvent::Result(result)) => {
-                // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
+                // Stop the typing indicator for the completed turn's exact scope,
+                // not the whole channel — a sibling thread still running in the
+                // same channel must keep its indicator.
+                if let Some(scope) = result.source.scope() {
+                    typing_channels.remove(scope);
                 }
                 if handle_prompt_result(
                     &mut pool,
                     &mut queue,
-                    &config,
+                    config,
                     *result,
                     &mut heartbeat_in_flight,
                     &removed_channels,
@@ -2130,6 +3998,7 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    &mut last_activity,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -2137,7 +4006,7 @@ async fn tokio_main() -> Result<()> {
                 if drain_ready_join_results(
                     &mut pool,
                     &mut queue,
-                    &config,
+                    config,
                     &mut heartbeat_in_flight,
                     &removed_channels,
                     &mut typing_channels,
@@ -2149,8 +4018,14 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
@@ -2158,7 +4033,7 @@ async fn tokio_main() -> Result<()> {
                 recover_panicked_agent(
                     &mut pool,
                     &mut queue,
-                    &config,
+                    config,
                     join_error,
                     &mut heartbeat_in_flight,
                     &removed_channels,
@@ -2172,22 +4047,41 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
                 }
             }
             Some(PoolEvent::SteerAck(SteerAckEvent {
                 channel_id,
+                scope,
                 event_id,
                 ack,
             })) => {
-                // Goose-native steer attempt resolved. Locked semantics
-                // (Eva + Max + Perci, unanimous on Option X):
+                // Mid-turn steer attempt resolved (either transport:
+                // `_goose/unstable/session/steer` or `_session/steering`).
+                // Locked semantics (Eva + Max + Perci, unanimous on Option X):
                 //
                 //   Success
                 //     The agent received the steer via the non-cancelling
                 //     path. Drop the withheld event so normal dispatch
                 //     never redelivers it.
+                //
+                //     Also covers `_session/steering`'s `startedNewTurn`
+                //     outcome: the message was delivered, but into a fresh
+                //     turn because the one being steered had already
+                //     finished. Delivery is what this arm keys on, so the
+                //     event is still dropped. The read loop deliberately
+                //     does NOT renew its hard deadline in that case (the
+                //     awaited turn is settled), while
+                //     `extend_in_flight_deadline` below still applies —
+                //     the agent really is running more work, so the
+                //     channel's in-flight budget should reflect it.
                 //
                 //   Err(_) where the write never landed (Transport /
                 //   ExpectedRunIdMissing):
@@ -2195,6 +4089,16 @@ async fn tokio_main() -> Result<()> {
                 //     attempted on the wire". Release withheld back to the
                 //     queue front AND issue the cancel+merge fallback so
                 //     the message still reaches the agent.
+                //
+                //   Err(OutcomeRejected { .. })
+                //     A `_session/steering` request returned a JSON-RPC
+                //     success whose `outcome` was not `injected` or
+                //     `startedNewTurn` (codex's `failed`, an unknown value,
+                //     or a bare `{}` with no `outcome` at all). The steer
+                //     did not land, so this is treated exactly like a write
+                //     that never happened: release withheld AND fire the
+                //     cancel+merge fallback. Handled by the catch-all
+                //     `Err(_)` arm below.
                 //
                 //   Err(AgentError { code: -32601, .. })
                 //     The agent returned method_not_found — it does not
@@ -2235,7 +4139,7 @@ async fn tokio_main() -> Result<()> {
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
                 let (release_withheld, drop_withheld, signal_fallback) = match &ack {
-                    Ok(pool::SteerAck::Success) => (false, true, false),
+                    Ok(pool::SteerAck::Success { .. }) => (false, true, false),
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
                     // reaches the agent.
@@ -2252,9 +4156,9 @@ async fn tokio_main() -> Result<()> {
                     Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
                         (true, false, false)
                     }
-                    // Transport / ExpectedRunIdMissing: write never landed.
-                    // Release and fire the cancel+merge fallback so the
-                    // message still reaches the agent.
+                    // Transport / ExpectedRunIdMissing / OutcomeRejected: the
+                    // steer did not land. Release and fire the cancel+merge
+                    // fallback so the message still reaches the agent.
                     Ok(pool::SteerAck::Err(_)) => (true, false, true),
                     Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
                     Err(_recv_err) => (true, false, false),
@@ -2268,19 +4172,31 @@ async fn tokio_main() -> Result<()> {
                     signal_fallback,
                     "non-cancelling steer ack received"
                 );
+                if let Ok(pool::SteerAck::Success { session_id }) = &ack {
+                    queue.extend_in_flight_deadline(&scope, config.max_turn_duration_secs);
+                    if !pool.record_successful_steer(&scope, event_id.clone(), session_id.clone()) {
+                        tracing::warn!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            "successful steer lost its in-flight delivery ledger"
+                        );
+                    }
+                }
                 if drop_withheld {
-                    queue.remove_event(channel_id, &event_id);
+                    queue.remove_event(&scope, &event_id);
                 }
                 if release_withheld {
-                    queue.release_native_steer(channel_id, &event_id);
+                    queue.release_native_steer(&scope, &event_id);
                 }
                 if signal_fallback {
                     // Universal cancel+merge fallback. Note: the
                     // queued event has already been released to the
-                    // front of `queues[channel_id]`, so the cancel
-                    // will pick it up as part of the merged batch and
-                    // re-prompt the agent.
-                    signal_in_flight_task(&mut pool, channel_id, ControlSignal::Steer);
+                    // front of `queues[scope]`, so the cancel will pick
+                    // it up as part of the merged batch and re-prompt the
+                    // agent. Scope-exact so the fallback cancels the
+                    // steered event's OWN thread, not a sibling thread
+                    // in the same channel.
+                    signal_in_flight_task_for_scope(&mut pool, &scope, ControlSignal::Steer);
                 }
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
@@ -2289,11 +4205,101 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
-                    typing_channels.insert(channel_id, thread_tags);
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
+            Some(PoolEvent::Wake(attempt, result)) => {
+                let completion = result.as_ref().map(|_| ()).map_err(|error| error.clone());
+                if let Err(error) =
+                    pool_lifecycle.complete_wake(attempt, result, tokio::time::Instant::now())
+                {
+                    tracing::warn!(attempt, error, "discarding stale pool wake result");
+                    continue;
+                }
+                match completion {
+                    Ok(()) => {
+                        pool = pool_lifecycle
+                            .take_ready()
+                            .expect("successful wake stores a ready pool");
+                        pool_ready = true;
+                        emit_runtime_lifecycle(
+                            observer.as_ref(),
+                            &runtime_start_nonce,
+                            &pubkey_hex,
+                            &config.relay_url,
+                            "ready",
+                            None,
+                        );
+                        for (scope, thread_tags) in dispatch_pending(
+                            &mut pool,
+                            &mut queue,
+                            &ctx,
+                            &mut last_activity,
+                            observer.as_ref(),
+                        ) {
+                            typing_channels.insert(scope, thread_tags);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert_eq!(pool_lifecycle.failed_error(), Some(error.as_str()));
+                        emit_runtime_lifecycle(
+                            observer.as_ref(),
+                            &runtime_start_nonce,
+                            &pubkey_hex,
+                            &config.relay_url,
+                            "failed",
+                            Some(&error),
+                        );
+                    }
+                }
+            }
+            Some(PoolEvent::HoldDeadline) => {
+                // A held thread must make progress even when every unrelated
+                // relay/timer source is quiet. The deadline is derived from
+                // the pool's first-held stamp, so this dispatch observes
+                // `ForkAfterHold` and claims an idle worker immediately.
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
                 }
             }
             None => {} // relay/heartbeat/shutdown branches handled inline above
+        }
+    }
+
+    // Drain wake tasks gracefully rather than aborting: an in-flight
+    // initialize_agent_pool observes the shutdown watch at its biased per-slot
+    // select and reaps its partially-spawned agents itself. `shutdown()` here
+    // would abort the task mid-init and drop those AcpClients via best-effort
+    // Drop — the exact zombie class the eager path's spawn-outside-the-timeout
+    // comment exists to prevent. Fire the watch first so exits that bypass the
+    // signal handlers (result channel closed, LoopAction::Exit) cancel the wake
+    // just as promptly. Timeout is a backstop for a slot stuck outside the
+    // select (e.g. in spawn); only then do we fall back to aborting.
+    let _ = shutdown_tx.send(());
+    let wake_drain = tokio::time::timeout(Duration::from_secs(30), async {
+        while wake_tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if wake_drain.is_err() {
+        tracing::warn!("wake task did not drain within grace period — aborting");
+        wake_tasks.shutdown().await;
+    }
+    while let Ok((_attempt, result)) = wake_rx.try_recv() {
+        if let Ok(mut awakened_pool) = result {
+            shutdown_agent_pool(&mut awakened_pool).await;
         }
     }
 
@@ -2450,12 +4456,25 @@ fn mode_gate_signal(
 }
 
 /// Send a control signal to the in-flight task for `channel_id`.
+///
+/// Channel-targeted: refuses channels with multiple session scopes. Used only
+/// by desktop observer frames (`cancel_turn` / `switch_model`), which carry a
+/// bare `channelId` and no thread context. Every thread-aware
+/// path — mid-turn steering/interruption and the owner `!cancel` / `!rotate`
+/// commands, whose triggering event carries NIP-10 thread tags — uses
+/// [`signal_in_flight_task_for_scope`], which targets one exact
+/// [`scope::SessionScope`] so a signal for thread A can never hit thread B
+/// running in the same channel.
+///
 /// Returns `true` if a signal was sent, `false` if no in-flight task was found.
 fn signal_in_flight_task(
     pool: &mut AgentPool,
     channel_id: uuid::Uuid,
     mode: ControlSignal,
 ) -> bool {
+    if pool.channel_control_is_ambiguous(channel_id) {
+        return false;
+    }
     let entry = pool
         .task_map_mut()
         .values_mut()
@@ -2464,6 +4483,39 @@ fn signal_in_flight_task(
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
             tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
+            let _ = tx.send(mode);
+            return true;
+        }
+    }
+    false
+}
+
+/// Send a control signal to the in-flight task for one exact session scope.
+///
+/// The scope-precise counterpart of [`signal_in_flight_task`]: mid-turn
+/// steer/interrupt must target the thread the triggering event belongs to, not
+/// “whichever task the channel happens to have first” — otherwise two threads
+/// running concurrently in one channel could steer each other.
+///
+/// Returns `true` if a signal was sent, `false` if no in-flight task matched.
+fn signal_in_flight_task_for_scope(
+    pool: &mut AgentPool,
+    scope: &scope::SessionScope,
+    mode: ControlSignal,
+) -> bool {
+    let entry = pool
+        .task_map_mut()
+        .values_mut()
+        .find(|m| m.scope.as_ref() == Some(scope));
+
+    if let Some(meta) = entry {
+        if let Some(tx) = meta.control_tx.take() {
+            tracing::info!(
+                channel = %scope.channel_id(),
+                scope = %scope.telemetry_label(),
+                ?mode,
+                "control signal sent to in-flight task (scope-exact)"
+            );
             let _ = tx.send(mode);
             return true;
         }
@@ -2498,11 +4550,11 @@ fn signal_in_flight_task(
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
-    channel_id: uuid::Uuid,
-    event: nostr::Event,
-    prompt_tag: String,
+    scope: scope::SessionScope,
+    be: queue::BatchEvent,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
+    let channel_id = scope.channel_id();
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
     // native and cancel+merge fallback share these so the agent gets the
@@ -2516,15 +4568,12 @@ fn try_native_steer(
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
     // steering (which is to inject only what's new).
-    let (header, closing) = queue::native_steer_framing();
-    let event_id_hex = event.id.to_hex();
-    let be = queue::BatchEvent {
-        event,
-        prompt_tag: prompt_tag.clone(),
-        received_at: std::time::Instant::now(),
-    };
-    let event_block = queue::format_event_block(channel_id, None, &be, None);
-    let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
+    // The caller steers natively only a message that replies where the
+    // running turn replies (`ReplyRoute::accepts_steer`), so the turn's own
+    // `<context>` still routes the reply. An edit's
+    // block names its original (`Edit of:`) and the original's thread root.
+    let event_id_hex = be.event.id.to_hex();
+    let body = native_steer_body(channel_id, &be);
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -2532,14 +4581,14 @@ fn try_native_steer(
         ack_tx,
     };
 
-    match pool.send_steer(channel_id, request) {
+    match pool.send_steer(&scope, request) {
         Ok(()) => {
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
             // re-deliver the event via normal dispatch. See
             // `EventQueue::mark_native_steer_pending` docs at queue.rs:606.
-            let withheld = queue.mark_native_steer_pending(channel_id, &event_id_hex);
+            let withheld = queue.mark_native_steer_pending(&scope, &event_id_hex);
             if !withheld {
                 // Race: the event was already drained out of the queue
                 // before we got here (e.g. a concurrent flush picked it
@@ -2557,10 +4606,12 @@ fn try_native_steer(
             }
             let ack_tx_clone = steer_ack_tx.clone();
             let event_id_for_watcher = event_id_hex.clone();
+            let scope_for_watcher = scope.clone();
             tokio::spawn(async move {
                 let ack = ack_rx.await;
                 let _ = ack_tx_clone.send(SteerAckEvent {
                     channel_id,
+                    scope: scope_for_watcher,
                     event_id: event_id_for_watcher,
                     ack,
                 });
@@ -2568,13 +4619,320 @@ fn try_native_steer(
             true
         }
         Err(e) => {
+            // Structured fixed-reason label from the stock admission owner
+            // (`pool::send_steer`): task_absent / sender_absent /
+            // mailbox_full / mailbox_closed. Only admission refusals reach
+            // this arm — the ack watcher is spawned solely on `Ok(())`, so
+            // ack-native write failures are logged by the main loop's
+            // SteerAck arm instead and are never conflated with admission.
+            // The label never carries request content.
+            let reason = e
+                .admission_reason()
+                .map(|reason| reason.as_str())
+                .unwrap_or("unclassified");
             tracing::info!(
                 channel = %channel_id,
-                error = ?e,
+                reason,
                 "non-cancelling steer not accepted — falling back to cancel+merge"
             );
             false
         }
+    }
+}
+
+/// Render the prompt delta sent by [`try_native_steer`].
+fn native_steer_body(channel_id: Uuid, be: &queue::BatchEvent) -> String {
+    let (tag, closing) = queue::native_steer_framing();
+    let event_block = queue::format_event_block(channel_id, None, be, None);
+    let new_message = prompt_framing::semantic_section(tag, "");
+    let event_section = prompt_framing::semantic_section_with_attributes(
+        "buzz-event",
+        &[("type", be.prompt_tag.as_str())],
+        &event_block,
+    );
+    format!("{new_message}\n\n{event_section}\n\n{closing}")
+}
+
+// ── try_native_steer fallback-log tests ───────────────────────────────────────
+//
+// Regression for the production tracing event `try_native_steer`'s Err arm
+// emits before the caller falls back to the universal cancel+merge path. The
+// `send_steer` admission-reason tests in pool.rs pin the refusal *labels*
+// through `SteerError::admission_reason` alone — mutating this log's `reason`
+// field leaves that suite green. These tests instead drive the REAL
+// `try_native_steer` (real pool, real queue, real signed event, real steer
+// body construction) through each of the four admission refusal branches and
+// pin the log itself: the exact reason label, the exact production message,
+// exactly the `channel`+`reason` fields (never request or error content), and
+// the unchanged `false` return that keeps the caller on the fallback.
+#[cfg(test)]
+mod try_native_steer_fallback_log_tests {
+    use super::*;
+    use crate::pool::{SteerRequest, TaskMeta};
+    use nostr::{EventBuilder, Keys, Kind};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Sentinel carried in the real event content — it flows into the steer
+    /// request body `try_native_steer` builds, and the fallback log must
+    /// never surface it.
+    const SECRET_REQUEST_CONTENT: &str = "SECRET-STEER-REQUEST-CONTENT";
+
+    /// One captured fallback log event: the exact values recorded for the
+    /// message/channel/reason fields, plus the names of any field beyond
+    /// that fixed vocabulary.
+    #[derive(Debug, Default)]
+    struct FallbackLog {
+        message: Option<String>,
+        channel: Option<String>,
+        reason: Option<String>,
+        unexpected_fields: Vec<String>,
+    }
+
+    /// Records event field values (str values via `record_str`, Display and
+    /// format_args values via `record_debug`, exactly as tracing routes them)
+    /// and collects any field outside the fixed message/channel/reason set.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        log: FallbackLog,
+    }
+
+    impl Recorder {
+        fn store(&mut self, name: &str, value: String) {
+            match name {
+                "message" => self.log.message = Some(value),
+                "channel" => self.log.channel = Some(value),
+                "reason" => self.log.reason = Some(value),
+                _ => self.log.unexpected_fields.push(name.to_string()),
+            }
+        }
+    }
+
+    impl tracing::field::Visit for Recorder {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.store(field.name(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.store(field.name(), format!("{value:?}"));
+        }
+    }
+
+    /// Captures INFO events on `buzz_acp` carrying a `reason` field — the
+    /// fallback log's signature — mirroring the workspace's Layer+Visit
+    /// capture fixture (buzz-agent `count_silent_turn_warnings`).
+    struct Capture {
+        logs: Arc<std::sync::Mutex<Vec<FallbackLog>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            if event.metadata().target() != "buzz_acp" {
+                return;
+            }
+            let mut recorder = Recorder::default();
+            event.record(&mut recorder);
+            if recorder.log.reason.is_some() {
+                self.logs
+                    .lock()
+                    .unwrap()
+                    .push(std::mem::take(&mut recorder.log));
+            }
+        }
+    }
+
+    /// Conversation scope for the steered channel — the same shape the
+    /// pool.rs admission fixtures use.
+    fn steer_scope() -> scope::SessionScope {
+        scope::SessionScope::Conversation {
+            channel_id: Uuid::nil(),
+        }
+    }
+
+    /// A real signed kind:20001 stream message whose content becomes part of
+    /// the real steer request body `try_native_steer` builds.
+    fn stream_event() -> nostr::Event {
+        EventBuilder::new(
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            SECRET_REQUEST_CONTENT,
+        )
+        .sign_with_keys(&Keys::generate())
+        .expect("sign test stream message")
+    }
+
+    /// Insert an in-flight task_map entry for `scope` carrying `steer_tx`,
+    /// mirroring `mark_agent_busy` — the existing seam for simulating an
+    /// in-flight prompt task without spawning a real agent turn (same shape
+    /// as the pool.rs `mark_agent_busy_with_steer_tx` fixture).
+    fn mark_in_flight_with_steer_tx(
+        pool: &mut AgentPool,
+        busy_scope: scope::SessionScope,
+        steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
+    ) {
+        let abort = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort.id(),
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(busy_scope.channel_id()),
+                scope: Some(busy_scope),
+                turn_id: "t".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+
+    /// Drive the REAL `try_native_steer` exactly as the production caller
+    /// (`QueuedNormalListenerEvent::steer_or_interrupt`) does — event already
+    /// pushed into the queue, steer-eligible event, live steer-ack channel —
+    /// under a capturing subscriber. Returns the function's return value and
+    /// the fallback logs it emitted on this thread.
+    fn try_native_steer_capturing(pool: &mut AgentPool) -> (bool, Vec<FallbackLog>) {
+        let busy_scope = steer_scope();
+        let event = stream_event();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        // Caller invariant: the event is already queued before the steer
+        // attempt (see `try_native_steer`'s doc comment).
+        assert!(
+            queue.push(QueuedEvent {
+                channel_id: Uuid::nil(),
+                scope: busy_scope.clone(),
+                event: event.clone(),
+                received_at: std::time::Instant::now(),
+                prompt_tag: "mention".into(),
+                edit: None,
+            }),
+            "queued event must be accepted before the steer attempt"
+        );
+        let (steer_ack_tx, _steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture { logs: logs.clone() });
+        let returned = tracing::subscriber::with_default(subscriber, || {
+            try_native_steer(
+                pool,
+                &mut queue,
+                busy_scope.clone(),
+                queue::BatchEvent {
+                    event,
+                    prompt_tag: "mention".into(),
+                    received_at: std::time::Instant::now(),
+                    edit: None,
+                },
+                &steer_ack_tx,
+            )
+        });
+        let logs_out = std::mem::take(&mut *logs.lock().unwrap());
+        (returned, logs_out)
+    }
+
+    /// Assert the captured logs are exactly one production fallback event for
+    /// `expected_reason`: exact message, exact reason, exact channel, no
+    /// additional fields, and no request or error content anywhere.
+    fn assert_single_fallback_log(logs: &[FallbackLog], expected_reason: &str) {
+        assert_eq!(
+            logs.len(),
+            1,
+            "exactly one fallback log must be emitted per refusal, got {logs:?}"
+        );
+        let log = &logs[0];
+        assert_eq!(
+            log.message.as_deref(),
+            Some("non-cancelling steer not accepted — falling back to cancel+merge"),
+            "fallback log message must stay the exact production bytes"
+        );
+        assert_eq!(
+            log.reason.as_deref(),
+            Some(expected_reason),
+            "fallback log reason must be the exact admission label"
+        );
+        let expected_channel = Uuid::nil().to_string();
+        assert_eq!(
+            log.channel.as_deref(),
+            Some(expected_channel.as_str()),
+            "fallback log channel must be the scope's channel id"
+        );
+        assert!(
+            log.unexpected_fields.is_empty(),
+            "fallback log must carry only channel+reason — no request/error \
+             content fields: {:?}",
+            log.unexpected_fields
+        );
+        let rendered = format!("{log:?}");
+        assert!(
+            !rendered.contains(SECRET_REQUEST_CONTENT),
+            "fallback log must not leak request content: {rendered}"
+        );
+    }
+
+    /// No in-flight task owns the scope: `send_steer` refuses with
+    /// `PromptCompleted`, classified as `task_absent`.
+    #[test]
+    fn try_native_steer_logs_task_absent_reason_and_keeps_fallback() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (returned, logs) = try_native_steer_capturing(&mut pool);
+        assert!(
+            !returned,
+            "refused native steer must keep the cancel+merge fallback"
+        );
+        assert_single_fallback_log(&logs, "task_absent");
+    }
+
+    /// The in-flight task has no steer sender installed: `sender_absent`.
+    #[tokio::test]
+    async fn try_native_steer_logs_sender_absent_reason_and_keeps_fallback() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        mark_in_flight_with_steer_tx(&mut pool, steer_scope(), None);
+        let (returned, logs) = try_native_steer_capturing(&mut pool);
+        assert!(
+            !returned,
+            "refused native steer must keep the cancel+merge fallback"
+        );
+        assert_single_fallback_log(&logs, "sender_absent");
+    }
+
+    /// The capacity-1 steer mailbox already holds one in-flight steer:
+    /// `mailbox_full`.
+    #[tokio::test]
+    async fn try_native_steer_logs_mailbox_full_reason_and_keeps_fallback() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
+        mark_in_flight_with_steer_tx(&mut pool, steer_scope(), Some(tx.clone()));
+        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
+        tx.try_send(SteerRequest {
+            prompt_blocks: vec!["first in-flight steer".into()],
+            ack_tx,
+        })
+        .expect("capacity-1 mailbox accepts the first in-flight steer");
+        let (returned, logs) = try_native_steer_capturing(&mut pool);
+        assert!(
+            !returned,
+            "refused native steer must keep the cancel+merge fallback"
+        );
+        assert_single_fallback_log(&logs, "mailbox_full");
+    }
+
+    /// The read loop's steer receiver is torn down: `mailbox_closed`.
+    #[tokio::test]
+    async fn try_native_steer_logs_mailbox_closed_reason_and_keeps_fallback() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (tx, rx) = tokio::sync::mpsc::channel::<SteerRequest>(1);
+        mark_in_flight_with_steer_tx(&mut pool, steer_scope(), Some(tx));
+        drop(rx); // read loop torn down before this steer arrived
+        let (returned, logs) = try_native_steer_capturing(&mut pool);
+        assert!(
+            !returned,
+            "refused native steer must keep the cancel+merge fallback"
+        );
+        assert_single_fallback_log(&logs, "mailbox_closed");
     }
 }
 
@@ -2585,31 +4943,118 @@ fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
-) -> Vec<(Uuid, ThreadTags)> {
+    last_activity: &mut tokio::time::Instant,
+    observer: Option<&observer::ObserverHandle>,
+) -> Vec<(scope::SessionScope, ThreadTags)> {
+    // Keyed by the exact session scope, not the channel: two threads dispatching
+    // concurrently in one channel get distinct typing entries so completing one
+    // never clears the other's indicator.
     let mut dispatched_channels = Vec::new();
+    // Batches held back this cycle because the worker that owns their thread's
+    // session is busy. They stay flushed-out of the queue (in-flight) until we
+    // release them at the end so `flush_next` cannot re-pick them mid-loop;
+    // releasing requeues them so the next dispatch (when the owner returns, or
+    // once the bounded hold expires) reuses that exact session or forks a fresh
+    // one instead of starving.
+    let mut held: Vec<FlushBatch> = Vec::new();
+    // One clock read for the whole cycle so every batch's bounded-hold window is
+    // measured against the same instant.
+    let now = tokio::time::Instant::now();
     loop {
         let batch = match queue.flush_next() {
             Some(b) => b,
             None => break,
         };
         let channel_id = batch.channel_id;
+        let scope = batch.scope.clone();
+        // Authoritative affinity, variant-gated and bounded: only a `Thread`
+        // scope whose session owner is checked out (busy on another turn) is
+        // held, and only until `HOLD_BUSY_OWNER_TIMEOUT` elapses. `Conversation`
+        // scopes never hold — a busy owner there forks onto another idle worker,
+        // so an active channel cannot starve a sibling channel on a shared
+        // worker. A held thread that outwaits the window forks a fresh session
+        // rather than starve behind an unbounded turn.
+        let forked_after_hold = match pool.hold_decision(&scope, now, pool::HOLD_BUSY_OWNER_TIMEOUT)
+        {
+            pool::HoldDecision::Hold {
+                held_for,
+                owner_index,
+            } => {
+                tracing::info!(
+                    channel = %channel_id,
+                    scope = %scope.telemetry_label(),
+                    owner_index,
+                    held_for_secs = held_for.as_secs_f64(),
+                    "busy-owner hold — thread session owner busy; awaiting its return"
+                );
+                if let Some(observer) = observer {
+                    observer.emit(
+                        "busy_owner_hold",
+                        None,
+                        &observer::context_for(Some(channel_id), None, None),
+                        serde_json::json!({
+                            "scope": scope.telemetry_label(),
+                            "ownerIndex": owner_index,
+                            "heldForSecs": held_for.as_secs_f64(),
+                            "timeoutSecs": pool::HOLD_BUSY_OWNER_TIMEOUT.as_secs_f64(),
+                        }),
+                    );
+                }
+                held.push(batch);
+                continue;
+            }
+            pool::HoldDecision::ForkAfterHold {
+                held_for,
+                owner_index,
+            } => Some((held_for, owner_index)),
+            pool::HoldDecision::Dispatch => None,
+        };
         let typing_scope = batch
             .events
             .last()
-            .map(|event| queue::parse_thread_tags(&event.event))
+            .map(queue::BatchEvent::routing_thread_tags)
             .unwrap_or_default();
-        let affinity_hit = pool.has_session_for(channel_id);
-        let mut agent = match pool.try_claim(Some(channel_id)) {
+        // Scope-level affinity: reuse the worker that already holds THIS
+        // thread's provider session so a temporarily busy worker cannot cause
+        // another to open a duplicate session for the same thread.
+        let affinity_hit = pool.has_session_for(&scope);
+        let mut agent = match pool.try_claim(Some(&scope)) {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
                 tracing::debug!(pending_channels = pending, "pool_exhausted");
                 queue.requeue_preserve_timestamps(batch);
-                queue.mark_complete(channel_id);
+                queue.mark_complete(&scope);
                 break;
             }
         };
-        tracing::debug!(agent = agent.index, channel = %channel_id, affinity_hit, "agent_claimed");
+        // Consume a bounded hold only after a worker was actually claimed.
+        // If every slot is checked out, the expired stamp remains sticky and
+        // the worker-return event retries immediately instead of waiting for a
+        // fresh timeout window.
+        pool.clear_hold(&scope);
+        if let Some((held_for, owner_index)) = forked_after_hold {
+            tracing::warn!(
+                channel = %channel_id,
+                scope = %scope.telemetry_label(),
+                owner_index,
+                held_for_secs = held_for.as_secs_f64(),
+                "busy-owner hold expired — forking fresh session on an idle worker"
+            );
+            if let Some(observer) = observer {
+                observer.emit(
+                    "busy_owner_hold_forked",
+                    None,
+                    &observer::context_for(Some(channel_id), None, None),
+                    serde_json::json!({
+                        "scope": scope.telemetry_label(),
+                        "ownerIndex": owner_index,
+                        "heldForSecs": held_for.as_secs_f64(),
+                    }),
+                );
+            }
+        }
+        tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
@@ -2620,15 +5065,15 @@ fn dispatch_pending(
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
 
-        // Goose-native non-cancelling steer seam: snapshot capability before
-        // the agent moves into `run_prompt_task`, and install the per-turn
-        // steer receiver on the read loop so the main loop's mode-gate fork
+        // Mid-turn non-cancelling steer seam: install the per-turn steer
+        // receiver on the read loop so the main loop's mode-gate fork
         // (see the `if accepted && queue.is_channel_in_flight(...)` block
         // in the relay event branch of the main `select!` loop) can drive
         // it via the matching sender stored in `TaskMeta.steer_tx`.
-        // Install the steer channel for every prompt task — the supervisor
-        // uses try-and-tolerate: it attempts the steer for any agent and
-        // treats `-32601 method_not_found` as "fall back to cancel+merge".
+        // Installed for every prompt task: the read loop picks the steer
+        // transport at write time from `active_run_id` and the agent's
+        // advertised `_session/steering` capability, and acks
+        // `ExpectedRunIdMissing` (→ cancel+merge) when it has neither.
         let (tx, rx) = tokio::sync::mpsc::channel::<pool::SteerRequest>(1);
         agent.acp.install_steer_rx(rx);
         let steer_tx = Some(tx);
@@ -2636,7 +5081,20 @@ fn dispatch_pending(
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
 
+        // Assign ownership before moving the worker into the task. If this is
+        // a bounded-hold fork, the new generation immediately invalidates the
+        // prior busy worker's copy when that worker eventually returns.
+        let owner_generation = pool.record_scope_owner(scope.clone(), agent.index);
+        agent
+            .state
+            .set_scope_owner_generation(scope.clone(), owner_generation);
+
+        // The prompt task records how it routed replies, for the
+        // native-steer guard (`EventQueue::in_flight_accepts_steer`).
+        let prompt_routing = queue.in_flight_prompt_routing(&scope).unwrap_or_default();
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
                 agent,
@@ -2645,6 +5103,8 @@ fn dispatch_pending(
                 ctx_clone,
                 result_tx,
                 Some(control_rx),
+                task_turn_id,
+                prompt_routing,
             )
             .await;
         });
@@ -2654,12 +5114,25 @@ fn dispatch_pending(
             pool::TaskMeta {
                 agent_index,
                 channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id,
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
-        dispatched_channels.push((channel_id, typing_scope));
+        dispatched_channels.push((scope, typing_scope));
+        *last_activity = tokio::time::Instant::now();
+    }
+    // Release held batches back to the queue (owner busy). They were flushed
+    // out (in-flight) so they could not be re-picked above; requeue preserves
+    // their timestamps and mark_complete clears the in-flight marker, leaving
+    // them queued for the next dispatch when the owner frees up.
+    for batch in held {
+        let scope = batch.scope.clone();
+        queue.requeue_preserve_timestamps(batch);
+        queue.mark_complete(scope);
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
@@ -2667,6 +5140,91 @@ fn dispatch_pending(
         "dispatch_pending"
     );
     dispatched_channels
+}
+
+/// Returns `true` when `error` is a non-retryable authentication failure.
+///
+/// Retrying auth errors is harmful: the token won't self-repair between
+/// attempts, so each retry wastes an attempt slot, delays the visible failure,
+/// and burns the user's context window. Dead-letter immediately and surface a
+/// re-authentication hint instead.
+///
+/// # Classification rationale
+///
+/// Auth failures arrive as [`acp::AcpError::AgentError`] with a message
+/// surfaced from the upstream CLI. Two narrow patterns reliably identify
+/// non-transient auth failures observed in the field:
+///
+/// - `"Re-authenticate"` — emitted by the Claude CLI when an OAuth token has
+///   expired ("OAuth access token has expired. Re-authenticate to continue.").
+///   Specific to the auth-expiry flow; does not appear in unrelated errors.
+/// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
+///   the standard auth-failure status and does not arise from network blips.
+///
+/// False positives (misclassifying a transient error as non-retryable) silently
+/// drop a user message, which is worse than a false negative (extra retries on
+/// an auth error). Both patterns are therefore chosen for high precision.
+fn is_auth_error(error: &acp::AcpError) -> bool {
+    let acp::AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+/// Thread placement for a batch's terminal failure notice.
+///
+/// Ordinary events keep their own thread tags. An edit follows its verified
+/// original message (`edit`): into the original's thread when it is a reply,
+/// otherwise as a reply to the original itself — the edited message may be
+/// far up the channel, so a top-level notice would be detached from the
+/// request. An unverified original is never claimed as a thread root: if it
+/// is itself a thread reply, the relay rejects the notice for mismatched
+/// ancestry and the user sees nothing. Such a notice posts at top level.
+fn failure_notice_thread_tags(
+    last: &queue::BatchEvent,
+    edit: Option<&queue::ResolvedEdit>,
+) -> ThreadTags {
+    let tags = queue::routing_thread_tags(&last.event, edit);
+    match (queue::edit_target_id(&last.event), edit) {
+        (Some(target), Some(_)) if tags.root_event_id.is_none() => ThreadTags {
+            root_event_id: Some(target.clone()),
+            parent_event_id: Some(target),
+            mentioned_pubkeys: tags.mentioned_pubkeys,
+        },
+        _ => tags,
+    }
+}
+
+/// Spawn a task that posts a user-visible failure notice to the relay.
+///
+/// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
+/// dead-letter path so neither duplicates the tokio::spawn block. An edit
+/// whose original was not resolved at admission gets one more lookup here, so
+/// a transient fetch failure does not detach the notice from its thread.
+fn spawn_failure_notice(
+    rest_client: Option<&relay::RestClient>,
+    batch: &FlushBatch,
+    content: String,
+) {
+    let Some(rest) = rest_client else {
+        return;
+    };
+    let Some(last) = batch.events.last().cloned() else {
+        return;
+    };
+    let rest = rest.clone();
+    let channel_id = batch.channel_id;
+    tokio::spawn(async move {
+        let edit = match last.edit.clone() {
+            Some(edit) => Some(edit),
+            None if queue::edit_target_id(&last.event).is_some() => {
+                edit_routing::resolve_edit(&last.event, channel_id, &rest).await
+            }
+            None => None,
+        };
+        let thread_tags = failure_notice_thread_tags(&last, edit.as_ref());
+        pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2682,12 +5240,50 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    last_activity: &mut tokio::time::Instant,
 ) -> LoopAction {
+    // Start a full idle interval when channel work settles, before releasing
+    // its in-flight guard. Heartbeats must not keep an otherwise idle pool alive.
+    match &result.source {
+        PromptSource::Channel(_) => *last_activity = tokio::time::Instant::now(),
+        PromptSource::Heartbeat => {}
+    }
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
+    let successful_steer_deliveries = pool
+        .task_map()
+        .values()
+        .find(|meta| meta.agent_index == agent_index)
+        .map(|meta| meta.successful_steer_deliveries.clone())
+        .unwrap_or_default();
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
+    if let PromptSource::Channel(scope) = &result.source {
+        // The task may have invalidated this session before returning. Never
+        // resurrect delivery state for a dead session; its replacement must
+        // receive fresh standing context and history.
+        if let Some(live_session_id) = result.agent.state.sessions.get(scope).cloned() {
+            let event_ids = successful_steer_deliveries
+                .into_iter()
+                .filter(|delivery| delivery.session_id == live_session_id)
+                .map(|delivery| delivery.event_id);
+            let scope = scope.clone();
+            result
+                .agent
+                .state
+                .mark_scope_delivery_success(scope, false, event_ids, []);
+        }
+    }
+
+    // The hard-timeout death_message (below) must describe the batch's
+    // *actual* fate, not just the `recently_active` eligibility flag — a
+    // recently-active batch that exhausts the retry budget in queue.requeue()
+    // is dead-lettered same as an immediate one, and both differ from a
+    // channel-removed drop or a heartbeat call with no batch at all. Each
+    // branch below records what actually happened; only the hard-timeout
+    // match arm in the death_message construction reads it.
+    let mut hard_timeout_fate_suffix: Option<&'static str> = None;
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -2698,7 +5294,10 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(result.outcome, PromptOutcome::Cancelled) {
+            if matches!(
+                result.outcome,
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+            ) {
                 // Cancel re-prompt: store as cancelled events so flush_next()
                 // merges them into the next FlushBatch.cancelled_events,
                 // enabling the annotated merged-prompt format. The batch's
@@ -2707,33 +5306,100 @@ fn handle_prompt_result(
                 // path; if somehow unset, fall back to the gentler Steer framing
                 // — consistent with MergeFraming::for_reason(None) and the
                 // system default — rather than telling the agent to supersede.
+                //
+                // CancelDrainTimeout shares this path with Cancelled: a failed
+                // 5s drain after a control-signal cancel is a cleanup-deadline
+                // problem, not the deterministic hard-cap death below — the
+                // original batch must survive with no retry/dead-letter
+                // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
-            } else if let Some(dead) = queue.requeue(batch) {
-                // Dead-lettered: retries exhausted and the events are gone.
-                // Post a visible notice so the channel isn't left waiting on
-                // a turn that will never happen.
-                if let Some(rest) = rest_client {
-                    let thread_tags = dead
-                        .events
-                        .last()
-                        .map(|be| queue::parse_thread_tags(&be.event))
-                        .unwrap_or_default();
-                    let reason = match &result.outcome {
-                        PromptOutcome::Timeout => "the turn timed out".to_string(),
-                        PromptOutcome::AgentExited => "the agent process exited".to_string(),
-                        PromptOutcome::Error(e) => format!("{e}"),
-                        _ => "repeated failures".to_string(),
-                    };
+            } else if matches!(
+                result.outcome,
+                PromptOutcome::Timeout(TimeoutKind::Hard {
+                    recently_active: false
+                })
+            ) {
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
+                    batch.events.len(),
+                );
+                let content = format!(
+                    "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
+                    config.max_turn_duration_secs
+                );
+                spawn_failure_notice(rest_client, &batch, content);
+                hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
+            } else if matches!(
+                result.outcome,
+                PromptOutcome::Timeout(TimeoutKind::Hard {
+                    recently_active: true
+                })
+            ) {
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "hard-cap timeout with recent activity — requeueing for retry"
+                );
+                if let Some(dead) = queue.requeue(batch) {
                     let content = format!(
-                        "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
+                        "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
+                        config.max_turn_duration_secs
                     );
-                    let rest = rest.clone();
-                    let channel_id = dead.channel_id;
-                    tokio::spawn(async move {
-                        pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
-                    });
+                    spawn_failure_notice(rest_client, &dead, content);
+                    hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
+                } else {
+                    hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
+            } else if matches!(
+                &result.outcome,
+                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
+                    if message.contains("model not found")
+            ) {
+                // Retrying the same missing model cannot repair its configuration.
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately — model not found"
+                );
+                let content = "⚠️ I couldn't process the last request: the configured model \
+                    wasn't found at the provider's endpoint. Open agent settings, select a \
+                    different model from the dropdown, and save your changes. Restart the agent \
+                    to apply the new configuration, then re-send your request."
+                    .to_string();
+                spawn_failure_notice(rest_client, &batch, content);
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
+                // Auth errors are non-retryable: the token won't self-repair
+                // between retries, so requeueing only wastes attempt slots and
+                // delays the visible failure. Dead-letter immediately and tell
+                // the user to re-authenticate the CLI.
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately — non-retryable auth error"
+                );
+                let content = "⚠️ I couldn't process the last request: authentication failed. \
+                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
+                    and then re-send."
+                    .to_string();
+                spawn_failure_notice(rest_client, &batch, content);
+            } else if let Some(dead) = queue.requeue(batch) {
+                let reason = match &result.outcome {
+                    PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
+                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+                        "the turn exceeded the maximum duration".to_string()
+                    }
+                    PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                    PromptOutcome::Error(e) => format!("{e}"),
+                    PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
+                    _ => "repeated failures".to_string(),
+                };
+                let content = format!(
+                    "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
+                );
+                spawn_failure_notice(rest_client, &dead, content);
             }
         } else {
             tracing::debug!(
@@ -2741,11 +5407,12 @@ fn handle_prompt_result(
                 events = batch.events.len(),
                 "dropping failed batch for removed channel"
             );
+            hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
         }
     }
 
     match &result.source {
-        PromptSource::Channel(ch) => queue.mark_complete(*ch),
+        PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -2759,9 +5426,12 @@ fn handle_prompt_result(
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
-        PromptOutcome::Timeout => "timeout",
+        PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
+        PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
+        PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
     };
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
@@ -2778,10 +5448,8 @@ fn handle_prompt_result(
         .to_string();
     let harness_pid = std::process::id();
 
-    let channel_id = match &result.source {
-        PromptSource::Channel(ch) => Some(*ch),
-        PromptSource::Heartbeat => None,
-    };
+    let channel_id = result.source.channel_id();
+    let turn_id = result.turn_id.clone();
     let emit_turn_error = |error_msg: &str, error_code: Option<i64>| {
         if let Some(ref observer) = observer {
             let mut payload = serde_json::json!({
@@ -2794,7 +5462,7 @@ fn handle_prompt_result(
             observer.emit(
                 "turn_error",
                 Some(agent_index),
-                &observer::context_for(channel_id, None, None),
+                &observer::context_for(channel_id, None, Some(turn_id.clone())),
                 payload,
             );
         }
@@ -2811,7 +5479,7 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
-        PromptOutcome::AgentExited | PromptOutcome::Timeout => {
+        PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
             tracing::warn!(
                 agent = agent_index,
                 outcome = outcome_label,
@@ -2819,11 +5487,61 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned — respawning"
             );
-            let death_message = match outcome_label {
-                "exited" => "Agent process exited unexpectedly",
-                _ => "Agent session timed out due to inactivity",
+            let death_message: String = match outcome_label {
+                "exited" => "Agent process exited unexpectedly".to_string(),
+                "hard_timeout" => {
+                    // Neutral wording when no fate was recorded above: a
+                    // heartbeat hard timeout carries no batch at all, so
+                    // nothing was requeued or dead-lettered.
+                    let suffix = hard_timeout_fate_suffix.unwrap_or(" (no batch to retry)");
+                    format!(
+                        "Agent turn exceeded the maximum duration ({}s){}",
+                        config.max_turn_duration_secs, suffix
+                    )
+                }
+                _ => "Agent session timed out due to inactivity".to_string(),
             };
-            emit_turn_error(death_message, None);
+            emit_turn_error(&death_message, None);
+
+            let index = result.agent.index;
+            let slot_history = &mut crash_history[index];
+            if !spawn_respawn_task(
+                result.agent,
+                config,
+                slot_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            ) {
+                // Circuit open — slot stays empty until maintenance refill.
+                if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
+                    tracing::error!("all agents dead — exiting");
+                    return LoopAction::Exit;
+                }
+            }
+        }
+        // Cancel-drain expiry: a control-signal cancel (steer fallback,
+        // interrupt, or explicit stop) did not drain within its bounded
+        // grace window. The process is poisoned/uncertain like a hard
+        // timeout — respawn it — but this is NOT the configured max-turn
+        // cap, so the message must name the actual grace, not
+        // `max_turn_duration_secs`. The triggering batch's fate (preserved
+        // for Steer/Interrupt, dropped for explicit Cancel/Rotate or a
+        // removed channel) is decided above — the message stays fate-neutral
+        // since it must be true in every case.
+        PromptOutcome::CancelDrainTimeout(grace) => {
+            tracing::warn!(
+                agent = agent_index,
+                outcome = outcome_label,
+                configured_model = %harness_configured_model,
+                pid = harness_pid,
+                grace = ?grace,
+                "agent_returned — respawning (cancel-drain timeout)"
+            );
+            let death_message = format!(
+                "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
+            );
+            emit_turn_error(&death_message, None);
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
@@ -2865,6 +5583,16 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
+            pool.return_agent(result.agent);
+        }
+        PromptOutcome::ProjectContextIndeterminate(reason) => {
+            tracing::warn!(
+                agent = agent_index,
+                outcome = outcome_label,
+                reason,
+                "agent_returned (local project context indeterminate — pipe intact)"
+            );
+            emit_turn_error(&reason, None);
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
@@ -2930,7 +5658,7 @@ fn recover_panicked_agent(
     join_error: tokio::task::JoinError,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
-    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    typing_channels: &mut HashMap<scope::SessionScope, ThreadTags>,
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
@@ -2961,8 +5689,23 @@ fn recover_panicked_agent(
     }
 
     if let Some(ch) = meta.channel_id {
-        queue.mark_complete(ch);
-        typing_channels.remove(&ch);
+        // Clear the EXACT session scope, not the channel. Passing a bare
+        // channel id would resolve to `Conversation(channel_id)` via IntoScope
+        // and, under thread policy, leave the actual `Thread(...)` entry wedged
+        // in-flight until the ~2h backstop deadline — blocking the batch we
+        // just requeued. `meta.scope` is the authoritative in-flight scope.
+        match &meta.scope {
+            Some(scope) => {
+                // Clear the panicked turn's exact scope so a sibling thread in
+                // the same channel keeps its typing indicator.
+                typing_channels.remove(scope);
+                queue.mark_complete(scope.clone());
+            }
+            None => {
+                typing_channels.retain(|scope, _| scope.channel_id() != ch);
+                queue.mark_complete(ch);
+            }
+        }
         tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
     } else {
         *heartbeat_in_flight = false;
@@ -2973,7 +5716,7 @@ fn recover_panicked_agent(
         observer.emit(
             "agent_panic",
             Some(i),
-            &observer::context_for(meta.channel_id, None, None),
+            &observer::context_for(meta.channel_id, None, Some(meta.turn_id)),
             serde_json::json!({
                 "outcome": "panic",
                 "error": format!("Agent task panicked: {join_error}"),
@@ -3010,12 +5753,13 @@ fn recover_panicked_agent(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
         guard.send(result);
     });
 }
@@ -3027,7 +5771,7 @@ fn drain_ready_join_results(
     config: &Config,
     heartbeat_in_flight: &mut bool,
     removed_channels: &HashSet<Uuid>,
-    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    typing_channels: &mut HashMap<scope::SessionScope, ThreadTags>,
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
@@ -3074,16 +5818,24 @@ fn dispatch_heartbeat(
         .heartbeat_prompt
         .clone()
         .unwrap_or_else(default_heartbeat_prompt);
-    // For legacy agents (protocol_version < 2), prepend base_prompt to the
-    // heartbeat user message since they don't receive it via session/new.
-    let prompt_text =
-        pool::prepend_base_for_legacy(agent.protocol_version, ctx.base_prompt, &prompt_text);
     let result_tx = pool.result_tx();
     let ctx_clone = Arc::clone(ctx);
     let agent_index = agent.index;
+    let turn_id = Uuid::new_v4().to_string();
+    let task_turn_id = turn_id.clone();
 
     let abort_handle = pool.join_set.spawn(async move {
-        pool::run_prompt_task(agent, None, Some(prompt_text), ctx_clone, result_tx, None).await;
+        pool::run_prompt_task(
+            agent,
+            None,
+            Some(prompt_text),
+            ctx_clone,
+            result_tx,
+            None,
+            task_turn_id,
+            Default::default(),
+        )
+        .await;
     });
 
     pool.task_map_mut().insert(
@@ -3091,13 +5843,98 @@ fn dispatch_heartbeat(
         pool::TaskMeta {
             agent_index,
             channel_id: None,
+            scope: None,
+            turn_id,
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
+            successful_steer_deliveries: HashSet::new(),
         },
     );
     *heartbeat_in_flight = true;
     tracing::info!(agent = agent_index, "heartbeat_fired");
+}
+
+#[cfg(test)]
+mod agent_draft_prompt_tests {
+    #[test]
+    fn shared_base_prompt_teaches_portable_agent_drafts() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.starts_with(
+            "You are an agent operating inside Buzz — a Nostr-based messaging platform for human-agent collaboration.\nBuzz is a desktop and mobile collaboration app organized around channels, conversations, and shared work."
+        ));
+        assert!(prompt.contains("buzz agents draft-create"));
+        assert!(prompt.contains("ask for at most two things"));
+        assert!(prompt.contains("what it should do day-to-day"));
+        assert!(prompt.contains("owner saves it"));
+        assert!(prompt.contains("Do not ask about runtime, provider, model, credentials"));
+    }
+
+    #[test]
+    fn shared_base_prompt_names_current_context_framing() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("## Incoming Turn Contract"));
+        assert!(prompt.contains("`Content:` field in the current `<buzz-event>`"));
+        assert!(prompt.contains("each event inside `<buzz-events>`"));
+        // Bind native-steer wording to its production framing. Interrupt
+        // framing is bound through `format_prompt` in the queue tests.
+        assert!(prompt.contains(crate::queue::native_steer_framing().0));
+        assert!(prompt.contains("Use `<thread-context>` or `<conversation-context>`"));
+        assert!(prompt.contains("do not mistake prior messages for the current request"));
+        assert!(prompt.contains("Treat `<context>` as authoritative routing"));
+        assert!(prompt.contains("supporting structured metadata"));
+        assert!(prompt.contains("UUID from `<context>`"));
+        assert!(prompt.contains("reply destination supplied in the `<context>` block"));
+        assert!(!prompt.contains("`[Context]`"));
+    }
+
+    #[test]
+    fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("pass real newline bytes through stdin"));
+        assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
+        assert!(prompt.contains("buzz messages send ... --content -"));
+    }
+
+    #[test]
+    fn shared_base_prompt_teaches_repo_context_and_learning_loop() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("read its root `AGENTS.md`"));
+        assert!(prompt.contains("path-local `AGENTS.md`"));
+        assert!(
+            prompt.contains("product, architecture, and vision documents as design constraints")
+        );
+        assert!(prompt.contains("CI and live workflow evidence answer different questions"));
+        assert!(prompt.contains("record the invariant in the same session"));
+        assert!(prompt.contains("update the team's shared guidance"));
+    }
+
+    #[test]
+    fn shared_base_prompt_teaches_not_to_duplicate_projects() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("do **not** run `buzz projects create`"));
+        assert!(prompt.contains("buzz issues create --channel"));
+        assert!(prompt.contains("is not a Buzz repository"));
+    }
+
+    #[test]
+    fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
+        assert!(prompt.contains("Do not expand a short display name, infer a surname"));
+        assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
+        assert!(prompt.contains("--mention <hex-or-npub>"));
+        assert!(prompt.contains("every presentation-only name that should notify"));
+        assert!(
+            prompt.contains("permits unresolved or ambiguous `@Name` text as presentation-only")
+        );
+        assert!(prompt.contains("success JSON's `mention_pubkeys`"));
+        assert!(prompt.contains("no follow-up verification command is needed"));
+        assert!(prompt.contains("stops before sending"));
+        assert!(prompt
+            .contains("add them explicitly with `buzz channels add-member` only when authorized"));
+        assert!(prompt.contains("never changes membership automatically"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {
@@ -3158,6 +5995,7 @@ fn spawn_respawn_task(
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -3169,11 +6007,148 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
         guard.send(result);
     });
 
     true
+}
+
+fn normalized_agent_name(init_result: &serde_json::Value) -> String {
+    init_result
+        .get("agentInfo")
+        .or_else(|| init_result.get("serverInfo"))
+        .and_then(|info| info.get("name"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
+    for slot in slots {
+        if let Some(mut agent) = slot.take() {
+            agent.acp.shutdown().await;
+        }
+    }
+}
+
+async fn shutdown_agent_pool(pool: &mut AgentPool) {
+    pool.join_set.shutdown().await;
+    while let Ok(mut result) = pool.result_rx_try_recv() {
+        result.agent.acp.shutdown().await;
+    }
+    for slot in pool.agents_mut() {
+        if let Some(mut agent) = slot.take() {
+            agent.acp.shutdown().await;
+        }
+    }
+}
+
+async fn initialize_agent_pool(
+    startup: &PoolStartup,
+    mut shutdown: Option<watch::Receiver<()>>,
+) -> Result<AgentPool> {
+    // One agent failing to start must not kill the whole pool.
+    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
+    let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
+    for i in 0..startup.agents as usize {
+        let spawn_result = AcpClient::spawn(
+            &startup.command,
+            &startup.args,
+            &startup.extra_env,
+            startup.has_generated_codex_config,
+        )
+        .await;
+        match spawn_result {
+            Ok(mut acp) => {
+                acp.set_observer(startup.observer.clone(), i);
+                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize_result = match shutdown.as_mut() {
+                    Some(shutdown) => tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => {
+                            acp.shutdown().await;
+                            shutdown_agent_slots(&mut agent_slots).await;
+                            return Err(anyhow::anyhow!("pool initialization cancelled by shutdown"));
+                        }
+                        result = initialize => result,
+                    },
+                    None => initialize.await,
+                };
+                match initialize_result {
+                    Ok(Ok(init_result)) => {
+                        tracing::info!(agent = i, "agent initialized: {init_result}");
+                        let protocol_version =
+                            init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
+                        tracing::info!(
+                            agent = i,
+                            name = init_result
+                                .get("agentInfo")
+                                .or_else(|| init_result.get("serverInfo"))
+                                .and_then(|info| info.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown"),
+                            steering_supported = acp.steering_supported(),
+                            "agent initialized"
+                        );
+                        acp.observe(
+                            "agent_initialized",
+                            serde_json::json!({
+                                "agentIndex": i,
+                                "initializeResult": init_result,
+                            }),
+                        );
+                        let agent_name = normalized_agent_name(&init_result);
+                        agent_slots.push(Some(OwnedAgent {
+                            index: i,
+                            acp,
+                            state: SessionState::default(),
+                            model_capabilities: None,
+                            desired_model: startup.model.clone(),
+                            model_overridden: false,
+                            desired_model_request_id: None,
+                            desired_model_pending_ack: false,
+                            startup_effort: startup.effort_level.clone(),
+                            agent_name,
+                            goose_system_prompt_supported: None,
+                            protocol_version,
+                        }));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(agent = i, "agent initialize failed: {e}");
+                        acp.shutdown().await;
+                        agent_slots.push(None);
+                    }
+                    Err(_) => {
+                        tracing::error!(agent = i, "agent timed out during init (60s)");
+                        acp.shutdown().await;
+                        agent_slots.push(None);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(agent = i, "agent failed to spawn: {e}");
+                agent_slots.push(None);
+            }
+        }
+    }
+    let live_count = agent_slots.iter().filter(|slot| slot.is_some()).count();
+    if live_count == 0 {
+        return Err(anyhow::anyhow!(
+            "all {} agents failed to start — cannot continue",
+            startup.agents
+        ));
+    }
+    if live_count < startup.agents as usize {
+        tracing::warn!(
+            "started {}/{} agents — continuing with reduced pool",
+            live_count,
+            startup.agents
+        );
+    }
+    tracing::info!("agent_pool_ready agents={}", live_count);
+    Ok(AgentPool::from_slots(agent_slots))
 }
 
 // ── spawn_and_init ────────────────────────────────────────────────────────────
@@ -3185,10 +6160,11 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
+    has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
-) -> Result<(AcpClient, u32, bool)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env)
+) -> Result<(AcpClient, u32, String)> {
+    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
@@ -3204,7 +6180,8 @@ async fn spawn_and_init(
                     "initializeResult": init_result,
                 }),
             );
-            Ok((acp, protocol_version, true))
+            let agent_name = normalized_agent_name(&init_result);
+            Ok((acp, protocol_version, agent_name))
         }
         Err(e) => {
             // Explicitly shut down the spawned child to prevent zombie/leak.
@@ -3216,22 +6193,22 @@ async fn spawn_and_init(
     }
 }
 
-/// `buzz-acp models` — spawn an agent, query its available models, exit.
-///
-/// Flow: spawn → initialize → session/new → print models → shutdown.
-/// No relay connection, no MCP servers, no subscriptions. ~2-5s total.
-async fn run_models(args: ModelsArgs) -> Result<()> {
-    use acp::{extract_model_config_options, extract_model_state};
+async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
+    let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
+    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
+}
 
-    let agent_args = config::normalize_agent_args(&args.agent_command, args.agent_args);
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-        .to_string_lossy()
-        .to_string();
+fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
+    init_result
+        .get("authMethods")
+        .and_then(|methods| methods.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
 
-    // Spawn outside the timeout so we always own the child for cleanup.
-    // `models` subcommand doesn't use persona packs — no extra env.
-    let mut client = match AcpClient::spawn(&args.agent_command, &agent_args, &[]).await {
+/// `buzz-acp auth-methods` — spawn an adapter, initialize it, print authMethods.
+async fn run_auth_methods(args: AuthMethodsArgs) -> Result<()> {
+    let mut client = match spawn_auth_client(&args.agent).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: failed to spawn agent: {e}");
@@ -3239,11 +6216,125 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         }
     };
 
+    let init_result = match tokio::time::timeout(MODELS_TIMEOUT, client.initialize()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            client.shutdown().await;
+            eprintln!("error: agent initialize failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            client.shutdown().await;
+            eprintln!("error: agent timed out ({MODELS_TIMEOUT:?})");
+            std::process::exit(1);
+        }
+    };
+
+    let methods = extract_auth_methods(&init_result);
+    client.shutdown().await;
+
+    if args.json {
+        let output = serde_json::json!({ "methods": methods });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if methods.is_empty() {
+        println!("No auth methods advertised.");
+    } else {
+        for method in methods {
+            let id = method
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let name = method
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or(id);
+            println!("{id}\t{name}");
+        }
+    }
+    Ok(())
+}
+
+/// `buzz-acp authenticate` — invoke one adapter-owned auth method.
+async fn run_authenticate(args: AuthenticateArgs) -> Result<()> {
+    let mut client = match spawn_auth_client(&args.agent).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to spawn agent: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let init_result = match tokio::time::timeout(MODELS_TIMEOUT, client.initialize()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            client.shutdown().await;
+            eprintln!("error: agent initialize failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            client.shutdown().await;
+            eprintln!("error: agent initialize timed out ({MODELS_TIMEOUT:?})");
+            std::process::exit(1);
+        }
+    };
+
+    let supports_method = extract_auth_methods(&init_result)
+        .iter()
+        .any(|method| method.get("id").and_then(|id| id.as_str()) == Some(args.method_id.as_str()));
+    if !supports_method {
+        client.shutdown().await;
+        eprintln!(
+            "error: auth method '{}' is not advertised by this adapter",
+            args.method_id
+        );
+        std::process::exit(1);
+    }
+
+    let result =
+        tokio::time::timeout(AUTHENTICATE_TIMEOUT, client.authenticate(&args.method_id)).await;
+
+    match result {
+        Ok(Ok(_)) => {
+            client.shutdown().await;
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            client.shutdown().await;
+            eprintln!("error: authenticate failed: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            client.shutdown().await;
+            eprintln!("error: authenticate timed out ({AUTHENTICATE_TIMEOUT:?})");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Flow: spawn → initialize → session/new → print models → shutdown.
+/// No relay connection, no MCP servers, no subscriptions. ~2-5s total.
+async fn run_models(args: ModelsArgs) -> Result<()> {
+    use acp::{extract_model_config_options, extract_model_state};
+
+    let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
+    let cwd = current_working_directory()?;
+
+    // Spawn outside the timeout so we always own the child for cleanup.
+    // `models` subcommand doesn't use persona packs — no extra env, no codex config.
+    let mut client =
+        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: failed to spawn agent: {e}");
+                std::process::exit(1);
+            }
+        };
+
     // Initialize + session/new under a timeout. Client is owned above,
     // so shutdown() runs on all paths (success, error, timeout).
     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
         let init = client.initialize().await?;
-        let session = client.session_new_full(&cwd, vec![], None).await?;
+        let session = client.session_new_full(&cwd, vec![], None, None).await?;
         Ok::<_, acp::AcpError>((init, session))
     })
     .await;
@@ -3306,16 +6397,20 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         if !config_options.is_empty() {
             println!("Models (stable configOptions):");
             for opt in &config_options {
-                let config_id = opt.get("configId").and_then(|v| v.as_str()).unwrap_or("?");
+                let config_id = opt
+                    .get("id")
+                    .or_else(|| opt.get("configId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let display = opt
-                    .get("displayName")
+                    .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or(config_id);
-                println!("  {display} (configId: {config_id})");
+                println!("  {display} (id: {config_id})");
                 if let Some(options) = opt.get("options").and_then(|v| v.as_array()) {
                     for o in options {
                         let val = o.get("value").and_then(|v| v.as_str()).unwrap_or("?");
-                        let name = o.get("displayName").and_then(|v| v.as_str()).unwrap_or(val);
+                        let name = o.get("name").and_then(|v| v.as_str()).unwrap_or(val);
                         println!("    - {name} (value: {val})");
                     }
                 }
@@ -3370,6 +6465,10 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         env: {
             let mut env = vec![
                 EnvVar {
+                    name: "BUZZ_OUTPUT_FORMAT".into(),
+                    value: config::agent_output_format(&config.persona_env_vars),
+                },
+                EnvVar {
                     name: "BUZZ_RELAY_URL".into(),
                     value: config.relay_url.clone(),
                 },
@@ -3395,6 +6494,25 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                     });
                 }
             }
+            // Preserve the display-name contract for tools. Git authorship is
+            // already normalized by the harness bootstrap.
+            if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
+                if !display_name.is_empty() {
+                    env.push(EnvVar {
+                        name: "BUZZ_ACP_DISPLAY_NAME".into(),
+                        value: display_name,
+                    });
+                }
+            }
+            for (name, value) in &config.persona_env_vars {
+                if git::is_managed_env(name) {
+                    env.retain(|entry| entry.name != *name);
+                    env.push(EnvVar {
+                        name: name.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
             env
         },
     }]
@@ -3405,21 +6523,27 @@ mod heartbeat_base_prompt_tests {
     use super::*;
 
     // Pins the heartbeat dispatch path (dispatch_heartbeat, ~line 2359): a
-    // legacy agent WITH a base_prompt must get [Base] prepended to the
-    // heartbeat user message, composed as `[Base]\n{bp}\n\n{prompt}`. This is
+    // legacy agent WITH a base_prompt must get <base> prepended to the
+    // heartbeat user message. This is
     // the second half of the round-2 regression (the first being initial_message).
+
+    fn heartbeat_standing() -> queue::StandingContext<'static> {
+        queue::StandingContext {
+            base_prompt: Some("you are a helpful agent"),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_heartbeat_legacy_agent_gets_base_prepended() {
         // protocol_version 1 + Some(base_prompt): heartbeat prompt is prefixed
-        // with the [Base] section exactly as the legacy session/new path would.
+        // with the <base> section exactly as the legacy session/new path would.
         let prompt = "[System: Heartbeat]\nrun feed get";
-        let composed = pool::prepend_base_for_legacy(1, Some("you are a helpful agent"), prompt);
+        let composed = pool::prepend_standing_for_legacy(1, &heartbeat_standing(), prompt);
         assert_eq!(
             composed,
-            "[Base]\nyou are a helpful agent\n\n[System: Heartbeat]\nrun feed get"
+            "<base>\nyou are a helpful agent\n</base>\n\n[System: Heartbeat]\nrun feed get"
         );
-        assert!(composed.starts_with("[Base]\nyou are a helpful agent\n\n"));
     }
 
     #[test]
@@ -3427,7 +6551,7 @@ mod heartbeat_base_prompt_tests {
         // protocol_version 2 gets base_prompt via session/new; the heartbeat
         // prompt is sent verbatim.
         let prompt = "[System: Heartbeat]\nrun feed get";
-        let composed = pool::prepend_base_for_legacy(2, Some("you are a helpful agent"), prompt);
+        let composed = pool::prepend_standing_for_legacy(2, &heartbeat_standing(), prompt);
         assert_eq!(composed, prompt);
     }
 }
@@ -3534,9 +6658,12 @@ mod owner_control_command_tests {
             pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
 
@@ -3556,6 +6683,334 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+
+    fn thread_scope(channel_id: Uuid, root: &str) -> scope::SessionScope {
+        scope::SessionScope::Thread {
+            channel_id,
+            root_event_id: root.to_string(),
+        }
+    }
+
+    fn insert_task_meta(
+        pool: &mut AgentPool,
+        agent_index: usize,
+        scope: scope::SessionScope,
+        control_tx: tokio::sync::oneshot::Sender<ControlSignal>,
+    ) {
+        let abort_handle = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(scope.channel_id()),
+                scope: Some(scope),
+                turn_id: "t".to_string(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_channel_controls_reject_sibling_sessions_without_signalling() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let a = thread_scope(ch, &"a".repeat(64));
+        let b = thread_scope(ch, &"b".repeat(64));
+        let (tx_a, mut rx_a) = tokio::sync::oneshot::channel();
+        let (tx_b, mut rx_b) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, a.clone(), tx_a);
+        insert_task_meta(&mut pool, 1, b.clone(), tx_b);
+        let observer = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "channelId": ch.to_string(), "modelId": "new-model", "requestId": "pick-1",
+        });
+
+        handle_cancel_turn_control(&payload, &mut pool, Some(&observer));
+        handle_switch_model_control(&payload, &mut pool, Some(&observer));
+        let results = observer.snapshot();
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert_eq!(result.payload["status"], "ambiguous_target");
+            assert_eq!(result.payload["requestId"], "pick-1");
+            assert_eq!(result.channel_id, Some(ch.to_string()));
+        }
+        assert_eq!(
+            rx_a.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(
+            rx_b.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+
+        // Completion does not make a channel-wide model switch safe: the
+        // sibling's retained session is still a distinct target.
+        pool.record_scope_owner(a, 0);
+        pool.record_scope_owner(b, 1);
+        pool.task_map_mut().clear();
+        assert_eq!(
+            pool.switch_idle_agent_model(ch, "new-model", None),
+            IdleSwitchResult::AmbiguousTarget
+        );
+        assert!(!pool.channel_control_is_ambiguous(Uuid::new_v4()));
+    }
+
+    #[tokio::test]
+    async fn observer_channel_controls_allow_one_scope_and_ignore_other_channels() {
+        for signal in [
+            ControlSignal::Cancel,
+            ControlSignal::SwitchModel {
+                model_id: "new-model".into(),
+                request_id: Some("pick-1".into()),
+            },
+        ] {
+            let mut pool = AgentPool::from_slots(vec![]);
+            let ch = Uuid::new_v4();
+            let scope = scope::SessionScope::Conversation { channel_id: ch };
+            pool.record_scope_owner(scope.clone(), 0);
+            pool.record_scope_owner(thread_scope(Uuid::new_v4(), &"a".repeat(64)), 1);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            insert_task_meta(&mut pool, 0, scope, tx);
+            let observer = observer::ObserverHandle::in_process();
+            let payload = serde_json::json!({
+                "channelId": ch.to_string(), "modelId": "new-model", "requestId": "pick-1",
+            });
+            match &signal {
+                ControlSignal::Cancel => {
+                    handle_cancel_turn_control(&payload, &mut pool, Some(&observer))
+                }
+                _ => handle_switch_model_control(&payload, &mut pool, Some(&observer)),
+            }
+            assert_eq!(rx.await.unwrap(), signal);
+            assert_eq!(observer.snapshot()[0].payload["status"], "sent");
+        }
+    }
+
+    // Fix #2: mid-turn steer/interrupt must target the exact thread scope, not
+    // “the first task in the channel” — two threads in one channel must not
+    // interrupt each other.
+    #[tokio::test]
+    async fn signal_in_flight_task_for_scope_targets_only_matching_thread() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let ta = thread_scope(ch, &"a".repeat(64));
+        let tb = thread_scope(ch, &"b".repeat(64));
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, ta.clone(), tx_a);
+        insert_task_meta(&mut pool, 1, tb.clone(), tx_b);
+
+        // Signalling thread A must reach A's task only.
+        assert!(signal_in_flight_task_for_scope(
+            &mut pool,
+            &ta,
+            ControlSignal::Steer
+        ));
+        assert_eq!(rx_a.await.unwrap(), ControlSignal::Steer);
+
+        // Thread B's control channel is untouched (still open, no signal).
+        assert!(signal_in_flight_task_for_scope(
+            &mut pool,
+            &tb,
+            ControlSignal::Interrupt
+        ));
+        assert_eq!(rx_b.await.unwrap(), ControlSignal::Interrupt);
+
+        // A scope with no in-flight task returns false.
+        assert!(!signal_in_flight_task_for_scope(
+            &mut pool,
+            &thread_scope(ch, &"c".repeat(64)),
+            ControlSignal::Steer
+        ));
+    }
+
+    // Fix #1: a thread must not get a second provider session when the worker
+    // that owns its session is busy on another turn.
+    #[tokio::test]
+    async fn busy_session_owner_holds_batch_instead_of_forking_session() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let ta = thread_scope(ch, &"a".repeat(64));
+        let tb = thread_scope(ch, &"b".repeat(64));
+
+        // Worker 0 owns thread A's session and is currently busy running B.
+        pool.record_scope_owner(ta.clone(), 0);
+        let (tx_b, _rx_b) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, tb.clone(), tx_b);
+
+        // A new A message must be HELD (owner busy, no idle worker holds A).
+        assert!(
+            pool.should_hold_for_busy_owner(&ta),
+            "owner busy => hold to avoid a duplicate session"
+        );
+
+        // A brand-new thread with no recorded owner is never held.
+        assert!(!pool.should_hold_for_busy_owner(&thread_scope(ch, &"d".repeat(64))));
+
+        // The bounded hold decision stamps A's first-held time, then forks once
+        // the window elapses rather than starving behind the busy owner.
+        let now = tokio::time::Instant::now();
+        assert!(
+            matches!(
+                pool.hold_decision(&ta, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
+                pool::HoldDecision::Hold { .. }
+            ),
+            "busy owner within window => hold"
+        );
+        assert!(pool.held_since_contains(&ta), "hold stamps first-held time");
+        assert!(
+            matches!(
+                pool.hold_decision(
+                    &ta,
+                    now + pool::HOLD_BUSY_OWNER_TIMEOUT,
+                    pool::HOLD_BUSY_OWNER_TIMEOUT
+                ),
+                pool::HoldDecision::ForkAfterHold { .. }
+            ),
+            "elapsed window => fork on an idle worker"
+        );
+        assert!(
+            pool.held_since_contains(&ta),
+            "expired hold stays sticky until an idle worker is claimed"
+        );
+        pool.clear_hold(&ta);
+
+        // A conversation scope never holds even with a busy recorded owner —
+        // this is the cross-channel head-of-line-blocking regression guard.
+        let cs = scope::SessionScope::Conversation { channel_id: ch };
+        pool.record_scope_owner(cs.clone(), 0);
+        assert_eq!(
+            pool.hold_decision(&cs, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
+            pool::HoldDecision::Dispatch,
+            "conversation scope forks a busy owner rather than holding"
+        );
+
+        // Re-stamp A's hold so channel invalidation has an entry to prune.
+        assert!(matches!(
+            pool.hold_decision(&ta, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
+            pool::HoldDecision::Hold { .. }
+        ));
+        assert!(pool.held_since_contains(&ta));
+
+        // Channel-wide session invalidation prunes the owner directory and the
+        // hold stamps so a stale owner can never strand a held batch.
+        pool.invalidate_channel_sessions(ch);
+        assert!(
+            !pool.should_hold_for_busy_owner(&ta),
+            "owner directory pruned on channel invalidation"
+        );
+        assert!(
+            !pool.held_since_contains(&ta),
+            "hold stamps pruned on channel invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_cap_eviction_prunes_orphaned_hold_deadline() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let held_scope = thread_scope(channel_id, &"a".repeat(64));
+        let surviving_scope = thread_scope(channel_id, &"b".repeat(64));
+
+        pool.record_scope_owner(held_scope.clone(), 0);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, surviving_scope.clone(), tx);
+        assert!(matches!(
+            pool.hold_decision(
+                &held_scope,
+                tokio::time::Instant::now(),
+                pool::HOLD_BUSY_OWNER_TIMEOUT
+            ),
+            pool::HoldDecision::Hold { .. }
+        ));
+
+        let oldest = std::time::Instant::now() - Duration::from_secs(1);
+        queue.push(queue::QueuedEvent {
+            edit: None,
+            channel_id,
+            scope: held_scope.clone(),
+            event: make_event(KIND_STREAM_MESSAGE, "held", None),
+            received_at: oldest,
+            prompt_tag: "test".into(),
+        });
+        for i in 0..500 {
+            queue.push(queue::QueuedEvent {
+                edit: None,
+                channel_id,
+                scope: surviving_scope.clone(),
+                event: make_event(KIND_STREAM_MESSAGE, &format!("new-{i}"), None),
+                received_at: std::time::Instant::now(),
+                prompt_tag: "test".into(),
+            });
+        }
+
+        assert!(
+            !queue.has_pending_scope(&held_scope),
+            "aggregate cap evicts the globally oldest scope"
+        );
+        pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
+        assert!(
+            !pool.held_since_contains(&held_scope),
+            "evicted scope cannot leave an immediately-ready deadline behind"
+        );
+    }
+
+    #[test]
+    fn project_owner_control_signs_only_addressable_project_events() {
+        let keys = Keys::generate();
+        let events = build_project_owner_announcement_events(
+            vec![
+                ProjectOwnerAnnouncementTemplate {
+                    kind: 30_621,
+                    content: String::new(),
+                    created_at: Some(1),
+                    tags: vec![vec!["d".to_string(), "project".to_string()]],
+                },
+                ProjectOwnerAnnouncementTemplate {
+                    kind: 30_617,
+                    content: String::new(),
+                    created_at: Some(1),
+                    tags: vec![vec!["d".to_string(), "repository".to_string()]],
+                },
+            ],
+            &keys,
+        )
+        .expect("valid project events");
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.pubkey == keys.public_key()));
+        assert!(events.iter().all(|event| event.verify().is_ok()));
+    }
+
+    #[test]
+    fn project_owner_control_rejects_arbitrary_or_unaddressed_events() {
+        let keys = Keys::generate();
+        let arbitrary = build_project_owner_announcement_events(
+            vec![ProjectOwnerAnnouncementTemplate {
+                kind: 1,
+                content: String::new(),
+                created_at: None,
+                tags: vec![vec!["d".to_string(), "project".to_string()]],
+            }],
+            &keys,
+        );
+        assert!(arbitrary.is_err());
+
+        let unaddressed = build_project_owner_announcement_events(
+            vec![ProjectOwnerAnnouncementTemplate {
+                kind: 30_621,
+                content: String::new(),
+                created_at: None,
+                tags: vec![],
+            }],
+            &keys,
+        );
+        assert!(unaddressed.is_err());
     }
 }
 
@@ -3579,6 +7034,305 @@ mod owner_cache_tests {
     fn get_returns_cached_value() {
         let cache = OwnerCache::new(Some("ab".repeat(32)));
         assert_eq!(cache.get(), Some("ab".repeat(32)).as_deref());
+    }
+}
+
+#[cfg(test)]
+mod workflow_owner_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn workflow_event(
+        signer: &Keys,
+        owner: Option<&str>,
+        marker_tags: &[&[&str]],
+        workflow_mentions: &[&[&str]],
+        p_tags: &[&str],
+    ) -> nostr::Event {
+        let mut tags = Vec::new();
+        for marker in marker_tags {
+            tags.push(Tag::parse(marker.iter().copied()).expect("workflow marker"));
+        }
+        if let Some(owner) = owner {
+            tags.push(Tag::parse(["buzz:workflow-owner", owner]).expect("workflow owner tag"));
+        }
+        for mention in workflow_mentions {
+            tags.push(Tag::parse(mention.iter().copied()).expect("workflow mention tag"));
+        }
+        for recipient in p_tags {
+            tags.push(Tag::parse(["p", *recipient]).expect("p tag"));
+        }
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "scheduled prompt")
+            .tags(tags)
+            .sign_with_keys(signer)
+            .expect("signed event")
+    }
+
+    #[tokio::test]
+    async fn relay_identity_refresh_keeps_last_good_key_after_fetch_error() {
+        let previous = Keys::generate().public_key().to_hex();
+        let client = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+
+        let (refreshed, completed) =
+            refresh_relay_self(&client, Some(previous.clone()), "test").await;
+        assert_eq!(refreshed, Some(previous));
+        assert!(!completed);
+    }
+
+    #[test]
+    fn trusted_relay_workflow_uses_owner_for_explicit_target() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &[&["buzz:workflow-mention", agent.as_str()]],
+            &[owner.as_str(), agent.as_str()],
+        );
+
+        assert_eq!(
+            effective_prompt_author(&event, Some(&relay.public_key().to_hex()), &agent),
+            owner
+        );
+    }
+
+    #[test]
+    fn multiple_explicit_targets_each_use_owner() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent_a = Keys::generate().public_key().to_hex();
+        let agent_b = Keys::generate().public_key().to_hex();
+        let event = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &[
+                &["buzz:workflow-mention", agent_a.as_str()],
+                &["buzz:workflow-mention", agent_b.as_str()],
+            ],
+            &[owner.as_str(), agent_a.as_str(), agent_b.as_str()],
+        );
+
+        for agent in [&agent_a, &agent_b] {
+            assert_eq!(
+                effective_prompt_author(&event, Some(&relay.public_key().to_hex()), agent),
+                owner
+            );
+        }
+    }
+
+    #[test]
+    fn owner_as_explicit_target_uses_owner_without_duplicate_p_tag() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let event = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &[&["buzz:workflow-mention", owner.as_str()]],
+            &[owner.as_str()],
+        );
+
+        assert_eq!(
+            effective_prompt_author(&event, Some(&relay.public_key().to_hex()), &owner),
+            owner
+        );
+    }
+
+    #[test]
+    fn legacy_owner_p_tag_without_explicit_target_keeps_relay_signer() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = owner.clone();
+        let event = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &[],
+            &[owner.as_str()],
+        );
+
+        assert_eq!(
+            effective_prompt_author(&event, Some(&relay.public_key().to_hex()), &agent),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn p_tag_without_matching_explicit_target_keeps_relay_signer() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let other = Keys::generate().public_key().to_hex();
+        let event = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &[&["buzz:workflow-mention", other.as_str()]],
+            &[owner.as_str(), agent.as_str(), other.as_str()],
+        );
+
+        assert_eq!(
+            effective_prompt_author(&event, Some(&relay.public_key().to_hex()), &agent),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn forged_or_tampered_workflow_keeps_raw_signer() {
+        let relay = Keys::generate();
+        let attacker = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let mentions = [&["buzz:workflow-mention", agent.as_str()][..]];
+        let forged = workflow_event(
+            &attacker,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &mentions,
+            &[agent.as_str()],
+        );
+        assert_eq!(
+            effective_prompt_author(&forged, Some(&relay.public_key().to_hex()), &agent),
+            attacker.public_key().to_hex()
+        );
+
+        let mut tampered = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &mentions,
+            &[agent.as_str()],
+        );
+        tampered.content = "tampered".into();
+        assert_eq!(
+            effective_prompt_author(&tampered, Some(&relay.public_key().to_hex()), &agent),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_metadata_fails_closed() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let relay_hex = relay.public_key().to_hex();
+        let valid_mentions = [&["buzz:workflow-mention", agent.as_str()][..]];
+
+        for event in [
+            workflow_event(
+                &relay,
+                Some(&owner),
+                &[],
+                &valid_mentions,
+                &[agent.as_str()],
+            ),
+            workflow_event(
+                &relay,
+                None,
+                &[&["buzz:workflow", "true"]],
+                &valid_mentions,
+                &[agent.as_str()],
+            ),
+            workflow_event(
+                &relay,
+                Some(&owner),
+                &[&["buzz:workflow", "true"], &["buzz:workflow", "true"]],
+                &valid_mentions,
+                &[agent.as_str()],
+            ),
+            workflow_event(
+                &relay,
+                Some(&owner),
+                &[&["buzz:workflow", "true", "extra"]],
+                &valid_mentions,
+                &[agent.as_str()],
+            ),
+            workflow_event(
+                &relay,
+                Some(&owner),
+                &[&["buzz:workflow", "true"]],
+                &[&["buzz:workflow-mention", agent.as_str(), "extra"]],
+                &[agent.as_str()],
+            ),
+            workflow_event(
+                &relay,
+                Some(&owner),
+                &[&["buzz:workflow", "true"]],
+                &[
+                    &["buzz:workflow-mention", agent.as_str()],
+                    &["buzz:workflow-mention", agent.as_str()],
+                ],
+                &[agent.as_str()],
+            ),
+            workflow_event(
+                &relay,
+                Some(&owner),
+                &[&["buzz:workflow", "true"]],
+                &[&["buzz:workflow-mention", "not-a-pubkey"]],
+                &[agent.as_str()],
+            ),
+        ] {
+            assert_eq!(
+                effective_prompt_author(&event, Some(&relay_hex), &agent),
+                relay_hex
+            );
+        }
+
+        let duplicate_owner = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &valid_mentions,
+            &[agent.as_str()],
+        );
+        let mut tags: Vec<Tag> = duplicate_owner.tags.iter().cloned().collect();
+        tags.push(Tag::parse(["buzz:workflow-owner", owner.as_str()]).expect("duplicate owner"));
+        let duplicate_owner =
+            EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "scheduled prompt")
+                .tags(tags)
+                .sign_with_keys(&relay)
+                .expect("signed event");
+        assert_eq!(
+            effective_prompt_author(&duplicate_owner, Some(&relay_hex), &agent),
+            relay_hex
+        );
+    }
+
+    #[test]
+    fn wrong_kind_or_missing_relay_identity_fails_closed() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let relay_hex = relay.public_key().to_hex();
+        let wrong_kind = EventBuilder::new(Kind::TextNote, "scheduled prompt")
+            .tags([
+                Tag::parse(["buzz:workflow", "true"]).expect("marker"),
+                Tag::parse(["buzz:workflow-owner", owner.as_str()]).expect("owner"),
+                Tag::parse(["buzz:workflow-mention", agent.as_str()]).expect("workflow mention"),
+            ])
+            .sign_with_keys(&relay)
+            .expect("signed event");
+        assert_eq!(
+            effective_prompt_author(&wrong_kind, Some(&relay_hex), &agent),
+            relay_hex
+        );
+
+        let valid = workflow_event(
+            &relay,
+            Some(&owner),
+            &[&["buzz:workflow", "true"]],
+            &[&["buzz:workflow-mention", agent.as_str()]],
+            &[agent.as_str()],
+        );
+        assert_eq!(effective_prompt_author(&valid, None, &agent), relay_hex);
     }
 }
 
@@ -3608,7 +7362,973 @@ mod author_gate_tests {
         let cache = OwnerCache::new(Some(OWNER.into()));
         cache.cache_sibling(SIBLING.into(), true);
         cache.cache_sibling(STRANGER.into(), false);
+        cache.cache_sibling(EXTERNAL.into(), false);
         cache
+    }
+
+    /// Serve a NIP-11 document on a loopback port so `InboundAuthorGate` can be
+    /// built through the *same* constructor the listeners use, rather than by
+    /// injecting an already-resolved relay identity. This is what makes the
+    /// listener-to-gate wiring testable: a gate that never loads its identity
+    /// fails these tests instead of silently degrading to the raw signer.
+    pub(super) async fn nip11_server(
+        document: serde_json::Value,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        nip11_scripted_server(std::collections::VecDeque::from([Ok(document)])).await
+    }
+
+    /// Serve scripted NIP-11 responses. `Err(())` returns HTTP 500.
+    async fn nip11_scripted_server(
+        responses: std::collections::VecDeque<Result<serde_json::Value, ()>>,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind NIP-11 test server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let responses = std::sync::Arc::new(tokio::sync::Mutex::new((responses, None)));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                let response = {
+                    let mut scripted = responses.lock().await;
+                    let response = if let Some(next) = scripted.0.pop_front() {
+                        Some(next)
+                    } else {
+                        scripted.1.clone()
+                    };
+                    if let Some(Ok(document)) = &response {
+                        scripted.1 = Some(Ok(document.clone()));
+                    }
+                    response
+                };
+                let Some(response) = response else {
+                    continue;
+                };
+                let Ok(document) = response else {
+                    let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    continue;
+                };
+                let body = document.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/nostr+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, server)
+    }
+
+    /// Build a gate through the real `connect` path against a NIP-11 document
+    /// advertising `relay_hex` as the relay signer. Tests use this instead of
+    /// constructing `InboundAuthorGate` literally so that the identity load
+    /// stays part of what they cover.
+    async fn connected_gate(
+        relay_hex: &str,
+        agent: &str,
+    ) -> (
+        InboundAuthorGate,
+        relay::RestClient,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
+        let gate = InboundAuthorGate::connect(&rest_client, agent, "test").await;
+        (gate, rest_client, server)
+    }
+
+    /// A genuine relay-signed workflow dispatch that explicitly targets `agent`
+    /// on behalf of `owner` — the exact event shape a scheduled workflow emits.
+    pub(super) fn relay_signed_workflow_dispatch(
+        relay_keys: &nostr::Keys,
+        owner: &str,
+        agent: &str,
+    ) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "dispatch")
+            .tags([
+                nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow marker"),
+                nostr::Tag::parse(["buzz:workflow-owner", owner]).expect("workflow owner tag"),
+                nostr::Tag::parse(["buzz:workflow-mention", agent]).expect("workflow mention tag"),
+                nostr::Tag::parse(["p", agent]).expect("recipient tag"),
+            ])
+            .sign_with_keys(relay_keys)
+            .expect("signed workflow event")
+    }
+
+    struct ListenerBoundaryScenario<'a> {
+        listener: ListenerBoundary,
+        relay_keys: &'a nostr::Keys,
+        workflow_owner: &'a str,
+        responses: std::collections::VecDeque<Result<serde_json::Value, ()>>,
+        event_generation: u64,
+        channel_type: &'a str,
+        respond_to: RespondTo,
+        allowlist: HashSet<String>,
+        cache_owner: bool,
+        cache_sibling: bool,
+    }
+
+    async fn listener_boundary_scenario(
+        scenario: ListenerBoundaryScenario<'_>,
+    ) -> (Option<String>, bool) {
+        let ListenerBoundaryScenario {
+            listener,
+            relay_keys,
+            workflow_owner,
+            responses,
+            event_generation,
+            channel_type,
+            respond_to,
+            allowlist,
+            cache_owner,
+            cache_sibling,
+        } = scenario;
+        let relay_hex = relay_keys.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let (rest_client, server) = nip11_scripted_server(responses).await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "listener startup").await;
+        let configured_owner = if cache_owner {
+            Some(workflow_owner.to_string())
+        } else if cache_sibling {
+            Some(nostr::Keys::generate().public_key().to_hex())
+        } else {
+            None
+        };
+        let owner_cache = OwnerCache::new(configured_owner);
+        owner_cache.cache_sibling(relay_hex, false);
+        owner_cache.cache_sibling(workflow_owner.to_string(), cache_sibling);
+        let channel_id = Uuid::new_v4();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "workflow".into(),
+                    channel_type: channel_type.into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+        let event = relay::BuzzEvent {
+            connection_generation: event_generation,
+            channel_id,
+            event: relay_signed_workflow_dispatch(relay_keys, workflow_owner, &agent),
+        };
+        let authorized = match listener {
+            ListenerBoundary::Normal => {
+                authorize_normal_listener_event(
+                    &mut gate,
+                    event,
+                    &respond_to,
+                    &allowlist,
+                    &owner_cache,
+                    &channel_info,
+                    &rest_client,
+                )
+                .await
+            }
+            ListenerBoundary::Setup => {
+                setup_mode::authorize_setup_listener_event(
+                    &mut gate,
+                    event,
+                    &respond_to,
+                    &allowlist,
+                    &owner_cache,
+                    &channel_info,
+                    &rest_client,
+                )
+                .await
+            }
+        };
+        let result = authorized.map(|event| event.into_parts().1);
+        server.abort();
+        let allowed = result.is_some();
+        (result, allowed)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ListenerBoundary {
+        Normal,
+        Setup,
+    }
+
+    impl ListenerBoundary {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Normal => "normal",
+                Self::Setup => "setup",
+            }
+        }
+    }
+
+    /// Both production listener callables must attribute relay-signed workflow
+    /// events to the workflow owner and enforce policy there. A local
+    /// `allowed: true` replacement at either call site makes the Nobody case
+    /// fail; using the raw relay signer makes the OwnerOnly case fail.
+    #[tokio::test]
+    async fn production_listener_boundaries_apply_workflow_owner_policy() {
+        for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let accepted_workflow_owner = nostr::Keys::generate().public_key().to_hex();
+            let accepted = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &accepted_workflow_owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::OwnerOnly,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                accepted.1,
+                "{} listener must allow the workflow owner",
+                listener.name()
+            );
+            assert_eq!(
+                accepted.0.as_deref(),
+                Some(accepted_workflow_owner.as_str()),
+                "{} listener must preserve the effective workflow owner",
+                listener.name()
+            );
+
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let denied_workflow_owner = nostr::Keys::generate().public_key().to_hex();
+            let denied = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &denied_workflow_owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::Nobody,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                !denied.1,
+                "{} listener must enforce respond-to=nobody",
+                listener.name()
+            );
+        }
+    }
+
+    /// Both production boundaries must retain DM classification when composing
+    /// trusted workflow attribution with configured author policy. External
+    /// allowlist entries and `Anyone` stay denied in a DM; owner and sibling
+    /// principals remain allowed; `Nobody` remains absolute.
+    #[tokio::test]
+    async fn production_listener_boundaries_enforce_dm_author_policy() {
+        for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let external = nostr::Keys::generate().public_key().to_hex();
+            let external_allowlist = HashSet::from([external.clone()]);
+            let denied_external = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &external,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "dm",
+                respond_to: RespondTo::Allowlist,
+                allowlist: external_allowlist,
+                cache_owner: false,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                !denied_external.1,
+                "{} listener must deny an external allowlist entry in a DM",
+                listener.name()
+            );
+
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let stranger = nostr::Keys::generate().public_key().to_hex();
+            let denied_stranger = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &stranger,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "dm",
+                respond_to: RespondTo::Anyone,
+                allowlist: HashSet::new(),
+                cache_owner: false,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                !denied_stranger.1,
+                "{} listener must deny a stranger in a DM under Anyone",
+                listener.name()
+            );
+
+            for (principal, cache_owner, cache_sibling, label) in [
+                (
+                    nostr::Keys::generate().public_key().to_hex(),
+                    true,
+                    false,
+                    "owner",
+                ),
+                (
+                    nostr::Keys::generate().public_key().to_hex(),
+                    false,
+                    true,
+                    "sibling",
+                ),
+            ] {
+                let relay_keys = nostr::Keys::generate();
+                let relay_hex = relay_keys.public_key().to_hex();
+                let allowed = listener_boundary_scenario(ListenerBoundaryScenario {
+                    listener,
+                    relay_keys: &relay_keys,
+                    workflow_owner: &principal,
+                    responses: std::collections::VecDeque::from([Ok(
+                        serde_json::json!({ "self": relay_hex }),
+                    )]),
+                    event_generation: 0,
+                    channel_type: "dm",
+                    respond_to: RespondTo::Anyone,
+                    allowlist: HashSet::new(),
+                    cache_owner,
+                    cache_sibling,
+                })
+                .await;
+                assert!(
+                    allowed.1,
+                    "{} listener must allow the {label} in a DM",
+                    listener.name()
+                );
+            }
+
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let owner = nostr::Keys::generate().public_key().to_hex();
+            let denied_nobody = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "dm",
+                respond_to: RespondTo::Nobody,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                !denied_nobody.1,
+                "{} listener must enforce Nobody in a DM",
+                listener.name()
+            );
+        }
+    }
+
+    /// Both production boundaries must perform the pending generation-zero
+    /// refresh before policy evaluation. Bypassing the gate invocation leaves
+    /// the relay signer denied and makes this recovery assertion fail.
+    #[tokio::test]
+    async fn production_listener_boundaries_recover_relay_identity() {
+        for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+            let result = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &workflow_owner,
+                responses: std::collections::VecDeque::from([
+                    Err(()),
+                    Err(()),
+                    Ok(serde_json::json!({ "self": relay_hex })),
+                ]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::OwnerOnly,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                result.1,
+                "{} listener must recover identity before authorization",
+                listener.name()
+            );
+            assert_eq!(
+                result.0.as_deref(),
+                Some(workflow_owner.as_str()),
+                "{} listener must preserve the recovered workflow owner",
+                listener.name()
+            );
+        }
+    }
+
+    /// The listener decision-boundary regression.
+    ///
+    /// Both listeners call `evaluate_listener_event`; it owns identity refresh,
+    /// channel trust, workflow attribution, and policy, with no production-visible
+    /// raw-policy helper alongside it. This test drives that exact callable
+    /// against a live NIP-11 document, so it fails if identity loading,
+    /// effective-author resolution, DM classification, or policy application
+    /// regresses. Replacing either listener call with the former raw-signer
+    /// `author_allowed` path is now a compile error because that policy is
+    /// private to the gate module.
+    #[tokio::test]
+    async fn test_connected_gate_wakes_owner_only_agent_for_relay_signed_workflow() {
+        let relay_keys = nostr::Keys::generate();
+        let relay_hex = relay_keys.public_key().to_hex();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
+
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        assert!(
+            gate.has_relay_identity(),
+            "the gate must load the relay signing identity during construction"
+        );
+
+        let event = relay_signed_workflow_dispatch(&relay_keys, &workflow_owner, &agent);
+        let cache = cache_with_sibling();
+        cache.cache_sibling(workflow_owner.clone(), true);
+        cache.cache_sibling(relay_hex.clone(), false);
+
+        let channel_id = Uuid::new_v4();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "workflow".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+        let buzz_event = relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id,
+            event,
+        };
+        let decision = gate
+            .evaluate_listener_event(
+                &buzz_event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+
+        assert_eq!(
+            decision.effective_author, workflow_owner,
+            "a connected gate must attribute a relay-signed workflow dispatch to its owner, not the relay signer"
+        );
+        assert!(
+            decision.allowed,
+            "an owner-only agent must wake for its own workflow's explicit mention"
+        );
+        server.abort();
+    }
+
+    /// A gate whose relay identity is unavailable must fall back to the raw
+    /// signer and stay closed — the documented fail-closed behavior, and the
+    /// exact state the wiring regression above proves the listeners avoid.
+    #[tokio::test]
+    async fn test_gate_without_relay_identity_fails_closed_to_raw_signer() {
+        let relay_keys = nostr::Keys::generate();
+        let relay_hex = relay_keys.public_key().to_hex();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        // A NIP-11 document with no `self` key: attribution is unavailable.
+        let (rest_client, server) = nip11_server(serde_json::json!({ "name": "relay" })).await;
+
+        let gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        assert!(
+            !gate.has_relay_identity(),
+            "a NIP-11 document without `self` must leave attribution unavailable"
+        );
+
+        let event = relay_signed_workflow_dispatch(&relay_keys, &workflow_owner, &agent);
+        let cache = cache_with_sibling();
+        cache.cache_sibling(workflow_owner, true);
+        cache.cache_sibling(relay_hex.clone(), false);
+
+        let decision = gate
+            .evaluate_for_test(
+                &event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                false,
+                &cache,
+                &rest_client,
+            )
+            .await;
+
+        assert_eq!(
+            decision.effective_author, relay_hex,
+            "without a verified relay identity the gate must fall back to the raw signer"
+        );
+        assert!(
+            !decision.allowed,
+            "unattributed relay-signed output must not wake an owner-only agent"
+        );
+        server.abort();
+    }
+
+    /// The first authorized event after reconnect must restore attribution
+    /// through the same decision boundary both listeners use, without a
+    /// separate identity-refresh call.
+    #[tokio::test]
+    async fn test_gate_refresh_arms_attribution_after_reconnect() {
+        let relay_keys = nostr::Keys::generate();
+        let relay_hex = relay_keys.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+
+        // Construct against an unreachable relay: no identity yet.
+        let unreachable = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        let mut gate = InboundAuthorGate::connect(&unreachable, &agent, "test").await;
+        assert!(!gate.has_relay_identity());
+
+        let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let event = relay_signed_workflow_dispatch(&relay_keys, &workflow_owner, &agent);
+        let cache = cache_with_sibling();
+        cache.cache_sibling(workflow_owner.clone(), true);
+        cache.cache_sibling(relay_hex, false);
+        let channel_id = Uuid::new_v4();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "workflow".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+        let buzz_event = relay::BuzzEvent {
+            connection_generation: 1,
+            channel_id,
+            event,
+        };
+
+        let decision = gate
+            .evaluate_listener_event(
+                &buzz_event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+        assert_eq!(
+            decision.effective_author, workflow_owner,
+            "a reconnect refresh must restore delegated workflow attribution"
+        );
+        assert!(decision.allowed);
+        server.abort();
+    }
+
+    #[test]
+    fn refresh_needed_until_generation_completes() {
+        use super::inbound_author_gate::refresh_needed;
+        assert!(refresh_needed(None, 0));
+        assert!(refresh_needed(None, 1));
+        assert!(!refresh_needed(Some(0), 0));
+        assert!(refresh_needed(Some(0), 1));
+        assert!(!refresh_needed(Some(1), 1));
+        assert!(!refresh_needed(Some(1), 0));
+        assert!(refresh_needed(Some(1), 2));
+    }
+
+    #[tokio::test]
+    async fn test_generation_zero_retries_failed_startup_identity() {
+        let relay_keys = nostr::Keys::generate();
+        let relay_hex = relay_keys.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        // Both startup probes fail; HTTP then recovers without a WS reconnect.
+        let (rest_client, server) = nip11_scripted_server(std::collections::VecDeque::from([
+            Err(()),
+            Err(()),
+            Ok(serde_json::json!({ "self": relay_hex.clone() })),
+        ]))
+        .await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup").await;
+        assert!(!gate.has_relay_identity());
+        let channel_id = Uuid::new_v4();
+        let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
+        owner_cache.cache_sibling(relay_hex.clone(), false);
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "workflow".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+        let event = relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id,
+            event: relay_signed_workflow_dispatch(&relay_keys, &workflow_owner, &agent),
+        };
+        let decision = gate
+            .evaluate_listener_event(
+                &event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &owner_cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+        server.abort();
+        assert!(
+            decision.allowed,
+            "a generation-0 workflow wake must recover after the startup NIP-11 failure"
+        );
+        assert_eq!(decision.effective_author, workflow_owner);
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_startup_result_completes_generation_zero() {
+        let relay_keys = nostr::Keys::generate();
+        let next_relay_keys = nostr::Keys::generate();
+        let relay_hex = relay_keys.public_key().to_hex();
+        let next_relay_hex = next_relay_keys.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
+        owner_cache.cache_sibling(relay_hex.clone(), false);
+        owner_cache.cache_sibling(next_relay_hex.clone(), false);
+        for identity in [Some(relay_hex.clone()), None] {
+            let document = match &identity {
+                Some(key) => serde_json::json!({ "self": key }),
+                None => serde_json::json!({ "name": "relay without stable identity" }),
+            };
+            let mut responses = std::collections::VecDeque::from([Ok(document.clone())]);
+            if identity.is_none() {
+                // A missing `self` probes /info as well as the root.
+                responses.push_back(Ok(document));
+            }
+            responses.push_back(Ok(serde_json::json!({ "self": next_relay_hex.clone() })));
+            let (rest_client, server) = nip11_scripted_server(responses).await;
+            let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "startup").await;
+            assert_eq!(gate.relay_identity_for_test(), identity.as_deref());
+            let channel_id = Uuid::new_v4();
+            let channel_info = pool::ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel_id,
+                    relay::ChannelInfo {
+                        name: "workflow".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )]),
+                rest_client.clone(),
+            );
+            let mut event = relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event: relay_signed_workflow_dispatch(&relay_keys, &workflow_owner, &agent),
+            };
+            for _ in 0..2 {
+                let decision = gate
+                    .evaluate_listener_event(
+                        &event,
+                        &RespondTo::OwnerOnly,
+                        &HashSet::new(),
+                        &owner_cache,
+                        &channel_info,
+                        &rest_client,
+                    )
+                    .await;
+                assert_eq!(decision.allowed, identity.is_some());
+                assert_eq!(
+                    gate.relay_identity_for_test(),
+                    identity.as_deref(),
+                    "an authoritative startup response must not be fetched again at generation 0"
+                );
+            }
+            event.connection_generation = 1;
+            event.event = relay_signed_workflow_dispatch(&next_relay_keys, &workflow_owner, &agent);
+            let decision = gate
+                .evaluate_listener_event(
+                    &event,
+                    &RespondTo::OwnerOnly,
+                    &HashSet::new(),
+                    &owner_cache,
+                    &channel_info,
+                    &rest_client,
+                )
+                .await;
+            assert!(decision.allowed);
+            assert_eq!(decision.effective_author, workflow_owner);
+            assert_eq!(
+                gate.relay_identity_for_test(),
+                Some(next_relay_hex.as_str()),
+                "a later connection must still refresh after authoritative startup"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generation_refresh_retries_after_nip11_failure() {
+        let old_relay = nostr::Keys::generate();
+        let new_relay = nostr::Keys::generate();
+        let old_relay_hex = old_relay.public_key().to_hex();
+        let new_relay_hex = new_relay.public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let channel_id = uuid::Uuid::new_v4();
+        let (rest_client, server) = nip11_scripted_server(std::collections::VecDeque::from([
+            Ok(serde_json::json!({ "self": old_relay_hex.clone() })),
+            Err(()),
+            Err(()),
+            Ok(serde_json::json!({ "self": new_relay_hex.clone() })),
+        ]))
+        .await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let owner_cache = OwnerCache::new(Some(workflow_owner.clone()));
+        owner_cache.cache_sibling(old_relay_hex.clone(), false);
+        owner_cache.cache_sibling(new_relay_hex.clone(), false);
+        let channel_info = pool::ChannelInfoResolver::new(
+            std::collections::HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "test".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+
+        assert_eq!(gate.relay_identity_for_test(), Some(old_relay_hex.as_str()));
+
+        let new_event = relay::BuzzEvent {
+            connection_generation: 2,
+            channel_id,
+            event: relay_signed_workflow_dispatch(&new_relay, &workflow_owner, &agent),
+        };
+        let first_new = gate
+            .evaluate_listener_event(
+                &new_event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &owner_cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+        assert_eq!(gate.relay_identity_for_test(), Some(old_relay_hex.as_str()));
+        assert!(
+            !first_new.allowed,
+            "the new signer must remain fail-closed while NIP-11 is unavailable"
+        );
+
+        let recovered = gate
+            .evaluate_listener_event(
+                &new_event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &owner_cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+        assert_eq!(gate.relay_identity_for_test(), Some(new_relay_hex.as_str()));
+        assert_eq!(recovered.effective_author, workflow_owner);
+        assert!(
+            recovered.allowed,
+            "a later event on the same connection must use the refreshed relay key"
+        );
+
+        let stale_old_event = relay::BuzzEvent {
+            connection_generation: 2,
+            channel_id,
+            event: relay_signed_workflow_dispatch(&old_relay, &workflow_owner, &agent),
+        };
+        let stale = gate
+            .evaluate_listener_event(
+                &stale_old_event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &owner_cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+        assert!(!stale.allowed, "the rotated-away relay key must be evicted");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_combined_gate_accepts_explicit_trusted_workflow_target_only() {
+        let relay = nostr::Keys::generate();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "dispatch")
+                .tags([
+                    nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow marker"),
+                    nostr::Tag::parse(["buzz:workflow-owner", workflow_owner.as_str()])
+                        .expect("workflow owner tag"),
+                    nostr::Tag::parse(["buzz:workflow-mention", agent.as_str()])
+                        .expect("workflow mention tag"),
+                    nostr::Tag::parse(["p", agent.as_str()]).expect("recipient tag"),
+                ])
+                .sign_with_keys(&relay)
+                .expect("signed workflow event");
+        let cache = cache_with_sibling();
+        cache.cache_sibling(workflow_owner.clone(), true);
+
+        let (gate, rest_client, server) =
+            connected_gate(&relay.public_key().to_hex(), &agent).await;
+        let decision = gate
+            .evaluate_for_test(
+                &event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                false,
+                &cache,
+                &rest_client,
+            )
+            .await;
+        assert_eq!(decision.effective_author, workflow_owner);
+        assert!(
+            decision.allowed,
+            "a verified workflow owner for an explicitly targeted agent must flow through the existing sibling policy"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_combined_gate_rejects_owner_p_tag_without_explicit_workflow_target() {
+        let relay = nostr::Keys::generate();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = workflow_owner.clone();
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "dispatch")
+                .tags([
+                    nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow marker"),
+                    nostr::Tag::parse(["buzz:workflow-owner", workflow_owner.as_str()])
+                        .expect("workflow owner tag"),
+                    nostr::Tag::parse(["p", agent.as_str()]).expect("legacy owner p tag"),
+                ])
+                .sign_with_keys(&relay)
+                .expect("signed workflow event");
+        let cache = cache_with_sibling();
+        cache.cache_sibling(workflow_owner, true);
+        cache.cache_sibling(relay.public_key().to_hex(), false);
+
+        let (gate, rest_client, server) =
+            connected_gate(&relay.public_key().to_hex(), &agent).await;
+        let decision = gate
+            .evaluate_for_test(
+                &event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                false,
+                &cache,
+                &rest_client,
+            )
+            .await;
+        server.abort();
+        assert_eq!(decision.effective_author, relay.public_key().to_hex());
+        assert!(
+            !decision.allowed,
+            "the legacy owner p tag alone must not wake an agent-owned workflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_gate_rejects_forged_workflow_attribution() {
+        let relay = nostr::Keys::generate();
+        let attacker = nostr::Keys::generate();
+        let workflow_owner = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "dispatch")
+                .tags([
+                    nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow marker"),
+                    nostr::Tag::parse(["buzz:workflow-owner", workflow_owner.as_str()])
+                        .expect("workflow owner tag"),
+                    nostr::Tag::parse(["buzz:workflow-mention", agent.as_str()])
+                        .expect("workflow mention tag"),
+                    nostr::Tag::parse(["p", agent.as_str()]).expect("recipient tag"),
+                ])
+                .sign_with_keys(&attacker)
+                .expect("signed forged event");
+        let cache = cache_with_sibling();
+        cache.cache_sibling(workflow_owner, true);
+        cache.cache_sibling(attacker.public_key().to_hex(), false);
+
+        let (gate, rest_client, server) =
+            connected_gate(&relay.public_key().to_hex(), &agent).await;
+        let decision = gate
+            .evaluate_for_test(
+                &event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                false,
+                &cache,
+                &rest_client,
+            )
+            .await;
+        server.abort();
+        assert_eq!(decision.effective_author, attacker.public_key().to_hex());
+        assert!(
+            !decision.allowed,
+            "an attacker-signed workflow event must not borrow trusted owner authority"
+        );
     }
 
     #[tokio::test]
@@ -3616,10 +8336,11 @@ mod author_gate_tests {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
-            author_allowed(
+            inbound_author_gate::test_author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 SIBLING,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -3633,10 +8354,11 @@ mod author_gate_tests {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
-            author_allowed(
+            inbound_author_gate::test_author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -3650,10 +8372,11 @@ mod author_gate_tests {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
-            !author_allowed(
+            !inbound_author_gate::test_author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 STRANGER,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -3667,10 +8390,11 @@ mod author_gate_tests {
         let cache = cache_with_sibling();
         let allowlist = HashSet::new();
         assert!(
-            author_allowed(
+            inbound_author_gate::test_author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 OWNER,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -3687,10 +8411,11 @@ mod author_gate_tests {
     async fn test_owner_only_rejects_stranger_so_no_steer() {
         let cache = cache_with_sibling();
         assert!(
-            !author_allowed(
+            !inbound_author_gate::test_author_allowed(
                 &RespondTo::OwnerOnly,
                 &HashSet::new(),
                 STRANGER,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -3704,10 +8429,11 @@ mod author_gate_tests {
         let cache = cache_with_sibling();
         for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
             assert!(
-                author_allowed(
+                inbound_author_gate::test_author_allowed(
                     &RespondTo::OwnerOnly,
                     &HashSet::new(),
                     who,
+                    false,
                     &cache,
                     &dummy_rest_client()
                 )
@@ -3715,6 +8441,1553 @@ mod author_gate_tests {
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
             );
         }
+    }
+
+    // ── DM hardening ──────────────────────────────────────────────────────
+    //
+    // In a DM, clients auto-p-tag every participant, and an agent can be
+    // asked to open a DM with a third party. The gate must therefore ignore
+    // the allowlist and `anyone` mode inside DMs: only owner + verified
+    // siblings fire turns.
+
+    #[tokio::test]
+    async fn test_dm_rejects_allowlisted_external_pubkey() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        assert!(
+            !inbound_author_gate::test_author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                EXTERNAL,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "an allowlisted external pubkey must NOT fire a turn inside a DM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dm_rejects_stranger_under_anyone() {
+        let cache = cache_with_sibling();
+        assert!(
+            !inbound_author_gate::test_author_allowed(
+                &RespondTo::Anyone,
+                &HashSet::new(),
+                STRANGER,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "respond_to=anyone must still drop non-owner authors inside a DM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dm_admits_owner_and_sibling_in_every_responding_mode() {
+        let cache = cache_with_sibling();
+        for mode in [
+            RespondTo::OwnerOnly,
+            RespondTo::Allowlist,
+            RespondTo::Anyone,
+        ] {
+            for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
+                assert!(
+                    inbound_author_gate::test_author_allowed(
+                        &mode,
+                        &HashSet::new(),
+                        who,
+                        true,
+                        &cache,
+                        &dummy_rest_client()
+                    )
+                    .await,
+                    "in a DM under {mode}, the {label} must still be admitted"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dm_nobody_rejects_even_owner() {
+        let cache = cache_with_sibling();
+        assert!(
+            !inbound_author_gate::test_author_allowed(
+                &RespondTo::Nobody,
+                &HashSet::new(),
+                OWNER,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "respond_to=nobody must drop everything, DMs included"
+        );
+    }
+
+    // ── sibling verdict caching ───────────────────────────────────────────
+    //
+    // A sibling lookup that failed because the relay was unreachable is
+    // Indeterminate: it fails closed for that one event but must NOT be
+    // cached, or a single relay blip makes this agent silently ignore a
+    // same-owner sibling until the process restarts.
+
+    /// Serve one JSON body for every request on a loopback port, as the
+    /// `/query` endpoint the sibling check consults.
+    async fn sibling_query_server(
+        body: serde_json::Value,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sibling query server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, server)
+    }
+
+    #[tokio::test]
+    async fn test_sibling_indeterminate_relay_failure_is_not_cached() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::new(Some(owner));
+        assert!(
+            !is_owner_or_sibling(&author, &cache, &dummy_rest_client()).await,
+            "an unverifiable author must fail closed for this event"
+        );
+        assert_eq!(
+            cache.proven_verdict(&author),
+            None,
+            "a relay failure must not be cached as a permanent non-sibling verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sibling_absent_profile_is_indeterminate_and_throttled() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::new(Some(owner));
+        let (rest, server) = sibling_query_server(serde_json::json!([])).await;
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(
+            cache.proven_verdict(&author),
+            None,
+            "a missing kind:0 is not a verdict — the profile may not exist or replicate yet"
+        );
+        assert_eq!(
+            cache.sibling_state(&author),
+            SiblingCacheState::Throttled,
+            "a missing profile is retried under the bounded backoff, not per event"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sibling_profile_without_matching_tag_is_cached_negative() {
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::new(Some(owner));
+        let (rest, server) = sibling_query_server(serde_json::json!([{ "tags": [] }])).await;
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(
+            cache.proven_verdict(&author),
+            Some(false),
+            "a fetched profile with no verifying owner attestation is definitive"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_sibling_valid_auth_tag_is_verified_and_cached() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let author = agent_keys.public_key().to_hex();
+        let tag_json =
+            buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_keys.public_key(), "")
+                .expect("compute auth tag");
+        let tag: serde_json::Value = serde_json::from_str(&tag_json).expect("tag json");
+        let profile = serde_json::json!([{ "tags": [tag] }]);
+        let cache = OwnerCache::new(Some(owner_keys.public_key().to_hex()));
+        let (rest, server) = sibling_query_server(profile).await;
+        assert!(
+            is_owner_or_sibling(&author, &cache, &rest).await,
+            "a kind:0 carrying a valid owner attestation must verify as a sibling"
+        );
+        assert_eq!(cache.proven_verdict(&author), Some(true));
+        server.abort();
+    }
+
+    /// A `/query` stand-in that counts requests and answers HTTP 500 (a
+    /// non-retriable status, so the harness sees an immediate error rather
+    /// than the 2s timeout) until `healthy` is flipped, after which it answers
+    /// `200 [{"tags":[]}]` — a fetched profile with no owner attestation, i.e.
+    /// a definitive `NotSibling`.
+    async fn flaky_sibling_query_server() -> (
+        relay::RestClient,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky sibling query server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let healthy = std::sync::Arc::new(AtomicBool::new(false));
+        let (server_requests, server_healthy) = (requests.clone(), healthy.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = if server_healthy.load(Ordering::SeqCst) {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n[{\"tags\":[]}]".to_string()
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (rest, requests, healthy, server)
+    }
+
+    #[tokio::test]
+    async fn test_sibling_indeterminate_retry_is_throttled_then_recovers() {
+        use std::sync::atomic::Ordering;
+
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let author = nostr::Keys::generate().public_key().to_hex();
+        let cache = OwnerCache::with_retry_backoff(
+            Some(owner),
+            Duration::from_millis(80),
+            Duration::from_millis(400),
+        );
+        let (rest, requests, healthy, server) = flaky_sibling_query_server().await;
+
+        // First contact during the outage: one relay call, denied, not proven.
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.proven_verdict(&author), None);
+        assert_eq!(cache.sibling_state(&author), SiblingCacheState::Throttled);
+
+        // A burst of further events inside the retry deadline must be denied
+        // WITHOUT another inline relay round-trip — this is what keeps a
+        // chatty sibling from stalling the inbound loop during an outage.
+        for _ in 0..5 {
+            assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "events inside the retry deadline must not re-query the relay"
+        );
+
+        // Once the deadline passes the lookup is retried (still failing).
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "deadline expiry re-arms the lookup"
+        );
+        assert_eq!(cache.sibling_state(&author), SiblingCacheState::Throttled);
+
+        // Relay recovers: after the (now doubled) deadline the retry lands a
+        // proven verdict, which is cached and ends the throttling entirely.
+        healthy.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            cache.proven_verdict(&author),
+            Some(false),
+            "a relay-confirmed verdict replaces the retry deadline"
+        );
+        assert!(!is_owner_or_sibling(&author, &cache, &rest).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "a proven verdict is served from cache with no further relay calls"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn test_sibling_indeterminate_backoff_doubles_to_cap() {
+        let cache = OwnerCache::with_retry_backoff(
+            Some("00".into()),
+            Duration::from_secs(5),
+            Duration::from_secs(12),
+        );
+        let observed: Vec<u64> = (0..5)
+            .map(|_| cache.note_indeterminate("author").as_secs())
+            .collect();
+        assert_eq!(
+            observed,
+            vec![5, 10, 12, 12, 12],
+            "consecutive indeterminate lookups back off exponentially up to the cap"
+        );
+        assert_eq!(cache.sibling_state("author"), SiblingCacheState::Throttled);
+        // A proven verdict clears the backoff state.
+        cache.cache_sibling("author".into(), true);
+        assert_eq!(
+            cache.sibling_state("author"),
+            SiblingCacheState::Proven(true)
+        );
+        assert_eq!(
+            cache.note_indeterminate("fresh").as_secs(),
+            5,
+            "backoff is tracked per author"
+        );
+    }
+
+    /// A cache whose retry deadlines expire almost immediately, filled to the
+    /// eviction threshold with proven verdicts for `authors`.
+    fn saturated_cache_with_proven(authors: &[String]) -> OwnerCache {
+        let cache = OwnerCache::with_retry_backoff(
+            Some("00".into()),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        for author in authors {
+            cache.cache_sibling(author.clone(), true);
+        }
+        cache
+    }
+
+    #[test]
+    fn test_sibling_cache_replacing_an_author_at_capacity_keeps_the_rest() {
+        let authors: Vec<String> = (0..OwnerCache::SIBLING_CACHE_CAP)
+            .map(|i| format!("author-{i}"))
+            .collect();
+        let cache = saturated_cache_with_proven(&authors);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+
+        // Re-arming one author's retry deadline at capacity — first arming,
+        // then re-arming after it expired — replaces that entry only.
+        cache.note_indeterminate(&authors[0]);
+        std::thread::sleep(Duration::from_millis(5));
+        cache.note_indeterminate(&authors[0]);
+
+        assert_eq!(
+            cache.len(),
+            OwnerCache::SIBLING_CACHE_CAP,
+            "replacing an existing author must not evict anything"
+        );
+        for author in &authors[1..] {
+            assert_eq!(
+                cache.sibling_state(author),
+                SiblingCacheState::Proven(true),
+                "re-arming {} at capacity must keep {author}'s proven verdict",
+                authors[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_sibling_cache_new_author_at_capacity_evicts_expired_deadlines_first() {
+        let proven: Vec<String> = (1..OwnerCache::SIBLING_CACHE_CAP)
+            .map(|i| format!("proven-{i}"))
+            .collect();
+        let cache = saturated_cache_with_proven(&proven);
+        cache.note_indeterminate("expired");
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        std::thread::sleep(Duration::from_millis(5));
+
+        // A new author at capacity displaces the one expired deadline, nothing else.
+        cache.cache_sibling("newcomer".into(), false);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        assert_eq!(
+            cache.sibling_state("newcomer"),
+            SiblingCacheState::Proven(false)
+        );
+        for author in &proven {
+            assert_eq!(
+                cache.sibling_state(author),
+                SiblingCacheState::Proven(true),
+                "an expired deadline must be evicted before any proven verdict"
+            );
+        }
+
+        // With no expired deadlines left, one more new author evicts exactly
+        // one entry — never the whole map.
+        cache.cache_sibling("newcomer-2".into(), false);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        assert_eq!(
+            cache.sibling_state("newcomer-2"),
+            SiblingCacheState::Proven(false)
+        );
+        let retained = proven
+            .iter()
+            .chain(std::iter::once(&"newcomer".to_string()))
+            .filter(|author| cache.sibling_state(author) != SiblingCacheState::Unknown)
+            .count();
+        assert_eq!(
+            retained,
+            OwnerCache::SIBLING_CACHE_CAP - 1,
+            "a full cache evicts a single entry for a new author"
+        );
+    }
+
+    #[test]
+    fn test_sibling_cache_evicts_one_expired_record_and_keeps_other_backoff_tiers() {
+        let cache = OwnerCache::with_retry_backoff(
+            Some("00".into()),
+            Duration::from_millis(1),
+            Duration::from_millis(64),
+        );
+        // "old" expires first at the base tier; "tiered" has failed three
+        // times and climbed to a 4ms deadline.
+        assert_eq!(cache.note_indeterminate("old").as_millis(), 1);
+        for _ in 0..3 {
+            cache.note_indeterminate("tiered");
+        }
+        let proven: Vec<String> = (2..OwnerCache::SIBLING_CACHE_CAP)
+            .map(|i| format!("proven-{i}"))
+            .collect();
+        for author in &proven {
+            cache.cache_sibling(author.clone(), true);
+        }
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        std::thread::sleep(Duration::from_millis(10)); // both deadlines expired
+
+        // The newcomer takes exactly one slot: the longest-expired record.
+        cache.cache_sibling("newcomer".into(), false);
+        assert_eq!(cache.len(), OwnerCache::SIBLING_CACHE_CAP);
+        for author in &proven {
+            assert_eq!(cache.sibling_state(author), SiblingCacheState::Proven(true));
+        }
+        assert_eq!(
+            cache.note_indeterminate("tiered").as_millis(),
+            8,
+            "the surviving expired record must keep its backoff tier (3 failures → 8ms next)"
+        );
+        assert_eq!(
+            cache.note_indeterminate("old").as_millis(),
+            1,
+            "only the longest-expired record was evicted, so it restarts at the base tier"
+        );
+    }
+
+    // ── is_dm_channel resolution ──────────────────────────────────────────
+
+    fn resolver(startup: HashMap<Uuid, relay::ChannelInfo>) -> pool::ChannelInfoResolver {
+        pool::ChannelInfoResolver::new(startup, dummy_rest_client())
+    }
+
+    #[tokio::test]
+    async fn test_is_dm_channel_uses_definitive_startup_metadata() {
+        let dm_id = Uuid::new_v4();
+        let stream_id = Uuid::new_v4();
+        let startup = HashMap::from([
+            (
+                dm_id,
+                relay::ChannelInfo {
+                    name: "dm".into(),
+                    channel_type: "dm".into(),
+                    description: None,
+                },
+            ),
+            (
+                stream_id,
+                relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            ),
+        ]);
+        let resolver = resolver(startup);
+        assert!(is_dm_channel(dm_id, &resolver).await);
+        assert!(!is_dm_channel(stream_id, &resolver).await);
+    }
+
+    #[tokio::test]
+    async fn test_is_dm_channel_fails_closed_for_unknown_startup_metadata() {
+        let id = Uuid::new_v4();
+        let startup = HashMap::from([(
+            id,
+            relay::ChannelInfo {
+                name: "unknown".into(),
+                channel_type: "unknown".into(),
+                description: None,
+            },
+        )]);
+        assert!(
+            is_dm_channel(id, &resolver(startup)).await,
+            "missing startup metadata must not be trusted as a stream"
+        );
+    }
+
+    async fn lazy_resolver_with_response(
+        response: serde_json::Value,
+    ) -> (
+        pool::ChannelInfoResolver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let body = response.to_string();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (
+            pool::ChannelInfoResolver::new(HashMap::new(), rest),
+            requests,
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_is_dm_channel_lazy_resolves_declared_dm_and_caches_it() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", id.to_string()], ["name", "DM"], ["t", "dm"]]
+        }]);
+        let (resolver, requests, server) = lazy_resolver_with_response(response).await;
+
+        assert!(is_dm_channel(id, &resolver).await);
+        assert!(is_dm_channel(id, &resolver).await);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "author-gate DM classification resolves and caches channel metadata only"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_discovery_without_metadata_stays_fail_closed_at_author_gate() {
+        let id = Uuid::new_v4();
+        let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
+        let channel_info = resolver(discovered);
+        let owner_cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+
+        let is_dm = is_dm_channel(id, &channel_info).await;
+        assert!(is_dm, "unknown startup metadata must fail closed as DM");
+        assert!(
+            !inbound_author_gate::test_author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                EXTERNAL,
+                is_dm,
+                &owner_cache,
+                &dummy_rest_client(),
+            )
+            .await,
+            "an external author must not pass when startup discovery omitted metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_dm_channel_fails_closed_when_lazy_resolution_fails() {
+        assert!(
+            is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
+            "an unresolvable channel type must be treated as a DM"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observer_snapshot_race_tests {
+    use super::*;
+    use nostr::Keys;
+
+    fn emit_marker(observer: &observer::ObserverHandle, marker: &str) {
+        observer.emit(
+            "test_event",
+            None,
+            &observer::context_for(None, None, None),
+            serde_json::json!({ "marker": marker }),
+        );
+    }
+
+    /// An event emitted between `subscribe()` and `snapshot()` lands in BOTH
+    /// the snapshot and the live receiver; the seq high-water dedupe must
+    /// deliver it exactly once — and never lose events on either side of it.
+    #[tokio::test(start_paused = true)]
+    async fn overlap_between_subscribe_and_snapshot_publishes_exactly_once() {
+        let observer = observer::ObserverHandle::in_process();
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        // Before the publisher starts: replay-buffer only.
+        emit_marker(&observer, "before");
+        // The race window: emitted after subscribe() but before snapshot(),
+        // so it is present in the snapshot AND queued on the receiver.
+        let rx = observer.subscribe();
+        emit_marker(&observer, "overlap");
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.len(), 2, "overlap event must be in the snapshot");
+        // After the snapshot: live receiver only.
+        emit_marker(&observer, "after");
+        // Close the broadcast channel so the run loop drains and exits.
+        drop(observer);
+
+        run_relay_observer_publisher(
+            snapshot,
+            rx,
+            publisher,
+            agent_keys.clone(),
+            agent_keys.public_key().to_hex(),
+            owner_keys.public_key().to_hex(),
+            owner_keys.public_key(),
+        )
+        .await;
+
+        // The run loop has exited, dropping the publisher; drain the forwarded
+        // events until the channel closes (deterministic — no try_recv race
+        // with the test_pair forwarding task). With per-tick batching the three
+        // events arrive inside batch envelopes (or unwrapped when a drain held
+        // exactly one event); unwrap both shapes.
+        let mut markers = Vec::new();
+        while let Some(event) = published_rx.recv().await {
+            let payload: serde_json::Value =
+                decrypt_observer_payload(&owner_keys, &event).expect("decrypt published frame");
+            match payload["payload"]["events"].as_array() {
+                Some(inner) => markers.extend(
+                    inner
+                        .iter()
+                        .map(|e| e["payload"]["marker"].as_str().unwrap().to_string()),
+                ),
+                None => markers.push(payload["payload"]["marker"].as_str().unwrap().to_string()),
+            }
+        }
+        assert_eq!(
+            markers,
+            ["before", "overlap", "after"],
+            "each event must be published exactly once, in order"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observer_publish_queue_tests {
+    use super::*;
+
+    fn event(seq: u64, kind: &str, channel: Option<&str>) -> observer::ObserverEvent {
+        observer::ObserverEvent {
+            seq,
+            timestamp: format!("2026-04-29T04:00:{:02}Z", seq.min(59)),
+            kind: kind.to_string(),
+            agent_index: Some(0),
+            channel_id: channel.map(ToOwned::to_owned),
+            session_id: Some("session-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            started_at: None,
+            payload: serde_json::json!({ "seq": seq }),
+        }
+    }
+
+    fn queue_of(events: Vec<observer::ObserverEvent>) -> ObserverPublishQueue {
+        let mut queue = ObserverPublishQueue::default();
+        for event in events {
+            queue.ingest(event);
+        }
+        queue
+    }
+
+    /// Collect every frame the queue will produce, one publish slot at a time.
+    fn drain_frames(queue: &mut ObserverPublishQueue) -> Vec<observer::ObserverEvent> {
+        let mut frames = Vec::new();
+        while !queue.is_empty() {
+            frames.push(queue.next_frame().expect("queue not empty"));
+        }
+        frames
+    }
+
+    /// Inner seqs of a frame, whether it is an envelope or an unwrapped
+    /// singleton.
+    fn frame_seqs(frame: &observer::ObserverEvent) -> Vec<u64> {
+        match frame.payload.get("events").and_then(|v| v.as_array()) {
+            Some(inner) => inner.iter().map(|e| e["seq"].as_u64().unwrap()).collect(),
+            None => vec![frame.seq],
+        }
+    }
+
+    /// Retained bytes computed by WALKING the entries, independently of the
+    /// queue's own accumulator. Cap regressions must assert on this, not on
+    /// `total_pending_bytes()` — asserting the counter against itself passed
+    /// while the process retained ~2x the budget (Sami/Max round 3: each
+    /// pending coalescer entry holds the first chunk's text twice, in the
+    /// serialized skeleton AND the extracted `text` copy).
+    fn walked_retained_bytes(queue: &ObserverPublishQueue) -> usize {
+        let fifo: usize = queue
+            .events
+            .iter()
+            .map(|(_, _, event)| serialized_len(event))
+            .sum();
+        let coalescer: usize = queue
+            .coalescer
+            .pending
+            .iter()
+            .map(|pending| serialized_len(&pending.event) + pending.text.len())
+            .sum();
+        fifo + coalescer
+    }
+
+    /// The walker above is itself an instrument, and every cap test asks it
+    /// only for `<= CAP` — a blinded walker (missing an arm, or returning 0)
+    /// would satisfy all of them while hiding exactly the 2x overshoot it was
+    /// added to catch (Sami round 5, M17-M20). Pin it two-sided: it must SEE
+    /// the double retention, and it must agree with the accumulator EXACTLY
+    /// while both stores are non-empty — neither may drift.
+    #[test]
+    fn walked_retained_bytes_agrees_with_the_accumulator_exactly() {
+        fn chunk(seq: u64, message_id: &str, text: &str) -> observer::ObserverEvent {
+            let mut e = event(seq, "acp_read", Some("chan-a"));
+            e.payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": message_id,
+                        "content": { "type": "text", "text": text },
+                    },
+                },
+            });
+            e
+        }
+
+        let text = "w".repeat(7_000);
+        let mut queue = ObserverPublishQueue::default();
+        // One pending chunk: its text lives in the serialized skeleton AND
+        // the extracted copy, so a walker blind to either arm reads short.
+        queue.ingest(chunk(1, "message-a", &text));
+        assert!(
+            walked_retained_bytes(&queue) >= 2 * text.len(),
+            "the walker must SEE the first chunk's text twice \
+             (skeleton + extracted copy), got {}",
+            walked_retained_bytes(&queue)
+        );
+
+        // Populate BOTH stores: the non-chunk event flushes message-a into
+        // the FIFO and queues itself; fresh pending keys (plus a same-key
+        // append) rebuild the coalescer side.
+        queue.ingest(event(2, "tool_call", Some("chan-a")));
+        queue.ingest(chunk(3, "message-b", &text));
+        queue.ingest(chunk(4, "message-b", &text));
+        queue.ingest(chunk(5, "message-c", &text));
+        assert!(
+            !queue.events.is_empty() && !queue.coalescer.pending.is_empty(),
+            "both arms must be non-empty for the agreement check to bind"
+        );
+        assert_eq!(
+            queue.total_pending_bytes(),
+            walked_retained_bytes(&queue),
+            "accumulator and entry-walk must agree exactly: neither may drift"
+        );
+    }
+
+    /// Two or more pending events for one channel ship as a single batch
+    /// envelope whose payload carries every inner event in arrival order.
+    #[test]
+    fn multiple_events_ship_as_one_envelope_in_order() {
+        let mut queue = queue_of(vec![
+            event(1, "turn_started", Some("chan-a")),
+            event(2, "acp_read", Some("chan-a")),
+            event(3, "acp_write", Some("chan-a")),
+        ]);
+
+        let frame = queue.next_frame().expect("one frame");
+        assert!(queue.is_empty(), "one channel, one publish slot");
+        assert_eq!(frame.kind, OBSERVER_BATCH_KIND);
+        assert_eq!(frame.seq, 3, "envelope mirrors the last inner event");
+        assert_eq!(frame_seqs(&frame), [1, 2, 3], "arrival order preserved");
+        let inner = frame.payload["events"].as_array().expect("events array");
+        assert_eq!(inner[1]["kind"], "acp_read", "inner events keep their kind");
+    }
+
+    /// A single pending event is published unwrapped — no envelope, so
+    /// consumers that predate batching still understand quiet periods.
+    #[test]
+    fn a_single_event_stays_unwrapped() {
+        let mut queue = queue_of(vec![event(7, "turn_started", Some("chan-a"))]);
+        let frame = queue.next_frame().expect("one frame");
+        assert!(queue.is_empty());
+        assert_eq!(frame.kind, "turn_started");
+        assert_eq!(frame.seq, 7);
+    }
+
+    /// An empty queue yields no frame — a tick with nothing pending must not
+    /// publish anything.
+    #[test]
+    fn empty_queue_yields_no_frame() {
+        let mut queue = ObserverPublishQueue::default();
+        assert!(queue.next_frame().is_none());
+        assert!(queue.is_empty());
+    }
+
+    /// Frames never mix channels, and each channel's events keep their FIFO
+    /// order. Gathering is QUEUE-WIDE: the front event's channel collects its
+    /// events from anywhere in the queue (that is what keeps the drain rate
+    /// in bytes per slot under interleaving), so cross-channel frame order
+    /// MAY differ from arrival order — but a null-channel event is a barrier
+    /// nothing gathers across.
+    #[test]
+    fn frames_never_mix_channels_and_gather_queue_wide() {
+        let mut queue = queue_of(vec![
+            event(1, "acp_read", Some("chan-a")),
+            event(2, "acp_write", Some("chan-a")),
+            event(3, "acp_read", Some("chan-b")),
+            event(4, "acp_read", Some("chan-a")),
+            event(5, "acp_read", None),
+        ]);
+
+        let frames = drain_frames(&mut queue);
+        assert_eq!(
+            frames.len(),
+            3,
+            "gathered: [1,2,4]@a, [3]@b, [5]@None — one frame each"
+        );
+        for frame in &frames {
+            let channels: HashSet<Option<String>> = match frame.payload.get("events") {
+                Some(serde_json::Value::Array(inner)) => inner
+                    .iter()
+                    .map(|e| e["channelId"].as_str().map(ToOwned::to_owned))
+                    .collect(),
+                _ => std::iter::once(frame.channel_id.clone()).collect(),
+            };
+            assert_eq!(channels.len(), 1, "a frame never mixes channels");
+        }
+        assert_eq!(
+            frame_seqs(&frames[0]),
+            [1, 2, 4],
+            "chan-a gathers queue-wide, FIFO within the channel"
+        );
+        assert_eq!(frames[0].channel_id.as_deref(), Some("chan-a"));
+        assert_eq!(frames[1].kind, "acp_read", "singleton stays unwrapped");
+        assert_eq!(frames[1].channel_id.as_deref(), Some("chan-b"));
+        assert_eq!(frames[2].channel_id, None);
+    }
+
+    /// A NULL-channel event is a barrier: channel events queued BEHIND it
+    /// must not gather into a frame ahead of it, so causally-global events
+    /// (`agent_panic`-class) keep their exact order against every channel.
+    /// The null event itself ships only its contiguous front run.
+    #[test]
+    fn null_channel_events_are_gather_barriers() {
+        let mut queue = queue_of(vec![
+            event(1, "acp_read", Some("chan-a")),
+            event(2, "acp_read", Some("chan-b")),
+            event(3, "agent_panic", None),
+            event(4, "acp_write", Some("chan-a")),
+        ]);
+
+        let frames = drain_frames(&mut queue);
+        let published: Vec<Vec<u64>> = frames.iter().map(frame_seqs).collect();
+        assert_eq!(
+            published,
+            [vec![1], vec![2], vec![3], vec![4]],
+            "seq 4 must not gather past the null barrier into frame 1"
+        );
+    }
+
+    /// The drain-rate regression Sami measured: with two channels strictly
+    /// alternating, a front-run packer degrades to ONE event per slot
+    /// (~275 B/s regardless of the 64KB frame budget). Queue-wide gathering
+    /// must drain an interleaved backlog in ~ceil(events / per-frame-fit)
+    /// slots per channel, not one slot per event.
+    #[test]
+    fn interleaved_channels_drain_at_bytes_per_slot_not_events_per_slot() {
+        let mut events = Vec::new();
+        for i in 0..100u64 {
+            events.push(event(2 * i + 1, "acp_read", Some("chan-a")));
+            events.push(event(2 * i + 2, "acp_read", Some("chan-b")));
+        }
+        let mut queue = queue_of(events);
+
+        let frames = drain_frames(&mut queue);
+        assert!(
+            frames.len() <= 4,
+            "200 tiny alternating events must gather into a few full frames, \
+             got {} (front-run packing would need 200 slots)",
+            frames.len()
+        );
+        for frame in &frames {
+            assert!(serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN);
+        }
+        // Within each channel, FIFO order survives the gather.
+        let mut seqs_a = Vec::new();
+        let mut seqs_b = Vec::new();
+        for frame in &frames {
+            match frame.channel_id.as_deref() {
+                Some("chan-a") => seqs_a.extend(frame_seqs(frame)),
+                Some("chan-b") => seqs_b.extend(frame_seqs(frame)),
+                other => panic!("unexpected channel {other:?}"),
+            }
+        }
+        assert!(seqs_a.windows(2).all(|w| w[0] < w[1]), "chan-a FIFO");
+        assert!(seqs_b.windows(2).all(|w| w[0] < w[1]), "chan-b FIFO");
+        assert_eq!(seqs_a.len() + seqs_b.len(), 200, "nothing lost");
+    }
+
+    /// A same-channel backlog that cannot fit one 64KB frame splits across
+    /// SUCCESSIVE publish slots — never multiple frames from one slot — with
+    /// every frame under the cap and no event lost or reordered.
+    #[test]
+    fn oversized_backlogs_split_across_publish_slots_under_the_cap() {
+        let big_text = "x".repeat(30_000);
+        let mut queue = queue_of(
+            (1..=6)
+                .map(|seq| {
+                    let mut e = event(seq, "acp_read", Some("chan-a"));
+                    e.payload = serde_json::json!({ "seq": seq, "text": big_text });
+                    e
+                })
+                .collect(),
+        );
+
+        let frames = drain_frames(&mut queue);
+        assert!(
+            frames.len() > 1,
+            "six 30KB events cannot fit one 64KB frame"
+        );
+        let mut seen = Vec::new();
+        for frame in &frames {
+            assert!(
+                serialized_len(frame) <= OBSERVER_MAX_PLAINTEXT_LEN,
+                "every emitted frame must fit the plaintext cap"
+            );
+            seen.extend(frame_seqs(frame));
+        }
+        assert_eq!(
+            seen,
+            [1, 2, 3, 4, 5, 6],
+            "no event lost or reordered by splitting"
+        );
+    }
+
+    /// The queue preserves the coalescer's ordering rule: a non-chunk event
+    /// force-flushes pending chunk text ahead of itself, so merged chunks can
+    /// never leapfrog a tool call that arrived after them.
+    #[test]
+    fn non_chunk_events_flush_pending_chunks_ahead_of_themselves() {
+        fn chunk(seq: u64, text: &str) -> observer::ObserverEvent {
+            let mut e = event(seq, "acp_read", Some("chan-a"));
+            e.payload = serde_json::json!({
+                "params": { "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "m1",
+                    "content": { "text": text },
+                }}
+            });
+            e
+        }
+
+        let mut queue = ObserverPublishQueue::default();
+        queue.ingest(chunk(1, "hello "));
+        queue.ingest(chunk(2, "world"));
+        queue.ingest(event(3, "tool_call", Some("chan-a")));
+
+        let frame = queue.next_frame().expect("one frame");
+        assert!(queue.is_empty());
+        let inner = frame.payload["events"].as_array().expect("batch of 2");
+        assert_eq!(inner.len(), 2, "two chunks coalesce into one event");
+        assert_eq!(
+            inner[0]["payload"]["params"]["update"]["content"]["text"], "hello world",
+            "chunk text merged before the tool call"
+        );
+        assert_eq!(inner[1]["kind"], "tool_call");
+        assert!(inner[0]["seq"].as_u64() < inner[1]["seq"].as_u64());
+    }
+
+    /// Chunks still pending inside the coalescer (no non-chunk flushed them)
+    /// are picked up by the publish slot itself, not stranded.
+    #[test]
+    fn a_publish_slot_flushes_pending_coalesced_chunks() {
+        let mut e = event(1, "acp_read", Some("chan-a"));
+        e.payload = serde_json::json!({
+            "params": { "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "m1",
+                "content": { "text": "buffered" },
+            }}
+        });
+        let mut queue = ObserverPublishQueue::default();
+        queue.ingest(e);
+        assert!(!queue.is_empty(), "pending chunk counts as queued work");
+
+        let frame = queue.next_frame().expect("chunk must ship");
+        assert!(queue.is_empty());
+        assert_eq!(
+            frame.payload["params"]["update"]["content"]["text"],
+            "buffered"
+        );
+    }
+
+    /// Sami's ceiling assertion: when sustained input outruns the one-frame
+    /// drain budget for longer than the queue's byte budget, the OLDEST events
+    /// drop with accounting — never silently — and everything that survives
+    /// publishes in order with nothing else lost.
+    #[test]
+    fn over_budget_floods_drop_oldest_with_accounting() {
+        let big_text = "y".repeat(10_000);
+        let total = 500usize; // ~5MB of ~10KB events > 4MiB budget
+        let mut queue = ObserverPublishQueue::default();
+        for seq in 1..=total as u64 {
+            let mut e = event(seq, "acp_read", Some("chan-a"));
+            e.payload = serde_json::json!({ "seq": seq, "text": big_text });
+            queue.ingest(e);
+        }
+
+        assert!(
+            queue.dropped_events > 0,
+            "a 5MB backlog must overflow the 4MiB budget"
+        );
+        assert!(
+            walked_retained_bytes(&queue) <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            "eviction must restore the byte budget (entry-walked), got {}",
+            walked_retained_bytes(&queue)
+        );
+
+        let frames = drain_frames(&mut queue);
+        let published: Vec<u64> = frames.iter().flat_map(frame_seqs).collect();
+        let expected: Vec<u64> = (queue.dropped_events + 1..=total as u64).collect();
+        assert_eq!(
+            published, expected,
+            "exactly the oldest `dropped_events` events are missing; the rest \
+             publish in order"
+        );
+        assert_eq!(
+            published.len() as u64 + queue.dropped_events,
+            total as u64,
+            "accounting: published + dropped == ingested"
+        );
+    }
+
+    /// Max's coalescer-bypass regression: a flood of chunks with DISTINCT
+    /// messageIds never flushes on its own, so every chunk sits in the
+    /// coalescer's pending buffer. TRUE retained bytes — walked from the
+    /// entries, never the queue's own accumulator — MUST respect the byte
+    /// budget with event-level drop accounting. Pre-fix this retained ~25MB
+    /// against the 4 MiB cap with `pending_bytes == 0` and zero drops; the
+    /// round-3 refinement (Sami/Max) caught the accumulator itself reading
+    /// under cap while true retention was 1.99x over.
+    #[test]
+    fn distinct_key_chunk_floods_are_bounded_by_the_byte_budget() {
+        let big_text = "z".repeat(50_000);
+        let total = 500u64; // ~25MB pending chunk text vs a 4MiB budget
+        let mut queue = ObserverPublishQueue::default();
+        for seq in 1..=total {
+            let mut e = event(seq, "acp_read", Some("chan-a"));
+            e.payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": format!("message-{seq}"),
+                        "content": { "type": "text", "text": big_text },
+                    },
+                },
+            });
+            queue.ingest(e);
+        }
+
+        let walked = walked_retained_bytes(&queue);
+        assert!(
+            walked <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            "TRUE retained bytes (walked from entries) must respect the cap, \
+             got {walked}"
+        );
+        assert!(
+            queue.total_pending_bytes() >= walked,
+            "the accumulator must never under-count true retention \
+             (accumulator {} < walked {walked})",
+            queue.total_pending_bytes()
+        );
+        assert!(
+            queue.dropped_events > 0,
+            "a ~25MB distinct-key chunk flood must record drops"
+        );
+        // Event-level accounting: everything that survives publishes, and
+        // survivors + dropped == ingested.
+        let frames = drain_frames(&mut queue);
+        let survived: u64 = frames.iter().map(|f| frame_seqs(f).len() as u64).sum();
+        assert_eq!(
+            survived + queue.dropped_events,
+            total,
+            "accounting: published + dropped == ingested"
+        );
+        // The survivors are the NEWEST events (drop-oldest).
+        let last_frame_seqs = frame_seqs(frames.last().expect("frames"));
+        assert_eq!(*last_frame_seqs.last().expect("seqs"), total);
+    }
+
+    /// Max's merged-chunk accounting regression: one coalescer entry can
+    /// represent MANY generated observer events (same-messageId chunks merge
+    /// in place), so evicting it must charge every merged source event to
+    /// `dropped_events`, not 1 per retained entry. Pre-fix, evicting an entry
+    /// that merged 50 chunks recorded `dropped_events == 1` and 49 generated
+    /// events vanished from the accounting.
+    #[test]
+    fn evicting_a_merged_chunk_entry_accounts_every_source_event() {
+        fn chunk(seq: u64, message_id: &str, text: &str) -> observer::ObserverEvent {
+            let mut e = event(seq, "acp_read", Some("chan-a"));
+            e.payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": message_id,
+                        "content": { "type": "text", "text": text },
+                    },
+                },
+            });
+            e
+        }
+
+        let mut queue = ObserverPublishQueue::default();
+        // 50 × 1KB chunks under ONE messageId merge into a single pending
+        // coalescer entry — the oldest item anywhere in the queue.
+        let merged_text = "m".repeat(1_000);
+        let merged_sources = 50u64;
+        for seq in 1..=merged_sources {
+            queue.ingest(chunk(seq, "message-merged", &merged_text));
+        }
+        // Flood with distinct-key 50KB chunks until the byte budget evicts
+        // the oldest entries — the merged entry goes first.
+        let flood_text = "f".repeat(50_000);
+        let flood = 100u64;
+        for seq in 1..=flood {
+            queue.ingest(chunk(
+                merged_sources + seq,
+                &format!("message-{seq}"),
+                &flood_text,
+            ));
+        }
+
+        assert!(
+            walked_retained_bytes(&queue) <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            "eviction must restore the byte budget (entry-walked), got {}",
+            walked_retained_bytes(&queue)
+        );
+        let frames = drain_frames(&mut queue);
+        assert!(
+            !frames
+                .iter()
+                .flat_map(frame_seqs)
+                .any(|seq| seq <= merged_sources),
+            "the merged entry (globally oldest) must have been evicted"
+        );
+        // Every survivor is an unmerged distinct-key chunk (1 source each),
+        // so source-event accounting must close exactly: the merged entry's
+        // eviction charges all 50 sources.
+        let survived: u64 = frames.iter().map(|f| frame_seqs(f).len() as u64).sum();
+        assert_eq!(
+            survived + queue.dropped_events,
+            merged_sources + flood,
+            "accounting: published sources + dropped sources == ingested"
+        );
+    }
+
+    /// Sami's M13 / Max's forced-flush probe: the OTHER eviction arm. A
+    /// merged entry FLUSHED into the publish FIFO (by a non-chunk event) must
+    /// still charge every absorbed source on eviction — the FIFO stores the
+    /// per-entry count precisely so the ledger survives flush. The
+    /// coalescer-side regression above never exercises this arm; mutating the
+    /// FIFO eviction to `dropped += 1` survived all 687 tests until this one.
+    #[test]
+    fn evicting_a_flushed_merged_entry_from_the_fifo_accounts_every_source_event() {
+        fn chunk(seq: u64, message_id: &str, text: &str) -> observer::ObserverEvent {
+            let mut e = event(seq, "acp_read", Some("chan-a"));
+            e.payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": message_id,
+                        "content": { "type": "text", "text": text },
+                    },
+                },
+            });
+            e
+        }
+
+        let mut queue = ObserverPublishQueue::default();
+        // 50 × 1KB chunks merge under one messageId in the coalescer…
+        let merged_text = "m".repeat(1_000);
+        let merged_sources = 50u64;
+        for seq in 1..=merged_sources {
+            queue.ingest(chunk(seq, "message-merged", &merged_text));
+        }
+        // …then a non-chunk event force-flushes the merged entry into the
+        // publish FIFO. From here eviction happens on the FIFO arm.
+        queue.ingest(event(merged_sources + 1, "tool_call", Some("chan-a")));
+        assert!(
+            queue.coalescer.pending.is_empty(),
+            "the non-chunk event must have flushed the merged entry"
+        );
+        assert_eq!(
+            queue.events.front().expect("flushed entry queued").1,
+            merged_sources,
+            "the FIFO front must carry the merged source count"
+        );
+
+        // Distinct-key flood forces byte-budget eviction of the FIFO front.
+        let flood_text = "f".repeat(50_000);
+        let flood = 100u64;
+        for seq in 1..=flood {
+            queue.ingest(chunk(
+                merged_sources + 1 + seq,
+                &format!("message-{seq}"),
+                &flood_text,
+            ));
+        }
+
+        assert!(
+            walked_retained_bytes(&queue) <= OBSERVER_PENDING_QUEUE_MAX_BYTES,
+            "eviction must restore the byte budget (entry-walked), got {}",
+            walked_retained_bytes(&queue)
+        );
+        let frames = drain_frames(&mut queue);
+        assert!(
+            !frames
+                .iter()
+                .flat_map(frame_seqs)
+                .any(|seq| seq <= merged_sources),
+            "the flushed merged entry (globally oldest) must have been evicted"
+        );
+        // Ledger in source units: survivors are unmerged (1 source each), the
+        // evicted merged FIFO entry must charge all 50 sources.
+        let survived: u64 = frames.iter().map(|f| frame_seqs(f).len() as u64).sum();
+        let ingested = merged_sources + 1 + flood;
+        assert_eq!(
+            survived + queue.dropped_events,
+            ingested,
+            "accounting: published sources + dropped sources == ingested"
+        );
+    }
+
+    /// Under the byte budget the queue is lossless: every ingested event
+    /// publishes exactly once.
+    #[test]
+    fn under_budget_backlogs_are_lossless() {
+        let mut queue = queue_of(
+            (1..=200)
+                .map(|seq| event(seq, "acp_read", Some("chan-a")))
+                .collect(),
+        );
+        let frames = drain_frames(&mut queue);
+        let published: Vec<u64> = frames.iter().flat_map(frame_seqs).collect();
+        assert_eq!(published, (1..=200).collect::<Vec<u64>>());
+        assert_eq!(queue.dropped_events, 0);
+    }
+}
+
+#[cfg(test)]
+mod observer_publish_cadence_tests {
+    use super::*;
+    use nostr::Keys;
+
+    /// Let every spawned task (publisher loop, test_pair forwarder) run to
+    /// quiescence WITHOUT advancing paused time. `yield_now` keeps this task
+    /// runnable, so tokio's auto-advance never fires here — time only moves
+    /// when the test says so.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn recv_all(rx: &mut tokio::sync::mpsc::Receiver<nostr::Event>) -> Vec<nostr::Event> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    fn count_inner(owner: &Keys, event: &nostr::Event) -> usize {
+        let payload: serde_json::Value =
+            decrypt_observer_payload(owner, event).expect("decrypt frame");
+        match payload["payload"]["events"].as_array() {
+            Some(inner) => inner.len(),
+            None => 1,
+        }
+    }
+
+    fn emit_on(observer: &observer::ObserverHandle, channel: Option<uuid::Uuid>, marker: &str) {
+        observer.emit(
+            "test_event",
+            None,
+            &observer::context_for(channel, None, None),
+            serde_json::json!({ "marker": marker }),
+        );
+    }
+
+    /// THE regression Max demanded: with a backlog needing multiple frames
+    /// (two channels — a frame never mixes channels, so the backlog takes two
+    /// publish slots), no frame publishes before its tick. Startup publishes
+    /// NOTHING at t=0 (Sami's Finding 1: a full replay buffer must not burst
+    /// on reconnect), frame 1 arrives at +1s, frame 2 no earlier than +2s.
+    #[tokio::test(start_paused = true)]
+    async fn one_frame_per_second_and_no_startup_burst() {
+        let observer = observer::ObserverHandle::in_process();
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        // Interleave channels so the backlog cannot fit one frame: each run
+        // boundary forces a new publish slot.
+        let chan_a = uuid::Uuid::new_v4();
+        let chan_b = uuid::Uuid::new_v4();
+        emit_on(&observer, Some(chan_a), "a1");
+        emit_on(&observer, Some(chan_b), "b1");
+        emit_on(&observer, Some(chan_a), "a2");
+
+        let rx = observer.subscribe();
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.len(), 3, "all three preloaded in the snapshot");
+
+        let task = tokio::spawn(run_relay_observer_publisher(
+            snapshot,
+            rx,
+            publisher,
+            agent_keys.clone(),
+            agent_keys.public_key().to_hex(),
+            owner_keys.public_key().to_hex(),
+            owner_keys.public_key(),
+        ));
+
+        // t=0: nothing may publish, no matter how full the snapshot was.
+        settle().await;
+        assert_eq!(
+            recv_all(&mut published_rx).len(),
+            0,
+            "startup must not burst at t=0"
+        );
+
+        // t=0.999s: still nothing.
+        tokio::time::advance(Duration::from_millis(999)).await;
+        settle().await;
+        assert_eq!(
+            recv_all(&mut published_rx).len(),
+            0,
+            "no frame may publish before the first tick"
+        );
+
+        // t=1s: exactly ONE frame — chan-a gathered queue-wide, so a1 AND a2
+        // ride the first slot together.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        let frames = recv_all(&mut published_rx);
+        assert_eq!(frames.len(), 1, "tick 1 publishes exactly one frame");
+        assert_eq!(count_inner(&owner_keys, &frames[0]), 2, "a1 + a2 gathered");
+
+        // t=1.5s: between ticks, nothing.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        settle().await;
+        assert_eq!(
+            recv_all(&mut published_rx).len(),
+            0,
+            "frame 2 must wait for tick 2"
+        );
+
+        // t=2s: the chan-b frame drains on its own tick.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        settle().await;
+        assert_eq!(recv_all(&mut published_rx).len(), 1, "tick 2: one frame");
+
+        // Backlog drained; a quiet tick publishes nothing.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(recv_all(&mut published_rx).len(), 0, "quiet tick is quiet");
+
+        task.abort();
+    }
+
+    /// Shutdown is NOT a burst bypass: when the producer closes with a
+    /// backlog, the remaining frames still publish one per tick, and the loop
+    /// exits only after the queue is empty — paced, lossless, in order.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_is_paced_and_lossless() {
+        let observer = observer::ObserverHandle::in_process();
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        let chan_a = uuid::Uuid::new_v4();
+        let chan_b = uuid::Uuid::new_v4();
+        emit_on(&observer, Some(chan_a), "a1");
+        emit_on(&observer, Some(chan_b), "b1");
+        emit_on(&observer, Some(chan_a), "a2");
+
+        let rx = observer.subscribe();
+        let snapshot = observer.snapshot();
+        // Close the broadcast channel immediately: the entire drain happens
+        // in "shutdown" mode.
+        drop(observer);
+
+        let task = tokio::spawn(run_relay_observer_publisher(
+            snapshot,
+            rx,
+            publisher,
+            agent_keys.clone(),
+            agent_keys.public_key().to_hex(),
+            owner_keys.public_key().to_hex(),
+            owner_keys.public_key(),
+        ));
+
+        settle().await;
+        assert_eq!(
+            recv_all(&mut published_rx).len(),
+            0,
+            "shutdown drain must not burst at t=0"
+        );
+
+        let mut markers = Vec::new();
+        for tick in 1..=2 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+            let frames = recv_all(&mut published_rx);
+            assert_eq!(frames.len(), 1, "shutdown tick {tick}: exactly one frame");
+            let payload: serde_json::Value =
+                decrypt_observer_payload(&owner_keys, &frames[0]).expect("decrypt");
+            match payload["payload"]["events"].as_array() {
+                Some(inner) => markers.extend(
+                    inner
+                        .iter()
+                        .map(|e| e["payload"]["marker"].as_str().unwrap().to_string()),
+                ),
+                None => markers.push(payload["payload"]["marker"].as_str().unwrap().to_string()),
+            }
+        }
+        // Gather-packing: chan-a (a1+a2) ships tick 1, chan-b tick 2.
+        assert_eq!(markers, ["a1", "a2", "b1"], "paced drain loses nothing");
+
+        // Queue empty + closed: the loop must have exited on its own.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert!(task.is_finished(), "publisher exits after paced drain");
+    }
+
+    /// Pins `MissedTickBehavior::Skip` (Sami's M6 mutant): when the publisher
+    /// misses ticks — relay backpressure can stall the tick arm past several
+    /// deadlines, since `publish_event` awaits a bounded mpsc — the interval
+    /// must fire ONE catch-up tick and realign, not fire once per missed
+    /// deadline. With `Burst`, a 10s stall against a multi-frame backlog
+    /// would replay all 10 missed ticks back-to-back: an unpaced burst that
+    /// bypasses exactly what the pacer exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn missed_ticks_skip_instead_of_bursting() {
+        let observer = observer::ObserverHandle::in_process();
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        // Three channels => three frames pending (a frame never mixes
+        // channels), so a bursting interval would have work for every
+        // spurious catch-up tick.
+        for chan in 0..3 {
+            emit_on(&observer, Some(uuid::Uuid::new_v4()), &format!("c{chan}"));
+        }
+        let rx = observer.subscribe();
+        let snapshot = observer.snapshot();
+
+        let task = tokio::spawn(run_relay_observer_publisher(
+            snapshot,
+            rx,
+            publisher,
+            agent_keys.clone(),
+            agent_keys.public_key().to_hex(),
+            owner_keys.public_key().to_hex(),
+            owner_keys.public_key(),
+        ));
+        settle().await;
+
+        // Jump 10 seconds in ONE advance — the loop was never polled in
+        // between, exactly like a stall across 10 deadlines.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(
+            recv_all(&mut published_rx).len(),
+            1,
+            "Skip: one catch-up frame after a stall — Burst would publish \
+             one per missed deadline"
+        );
+
+        // The interval realigned: the remaining backlog stays paced.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(recv_all(&mut published_rx).len(), 1, "paced after realign");
+
+        task.abort();
     }
 }
 
@@ -3736,6 +10009,7 @@ mod observer_chunk_coalescer_tests {
             channel_id: Some("channel-1".to_string()),
             session_id: Some("session-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            started_at: None,
             payload: serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "session/update",
@@ -3763,6 +10037,7 @@ mod observer_chunk_coalescer_tests {
             channel_id: Some("channel-1".to_string()),
             session_id: Some("session-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            started_at: None,
             payload: serde_json::json!({ "type": "turn_started" }),
         }
     }
@@ -3786,9 +10061,14 @@ mod observer_chunk_coalescer_tests {
 
         let events = coalescer.ingest(non_chunk_event(3));
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].seq, 2);
-        assert_eq!(chunk_text(&events[0]), "hello world");
-        assert_eq!(events[1].kind, "turn_started");
+        assert_eq!(events[0].1.seq, 2);
+        assert_eq!(chunk_text(&events[0].1), "hello world");
+        assert_eq!(
+            events[0].0, 2,
+            "a merged entry reports every source chunk it absorbed"
+        );
+        assert_eq!(events[1].1.kind, "turn_started");
+        assert_eq!(events[1].0, 1);
     }
 
     #[test]
@@ -3809,8 +10089,8 @@ mod observer_chunk_coalescer_tests {
 
         let events = coalescer.flush();
         assert_eq!(events.len(), 2);
-        assert_eq!(chunk_text(&events[0]), "answer");
-        assert_eq!(chunk_text(&events[1]), "thinking");
+        assert_eq!(chunk_text(&events[0].1), "answer");
+        assert_eq!(chunk_text(&events[1].1), "thinking");
     }
 }
 
@@ -3822,7 +10102,7 @@ mod build_mcp_servers_tests {
     /// Env-var-touching tests must run serially — env vars are process-global.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn test_config() -> Config {
+    pub(super) fn test_config() -> Config {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
@@ -3830,15 +10110,17 @@ mod build_mcp_servers_tests {
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: 3600,
+            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
+            team_instructions: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
+            session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -3851,16 +10133,228 @@ mod build_mcp_servers_tests {
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            effort_level: None,
+            session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            has_generated_codex_config: false,
             relay_observer: false,
+            exit_after_inactivity_secs: 0,
+            lazy_pool: false,
+            idle_pool_sleep_secs: 0,
+            replay_floor_unix: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
         }
+    }
+
+    /// Restores the runner's saved variables and clears fixture ones on drop,
+    /// so a panic mid-install cannot leave the process environment altered.
+    struct EnvRestore {
+        saved: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        fixture: Vec<String>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for name in &self.fixture {
+                std::env::remove_var(name);
+            }
+            for (name, value) in &self.saved {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    /// Run `GitEnvironment::install` with `vars` set and the runner's own
+    /// `GIT_CONFIG*` / `BUZZ_GIT_IDENTITY` hidden, so an agent session's
+    /// inherited identity cannot leak into the result. Caller holds `ENV_LOCK`.
+    fn install_git_with_env(
+        config: &Config,
+        vars: &[(String, String)],
+    ) -> anyhow::Result<git::GitEnvironment> {
+        let restore = EnvRestore {
+            saved: std::env::vars_os()
+                .filter(|(name, _)| {
+                    name.to_str().is_some_and(|name| {
+                        name.starts_with("GIT_CONFIG") || name == "BUZZ_GIT_IDENTITY"
+                    })
+                })
+                .collect(),
+            fixture: vars.iter().map(|(name, _)| name.clone()).collect(),
+        };
+        for (name, _) in &restore.saved {
+            std::env::remove_var(name);
+        }
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
+        git::GitEnvironment::install(
+            &config.keys,
+            &config.relay_url,
+            &std::env::current_exe().unwrap(),
+        )
+    }
+
+    #[test]
+    fn invalid_git_identity_mode_fails_install() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let err = install_git_with_env(
+            &test_config(),
+            &[("BUZZ_GIT_IDENTITY".into(), "human".into())],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("BUZZ_GIT_IDENTITY"), "{err}");
+    }
+
+    #[test]
+    fn user_mode_mcp_block_drops_inherited_identity_and_signing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let inherited = [
+            ("user.name", "Inherited Agent"),
+            ("USER.EMAIL", "inherited@example.invalid"),
+            ("user.signingKey", "inherited-key"),
+            ("GPG.Format", "openpgp"),
+            ("GPG.x509.PROGRAM", "inherited-signer"),
+            ("commit.gpgsign", "true"),
+            ("TAG.GPGSIGN", "true"),
+            ("Include.Path", "/tmp/identity.inc"),
+            ("INCLUDEIF.gitdir:/.PATH", "/tmp/identity.inc"),
+            ("Author.Name", "Inherited Author"),
+            ("Author.Email", "author@example.invalid"),
+            ("COMMITTER.name", "Inherited Committer"),
+            ("committer.EMAIL", "committer@example.invalid"),
+            ("gpg.X509.program", "distinct-subsection"),
+            ("core.abbrev", "12"),
+        ];
+        let mut vars = vec![
+            ("BUZZ_GIT_IDENTITY".into(), "user".into()),
+            ("GIT_CONFIG_COUNT".into(), inherited.len().to_string()),
+        ];
+        for (i, (key, value)) in inherited.iter().enumerate() {
+            vars.push((format!("GIT_CONFIG_KEY_{i}"), key.to_string()));
+            vars.push((format!("GIT_CONFIG_VALUE_{i}"), value.to_string()));
+        }
+        let mut config = test_config();
+        let git = install_git_with_env(&config, &vars).unwrap();
+        config.persona_env_vars.extend(git.env.iter().cloned());
+        let servers = build_mcp_servers(&config);
+        let env = &servers[0].env;
+        let value_of = |name: &str| {
+            env.iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.value.clone())
+        };
+        let count: usize = value_of("GIT_CONFIG_COUNT").unwrap().parse().unwrap();
+        let entries: Vec<(String, String)> = (0..count)
+            .map(|i| {
+                (
+                    value_of(&format!("GIT_CONFIG_KEY_{i}")).unwrap(),
+                    value_of(&format!("GIT_CONFIG_VALUE_{i}")).unwrap(),
+                )
+            })
+            .collect();
+        for (key, _) in &inherited[..13] {
+            assert!(
+                !entries.iter().any(|(forwarded, _)| forwarded == key),
+                "{key} leaked: {entries:?}"
+            );
+        }
+        for survivor in [
+            ("gpg.X509.program", "distinct-subsection"),
+            ("core.abbrev", "12"),
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(key, value)| (key.as_str(), value.as_str()) == survivor),
+                "{survivor:?} must survive unchanged: {entries:?}"
+            );
+        }
+        for absent in ["user.name", "user.email", "gpg.format", "commit.gpgSign"] {
+            assert!(
+                !entries.iter().any(|(key, _)| key == absent),
+                "user mode must not set {absent}: {entries:?}"
+            );
+        }
+        assert!(
+            entries.iter().any(|(key, _)| key == "nostr.keyfile"),
+            "{entries:?}"
+        );
+        assert_eq!(value_of("BUZZ_GIT_IDENTITY").as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn for_config_replaces_persona_git_identity_with_resolved_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut config = test_config();
+        config
+            .persona_env_vars
+            .push(("BUZZ_GIT_IDENTITY".into(), "stale".into()));
+        let restore = EnvRestore {
+            saved: std::env::vars_os()
+                .filter(|(name, _)| name == "BUZZ_GIT_IDENTITY")
+                .collect(),
+            fixture: vec!["BUZZ_GIT_IDENTITY".into()],
+        };
+        std::env::set_var("BUZZ_GIT_IDENTITY", "user");
+        let _git = git::GitEnvironment::for_config(&mut config).unwrap();
+        drop(restore);
+        let modes: Vec<_> = config
+            .persona_env_vars
+            .iter()
+            .filter(|(name, _)| name == "BUZZ_GIT_IDENTITY")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(modes, ["user"]);
+        let servers = build_mcp_servers(&config);
+        let forwarded: Vec<_> = servers[0]
+            .env
+            .iter()
+            .filter(|entry| entry.name == "BUZZ_GIT_IDENTITY")
+            .map(|entry| entry.value.as_str())
+            .collect();
+        assert_eq!(forwarded, ["user"]);
+    }
+
+    #[test]
+    fn session_new_forwards_complete_git_block_without_duplicate_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut config = test_config();
+        let git = install_git_with_env(&config, &[]).unwrap();
+        config.persona_env_vars.extend(git.env.iter().cloned());
+        let servers = build_mcp_servers(&config);
+        let env = &servers[0].env;
+        for (name, value) in &git.env {
+            let entries: Vec<_> = env.iter().filter(|entry| entry.name == *name).collect();
+            assert_eq!(entries.len(), 1, "{name} must appear exactly once");
+            assert_eq!(entries[0].value, *value);
+        }
+        assert!(!env.iter().any(|entry| entry.name == "NOSTR_PRIVATE_KEY"));
+        let keyfile = git
+            .env
+            .windows(2)
+            .find(|pair| pair[0].1 == "nostr.keyfile")
+            .unwrap()[1]
+            .1
+            .clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&keyfile).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(std::path::Path::new(&keyfile).exists());
+        drop(git);
+        assert!(!std::path::Path::new(&keyfile).exists());
     }
 
     #[test]
@@ -3880,6 +10374,46 @@ mod build_mcp_servers_tests {
             names.contains(&"BUZZ_PRIVATE_KEY"),
             "missing BUZZ_PRIVATE_KEY; got {names:?}"
         );
+    }
+
+    #[test]
+    fn session_new_mcp_server_uses_effective_output_format() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let inherited = std::env::var_os("BUZZ_OUTPUT_FORMAT");
+        for (operator, persona, expected) in [
+            (None, vec![], "agent"),
+            (None, vec!["json"], "json"),
+            (None, vec!["json", "compact"], "compact"),
+            (Some("compact"), vec![], "compact"),
+            (Some("json"), vec!["compact"], "json"),
+            (Some(""), vec!["json"], ""),
+        ] {
+            match operator {
+                Some(value) => std::env::set_var("BUZZ_OUTPUT_FORMAT", value),
+                None => std::env::remove_var("BUZZ_OUTPUT_FORMAT"),
+            }
+            let mut config = test_config();
+            config.persona_env_vars = persona
+                .iter()
+                .map(|value| ("BUZZ_OUTPUT_FORMAT".into(), (*value).into()))
+                .collect();
+            let servers = build_mcp_servers(&config);
+            match &inherited {
+                Some(value) => std::env::set_var("BUZZ_OUTPUT_FORMAT", value),
+                None => std::env::remove_var("BUZZ_OUTPUT_FORMAT"),
+            }
+            let formats: Vec<_> = servers[0]
+                .env
+                .iter()
+                .filter(|entry| entry.name == "BUZZ_OUTPUT_FORMAT")
+                .map(|entry| entry.value.as_str())
+                .collect();
+            assert_eq!(
+                formats,
+                vec![expected],
+                "operator={operator:?}, persona={persona:?}"
+            );
+        }
     }
 
     #[test]
@@ -3910,6 +10444,60 @@ mod build_mcp_servers_tests {
         let server = &servers[0];
         let has_auth_tag = server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(!has_auth_tag, "empty BUZZ_AUTH_TAG should not be forwarded");
+    }
+
+    #[test]
+    fn test_display_name_set_is_forwarded_to_mcp_server() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "Duncan");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
+
+        let entry = servers[0]
+            .env
+            .iter()
+            .find(|e| e.name == "BUZZ_ACP_DISPLAY_NAME");
+        assert_eq!(
+            entry.map(|e| e.value.as_str()),
+            Some("Duncan"),
+            "a set display name should reach the MCP server verbatim"
+        );
+    }
+
+    #[test]
+    fn test_display_name_unset_omits_the_key_entirely() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+
+        // Absent, not empty-valued: dev-mcp distinguishes the two and only
+        // falls back to the npub when the key is missing or blank.
+        assert!(
+            !servers[0]
+                .env
+                .iter()
+                .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
+            "unset display name should not add the key"
+        );
+    }
+
+    #[test]
+    fn test_display_name_empty_omits_the_key_entirely() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
+
+        assert!(
+            !servers[0]
+                .env
+                .iter()
+                .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
+            "empty display name should not be forwarded"
+        );
     }
 
     #[test]
@@ -3957,6 +10545,672 @@ mod build_mcp_servers_tests {
     }
 }
 
+/// Local admission rules for the normal listener. The relay subscription is
+/// derived separately (`config::resolve_channel_filters`); an event must pass
+/// both, so each default kind has to be present here too.
+fn startup_subscription_rules(config: &Config) -> Result<Vec<SubscriptionRule>> {
+    let rules = match config.subscribe_mode {
+        SubscribeMode::Mentions => {
+            vec![SubscriptionRule {
+                name: "mentions".into(),
+                channels: filter::ChannelScope::All("all".into()),
+                kinds: config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(config::default_mention_kinds),
+                require_mention: !config.no_mention_filter,
+                filter: None,
+                compiled_filter: None,
+                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                prompt_tag: Some("@mention".into()),
+            }]
+        }
+        SubscribeMode::All => {
+            vec![SubscriptionRule {
+                name: "all".into(),
+                channels: filter::ChannelScope::All("all".into()),
+                kinds: config.kinds_override.clone().unwrap_or_default(),
+                require_mention: false,
+                filter: None,
+                compiled_filter: None,
+                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                prompt_tag: Some("all".into()),
+            }]
+        }
+        SubscribeMode::Config => {
+            // load_rules() already warns if the config file has zero rules.
+            config::load_rules(&config.config_path)?
+        }
+    };
+    Ok(rules)
+}
+
+#[cfg(test)]
+mod edit_mention_admission_tests {
+    use super::*;
+    use crate::edit_routing::test_support::edit_event;
+
+    /// Default normal-mode admission: an edit that newly mentions the agent
+    /// matches the startup rule; an edit without the agent's `p` tag does not.
+    #[tokio::test]
+    async fn default_startup_rules_admit_only_edits_that_mention_the_agent() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.subscribe_mode = SubscribeMode::Mentions;
+        let agent = config.keys.public_key().to_hex();
+        let rules = startup_subscription_rules(&config).expect("mentions rules");
+        let channel_id = Uuid::new_v4();
+        let target = "ab".repeat(32);
+
+        let mentioned = edit_event(&target, &[["p", agent.as_str()]]);
+        assert!(
+            filter::match_event(&mentioned, channel_id, &rules, &agent)
+                .await
+                .is_some(),
+            "a mention added by an edit must wake the agent"
+        );
+        let unmentioned = edit_event(&target, &[]);
+        assert!(
+            filter::match_event(&unmentioned, channel_id, &rules, &agent)
+                .await
+                .is_none(),
+            "an edit that does not mention the agent must not wake it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_native_steer_tests {
+    use super::*;
+    use crate::edit_routing::test_support::{edit_event, message};
+
+    /// A steered edit renders its original's routing, not the edit's own
+    /// bare `e` tag, so the live turn replies in the original's thread.
+    #[test]
+    fn native_steer_body_carries_edit_original_routing() {
+        let root = "ab".repeat(32);
+        let original = message(Some(&root));
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let be = queue::BatchEvent {
+            event: edit.clone(),
+            prompt_tag: "@mention".into(),
+            received_at: std::time::Instant::now(),
+            edit: Some(queue::ResolvedEdit {
+                target_event_id: original.id.to_hex(),
+                target_thread_tags: queue::parse_thread_tags(&original),
+            }),
+        };
+        let body = native_steer_body(Uuid::new_v4(), &be);
+        assert!(
+            body.contains(&format!("Edit of: {}", original.id.to_hex())),
+            "{body}"
+        );
+        assert!(body.contains(&format!("root={root}")), "{body}");
+    }
+
+    /// The listener hands the steer path the same resolved route it queues.
+    #[test]
+    fn listener_steer_event_keeps_resolved_edit() {
+        let original = message(None);
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let channel_id = Uuid::new_v4();
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(&original),
+        };
+        let ingress = NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event: edit,
+            },
+            effective_author: "author".into(),
+            prompt_tag: "@mention".into(),
+            edit: Some(resolved.clone()),
+        };
+        let scope = ingress.session_scope(scope::SessionPolicy::Channel, false);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let queued = ingress.push(&mut queue, scope, false);
+        assert_eq!(queued.steer_event.edit, Some(resolved));
+        assert_eq!(queued.reaction_target_id, original.id.to_hex());
+    }
+
+    /// Drive a routed edit of `original` through the listener's steer decision
+    /// while a turn for `running_event` is in flight under the channel policy.
+    /// Returns the native steer request, if any, and the control signal sent
+    /// to the running turn, if any.
+    fn steer_edit_into_running_turn(
+        running_event: nostr::Event,
+        original: &nostr::Event,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(original),
+        };
+        steer_into_running_turn(false, Some(false), running_event, edit, Some(resolved))
+    }
+
+    /// Drive `incoming` through the listener's steer decision while a turn
+    /// for `running_event` is in flight in the same conversation session
+    /// (the channel policy, or any DM). `prompt_is_dm` is how the running
+    /// turn's prompt classified the channel, recorded with a thread-shared
+    /// reply anchor; `None` means the prompt has not been formatted yet.
+    fn steer_into_running_turn(
+        is_dm: bool,
+        prompt_is_dm: Option<bool>,
+        running_event: nostr::Event,
+        incoming: nostr::Event,
+        incoming_edit: Option<queue::ResolvedEdit>,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let channel_id = Uuid::new_v4();
+        let ingress =
+            |event: nostr::Event, edit: Option<queue::ResolvedEdit>| NormalListenerIngress {
+                buzz_event: relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event,
+                },
+                effective_author: "author".into(),
+                prompt_tag: "@mention".into(),
+                edit,
+            };
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let running = ingress(running_event, None);
+        let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
+        running.push(&mut queue, scope.clone(), is_dm);
+        queue.flush_next().expect("running turn");
+        assert!(queue.is_scope_in_flight(&scope));
+        if let Some(prompt_is_dm) = prompt_is_dm {
+            let routing = queue
+                .in_flight_prompt_routing(&scope)
+                .expect("in-flight turn records its prompt routing");
+            routing.record_dm(prompt_is_dm);
+            routing.record_trigger_anchor(false);
+        }
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(1);
+        let task = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            task.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "t".into(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: Some(steer_tx),
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let incoming_ingress = ingress(incoming, incoming_edit);
+        assert_eq!(
+            incoming_ingress.session_scope(scope::SessionPolicy::Channel, is_dm),
+            scope,
+            "one conversation session spans every thread"
+        );
+        let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
+        incoming_ingress
+            .push(&mut queue, scope.clone(), is_dm)
+            .steer_or_interrupt(
+                MultipleEventHandling::Steer,
+                None,
+                &mut pool,
+                &mut queue,
+                &ack_tx,
+            );
+        (steer_rx.try_recv().ok(), control_rx.try_recv().ok())
+    }
+
+    /// A routed edit whose original is in the running turn's thread is
+    /// steered natively, carrying the original's route, and the running turn
+    /// is not cancelled.
+    #[tokio::test]
+    async fn routed_edit_in_running_thread_steers_natively() {
+        let root = "ab".repeat(32);
+        let original = message(Some(&root));
+        let (steer, control) = steer_edit_into_running_turn(message(Some(&root)), &original);
+
+        let request = steer.expect("edit is sent as a native steer");
+        let body = request.prompt_blocks.join("\n");
+        assert!(
+            body.contains(&format!("Edit of: {}", original.id.to_hex())),
+            "{body}"
+        );
+        assert!(body.contains(&format!("root={root}")), "{body}");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// Editing the top-level message a turn is working on steers that turn:
+    /// replies to the edit belong to the same new thread.
+    #[tokio::test]
+    async fn edit_of_running_top_level_trigger_steers_natively() {
+        let original = message(None);
+        let (steer, control) = steer_edit_into_running_turn(original.clone(), &original);
+
+        assert!(steer.is_some(), "edit is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// Under the channel policy a turn started from thread A can be running
+    /// when an edit whose original is in thread B arrives. A native steer
+    /// would leave the turn's `<context>` replying to A, so the edit takes the
+    /// cancel+merge path instead; its re-prompt routes replies to B.
+    #[tokio::test]
+    async fn routed_edit_for_another_thread_cancels_and_merges() {
+        let thread_b = "ab".repeat(32);
+        let original = message(Some(&thread_b));
+        let (steer, control) = steer_edit_into_running_turn(message(None), &original);
+
+        assert!(steer.is_none(), "no native steer into thread A's turn");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// The same rule covers a top-level original: replies to it open a thread
+    /// rooted at the original, not at the running turn's top-level trigger.
+    #[tokio::test]
+    async fn routed_edit_for_another_top_level_message_cancels_and_merges() {
+        let original = message(None);
+        let (steer, control) = steer_edit_into_running_turn(message(None), &original);
+
+        assert!(steer.is_none(), "no native steer across top-level threads");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A top-level DM message's `<context>` names no reply target, so a
+    /// second top-level DM message replies in the same place and is steered
+    /// natively into the running turn rather than cancelling it.
+    #[tokio::test]
+    async fn dm_top_level_follow_up_steers_natively() {
+        let (steer, control) =
+            steer_into_running_turn(true, Some(true), message(None), message(None), None);
+
+        assert!(steer.is_some(), "DM follow-up is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// Where a dispatched turn is held when the follow-up arrives: the agent
+    /// never answers the first request with this method.
+    enum HoldAt {
+        /// Session setup, before the turn's own prompt is formatted.
+        SessionNew,
+        /// The turn's own prompt is running.
+        Prompt,
+    }
+
+    /// Dispatch a turn for `running_event` through the production
+    /// `dispatch_pending` → `run_prompt_task` path to an agent that holds at
+    /// `hold_at`, then drive `incoming` through the real listener admission.
+    /// `channel_type` is the channel's metadata (`"dm"` or `"stream"`), known
+    /// to the listener and the prompt alike. Returns the native steer request,
+    /// if any, and the control signal sent to the running turn, if any.
+    async fn steer_into_dispatched_turn(
+        channel_type: &str,
+        initial_message: Option<&str>,
+        hold_at: HoldAt,
+        running_event: nostr::Event,
+        incoming: nostr::Event,
+        profiles: &[nostr::Event],
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let channel_id = Uuid::new_v4();
+        let is_dm = channel_type == "dm";
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-dispatched-steer-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let held_method = match hold_at {
+            HoldAt::SessionNew => "session/new",
+            HoldAt::Prompt => "session/prompt",
+        };
+        // Record each request and never answer: the turn stays in flight at
+        // its first request, which is `held_method`.
+        let script = format!(
+            r#"while IFS= read -r line; do printf '%s\n' "$line" >> '{quoted_capture}'; done"#
+        );
+        let acp = acp::AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn holding ACP");
+        let ingress = |event: nostr::Event| NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            },
+            effective_author: "author".into(),
+            prompt_tag: "@mention".into(),
+            edit: None,
+        };
+        let running = ingress(running_event);
+        let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
+        let mut agent = pool::OwnedAgent {
+            index: 0,
+            acp,
+            state: pool::SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "dispatched-steer-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        if matches!(hold_at, HoldAt::Prompt) {
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), "live-session".into());
+        }
+        // The relay has no newer metadata, project, or history: every query
+        // except a profile lookup returns no events, so the turn keeps the
+        // startup channel metadata.
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay fixture");
+        let base_url = format!("http://{}", relay.local_addr().unwrap());
+        let profiles = Arc::new(serde_json::to_string(profiles).expect("profiles json"));
+        let relay = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut socket, _) = relay.accept().await.expect("accept relay query");
+                let profiles = Arc::clone(&profiles);
+                tokio::spawn(async move {
+                    let mut request = [0; 16384];
+                    let read = socket.read(&mut request).await.unwrap_or(0);
+                    let body =
+                        if String::from_utf8_lossy(&request[..read]).contains("\"kinds\":[0]") {
+                            profiles.as_str()
+                        } else {
+                            "[]"
+                        };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base_url;
+        ctx.initial_message = initial_message.map(str::to_string);
+        ctx.channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "test-channel".into(),
+                    channel_type: channel_type.into(),
+                    description: None,
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        let ctx = Arc::new(ctx);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        running.push(&mut queue, scope.clone(), is_dm);
+        let mut last_activity = tokio::time::Instant::now();
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, None);
+        assert_eq!(dispatched.len(), 1, "the running turn is dispatched");
+
+        // The turn has passed every step before `held_method` once that
+        // request reaches the agent.
+        let held_request = format!("\"{held_method}\"");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !std::fs::read_to_string(&capture)
+                .unwrap_or_default()
+                .contains(&held_request)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dispatched turn reaches its held request");
+
+        // Observe the listener's decision through the running task's own
+        // steer and control channels.
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(1);
+        let meta = pool
+            .task_map_mut()
+            .values_mut()
+            .find(|meta| meta.scope.as_ref() == Some(&scope))
+            .expect("running task");
+        meta.control_tx = Some(control_tx);
+        meta.steer_tx = Some(steer_tx);
+
+        let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
+        ingress(incoming)
+            .push(&mut queue, scope.clone(), is_dm)
+            .steer_or_interrupt(
+                MultipleEventHandling::Steer,
+                None,
+                &mut pool,
+                &mut queue,
+                &ack_tx,
+            );
+        let steer = steer_rx.try_recv().ok();
+        let control = control_rx.try_recv().ok();
+
+        pool.join_set.abort_all();
+        while pool.join_set.join_next().await.is_some() {}
+        relay.abort();
+        let _ = std::fs::remove_file(&capture);
+        (steer, control)
+    }
+
+    /// The DM steer rule depends on the running prompt's own classification,
+    /// which travels from the queue turn through `dispatch_pending` into
+    /// `run_prompt_task`, which records it. Drive that production handoff
+    /// with DM channel metadata, then the real listener admission: a
+    /// top-level follow-up must be steered natively.
+    #[tokio::test]
+    async fn dispatched_dm_turn_records_classification_for_native_steer() {
+        let (steer, control) = steer_into_dispatched_turn(
+            "dm",
+            None,
+            HoldAt::Prompt,
+            message(None),
+            message(None),
+            &[],
+        )
+        .await;
+
+        assert!(steer.is_some(), "DM follow-up is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// The prompt task records its classification as soon as channel
+    /// metadata resolves, so a top-level DM follow-up during a slow
+    /// `session/new` is steered natively too.
+    #[tokio::test]
+    async fn dm_follow_up_during_session_setup_steers_natively() {
+        let (steer, control) = steer_into_dispatched_turn(
+            "dm",
+            None,
+            HoldAt::SessionNew,
+            message(None),
+            message(None),
+            &[],
+        )
+        .await;
+
+        assert!(steer.is_some(), "DM follow-up is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// An `initial_message` setup prompt reads the same steer mailbox, so a
+    /// DM follow-up must not be admitted for native steering before that
+    /// setup turn finishes; it takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_follow_up_before_initial_message_cancels_and_merges() {
+        let (steer, control) = steer_into_dispatched_turn(
+            "dm",
+            Some("set up the session"),
+            HoldAt::SessionNew,
+            message(None),
+            message(None),
+            &[],
+        )
+        .await;
+
+        assert!(
+            steer.is_none(),
+            "no native steer into the initial_message setup turn"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// Until a thread turn's prompt is formatted, its reply anchor is
+    /// unknown: an agent↔agent turn anchors to its own trigger. A same-thread
+    /// follow-up during `session/new` therefore takes the cancel+merge path.
+    #[tokio::test]
+    async fn channel_same_thread_follow_up_during_setup_cancels_and_merges() {
+        let root = "ab".repeat(32);
+        let (steer, control) = steer_into_dispatched_turn(
+            "stream",
+            Some("set up the session"),
+            HoldAt::SessionNew,
+            message(Some(&root)),
+            message(Some(&root)),
+            &[],
+        )
+        .await;
+
+        assert!(
+            steer.is_none(),
+            "no native steer before the anchor is known"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A human-facing thread turn anchors to the thread root, which every
+    /// same-thread message shares, so a follow-up is steered natively once
+    /// the prompt has recorded that anchor.
+    #[tokio::test]
+    async fn channel_same_thread_follow_up_during_prompt_steers_natively() {
+        let root = "ab".repeat(32);
+        let (steer, control) = steer_into_dispatched_turn(
+            "stream",
+            None,
+            HoldAt::Prompt,
+            message(Some(&root)),
+            message(Some(&root)),
+            &[],
+        )
+        .await;
+
+        assert!(steer.is_some(), "same-thread follow-up is a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// An agent↔agent thread turn replies under its own trigger. A human's
+    /// message in that thread must reply at the thread root, so it takes the
+    /// cancel+merge path, whose re-prompt carries its own `<context>`.
+    #[tokio::test]
+    async fn human_follow_up_to_agent_thread_turn_cancels_and_merges() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let root = "ab".repeat(32);
+        let agent = Keys::generate();
+        let other_agent = Keys::generate();
+        let agent_profile = |keys: &Keys| {
+            EventBuilder::new(Kind::Metadata, "{}")
+                .tags([Tag::parse(["auth", &"cd".repeat(32), "", &"ef".repeat(64)]).unwrap()])
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let running = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+            "agent asks",
+        )
+        .tags([
+            Tag::parse(["e", root.as_str(), "", "reply"]).unwrap(),
+            Tag::parse(["p", other_agent.public_key().to_hex().as_str()]).unwrap(),
+        ])
+        .sign_with_keys(&agent)
+        .unwrap();
+        let (steer, control) = steer_into_dispatched_turn(
+            "stream",
+            None,
+            HoldAt::Prompt,
+            running,
+            message(Some(&root)),
+            &[agent_profile(&agent), agent_profile(&other_agent)],
+        )
+        .await;
+
+        assert!(steer.is_none(), "no native steer into an agent-only turn");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A DM thread reply needs a `--reply-to` the running top-level turn's
+    /// `<context>` does not carry, so it takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_thread_reply_during_top_level_turn_cancels_and_merges() {
+        let root = "ab".repeat(32);
+        let (steer, control) =
+            steer_into_running_turn(true, Some(true), message(None), message(Some(&root)), None);
+
+        assert!(
+            steer.is_none(),
+            "no native steer into a different DM thread"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A DM turn whose prompt was rendered while channel metadata was
+    /// unavailable got channel-style `<context>`: its replies go to a thread
+    /// rooted at its trigger. The DM rule must not apply once metadata
+    /// resolves, so a top-level follow-up takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_follow_up_into_channel_formatted_turn_cancels_and_merges() {
+        let (steer, control) =
+            steer_into_running_turn(true, Some(false), message(None), message(None), None);
+
+        assert!(
+            steer.is_none(),
+            "steer guard follows the running prompt's classification"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// Before the prompt task records its classification, nothing proves
+    /// which `<context>` a turn in a DM (or a channel of unresolved type)
+    /// will carry, so the follow-up takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_follow_up_before_prompt_classification_cancels_and_merges() {
+        let (steer, control) =
+            steer_into_running_turn(true, None, message(None), message(None), None);
+
+        assert!(steer.is_none(), "no native steer without a recorded prompt");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+}
+
 #[cfg(test)]
 mod error_outcome_emission_tests {
     //! Pins the policy that error-class outcomes surface to the activity feed
@@ -3975,7 +11229,11 @@ mod error_outcome_emission_tests {
     use super::*;
     use crate::acp::{AcpClient, AcpError};
     use crate::observer::ObserverHandle;
-    use crate::pool::{AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource};
+    use crate::pool::{
+        AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource, TimeoutKind,
+    };
+    use crate::queue::{BatchEvent, FlushBatch};
+    use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
     fn test_config() -> Config {
@@ -3989,15 +11247,17 @@ mod error_outcome_emission_tests {
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: 3600,
+            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
+            team_instructions: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
+            session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -4010,16 +11270,39 @@ mod error_outcome_emission_tests {
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            effort_level: None,
+            session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
+            has_generated_codex_config: false,
             relay_observer: false,
+            exit_after_inactivity_secs: 0,
+            lazy_pool: false,
+            idle_pool_sleep_secs: 0,
+            replay_floor_unix: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
         }
+    }
+
+    #[test]
+    fn normalizes_agent_name_from_initialize_result() {
+        assert_eq!(
+            normalized_agent_name(&serde_json::json!({
+                "agentInfo": { "name": " Goose ", "version": "1.43.0" }
+            })),
+            "goose"
+        );
+        assert_eq!(
+            normalized_agent_name(&serde_json::json!({
+                "serverInfo": { "name": "buzz-agent" }
+            })),
+            "buzz-agent"
+        );
     }
 
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
@@ -4028,17 +11311,423 @@ mod error_outcome_emission_tests {
     async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
-            acp: AcpClient::spawn("cat", &[], &[])
+            acp: AcpClient::spawn("cat", &[], &[], false)
                 .await
                 .expect("spawn cat as inert agent"),
             state: Default::default(),
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
         }
+    }
+
+    fn bind_agent_scope_owner(
+        pool: &mut AgentPool,
+        agent: &mut OwnedAgent,
+        scope: scope::SessionScope,
+    ) {
+        let generation = pool.record_scope_owner(scope.clone(), agent.index);
+        agent.state.set_scope_owner_generation(scope, generation);
+    }
+
+    // Exercise result handling and both production idle decisions with a fake clock.
+    // No relay or provider is used; cat supplies only an owned process handle.
+    async fn assert_completion_idle_window(channel_turn: bool) {
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        if channel_turn {
+            bind_agent_scope_owner(&mut pool, &mut agent, scope.clone());
+        }
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: channel_turn.then_some(channel_id),
+                scope: channel_turn.then_some(scope.clone()),
+                turn_id: "idle-window".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = !channel_turn;
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let bound = Duration::from_secs(30);
+        let mut last_activity = tokio::time::Instant::now();
+        tokio::time::advance(bound * 2).await;
+        let completed_at = tokio::time::Instant::now();
+        let result = PromptResult {
+            agent,
+            source: if channel_turn {
+                PromptSource::Channel(scope)
+            } else {
+                PromptSource::Heartbeat
+            },
+            turn_id: "idle-window".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &HashSet::new(),
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut last_activity,
+        );
+        // Match the main loop: consume finished prompt tasks before the idle check.
+        while pool.join_set.join_next().await.is_some() {}
+        assert!(pool.task_map().is_empty());
+        assert!(!heartbeat_in_flight);
+        assert!(!queue.has_undispatched_work());
+        let sleep_due = |now| {
+            idle_pool_sleep_due(
+                true,
+                last_activity,
+                now,
+                bound,
+                heartbeat_in_flight,
+                !pool.join_set.is_empty(),
+                queue.has_undispatched_work(),
+                any_respawn_in_flight(&crash_history),
+            )
+        };
+        assert_eq!(sleep_due(completed_at), !channel_turn);
+        assert_eq!(
+            inactivity_expired(last_activity, completed_at, bound, false),
+            !channel_turn
+        );
+        if channel_turn {
+            assert_eq!(last_activity, completed_at);
+            assert!(!sleep_due(completed_at + bound - Duration::from_millis(1)));
+        }
+        assert!(sleep_due(completed_at + bound));
+        assert!(inactivity_expired(
+            last_activity,
+            completed_at + bound,
+            bound,
+            false
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_channel_turn_gets_a_full_bounded_idle_window() {
+        assert_completion_idle_window(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_heartbeat_does_not_extend_the_idle_window() {
+        assert_completion_idle_window(false).await;
+    }
+
+    #[tokio::test]
+    async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {
+        let channel_id = Uuid::new_v4();
+        let steer_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut agent = dummy_agent(0).await;
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "live-session".into(),
+        );
+        agent.state.deliveries.insert(
+            scope::SessionScope::Conversation { channel_id },
+            Default::default(),
+        );
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        bind_agent_scope_owner(
+            &mut pool,
+            &mut agent,
+            scope::SessionScope::Conversation { channel_id },
+        );
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "test-turn-id".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::from([
+                    crate::pool::SuccessfulSteerDelivery {
+                        event_id: steer_event_id.into(),
+                        session_id: "live-session".into(),
+                    },
+                ]),
+            },
+        );
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
+        assert!(
+            returned.state.deliveries[&scope::SessionScope::Conversation { channel_id }]
+                .delivered_event_ids
+                .contains(steer_event_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_stale_native_steer_ack_cannot_update_replacement_session() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = dummy_agent(0).await;
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "replacement-session".into(),
+        );
+        agent.state.deliveries.insert(
+            scope::SessionScope::Conversation { channel_id },
+            Default::default(),
+        );
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        bind_agent_scope_owner(
+            &mut pool,
+            &mut agent,
+            scope::SessionScope::Conversation { channel_id },
+        );
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "test-turn-id".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::from([
+                    crate::pool::SuccessfulSteerDelivery {
+                        event_id: "stale-event".into(),
+                        session_id: "old-session".into(),
+                    },
+                ]),
+            },
+        );
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
+        assert!(
+            returned.state.deliveries[&scope::SessionScope::Conversation { channel_id }]
+                .delivered_event_ids
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_native_steer_ack_after_task_return_updates_matching_live_session() {
+        let channel_id = Uuid::new_v4();
+        let steer_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut agent = dummy_agent(0).await;
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "live-session".into(),
+        );
+        agent.state.deliveries.insert(
+            scope::SessionScope::Conversation { channel_id },
+            Default::default(),
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert!(pool.record_successful_steer(
+            &scope::SessionScope::Conversation { channel_id },
+            steer_event_id.into(),
+            "live-session".into(),
+        ));
+        let returned = pool.agents_mut()[0].as_ref().expect("idle returned agent");
+        assert!(
+            returned.state.deliveries[&scope::SessionScope::Conversation { channel_id }]
+                .delivered_event_ids
+                .contains(steer_event_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_native_steer_ack_cannot_update_replacement_session() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = dummy_agent(0).await;
+        agent.state.sessions.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "replacement-session".into(),
+        );
+        agent.state.deliveries.insert(
+            scope::SessionScope::Conversation { channel_id },
+            Default::default(),
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert!(!pool.record_successful_steer(
+            &scope::SessionScope::Conversation { channel_id },
+            "stale-event".into(),
+            "old-session".into(),
+        ));
+        let returned = pool.agents_mut()[0].as_ref().expect("replacement agent");
+        assert!(
+            returned.state.deliveries[&scope::SessionScope::Conversation { channel_id }]
+                .delivered_event_ids
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidated_session_does_not_resurrect_successful_steer_delivery_state() {
+        let channel_id = Uuid::new_v4();
+        let agent = dummy_agent(0).await;
+        // No live session: simulates the prompt task invalidating before return.
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "test-turn-id".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::from([
+                    crate::pool::SuccessfulSteerDelivery {
+                        event_id: "stale-event".into(),
+                        session_id: "invalidated-session".into(),
+                    },
+                ]),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
+        assert!(!returned
+            .state
+            .deliveries
+            .contains_key(&scope::SessionScope::Conversation { channel_id }));
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how
@@ -4057,9 +11746,12 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
 
@@ -4078,7 +11770,10 @@ mod error_outcome_emission_tests {
 
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            }),
+            turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
         };
@@ -4095,13 +11790,21 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &mut tokio::time::Instant::now(),
         );
 
-        observer
+        let turn_errors: Vec<_> = observer
             .snapshot()
-            .iter()
+            .into_iter()
             .filter(|e| e.kind == "turn_error")
-            .count()
+            .collect();
+        assert!(
+            turn_errors
+                .iter()
+                .all(|event| event.turn_id.as_deref() == Some("test-turn-id")),
+            "turn_error must retain the completed turn id"
+        );
+        turn_errors.len()
     }
 
     #[tokio::test]
@@ -4110,8 +11813,955 @@ mod error_outcome_emission_tests {
     }
 
     #[tokio::test]
-    async fn timeout_emits_exactly_one_feed_event() {
-        assert_eq!(turn_errors_emitted_for(PromptOutcome::Timeout).await, 1);
+    async fn panic_event_retains_task_turn_id() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let task_id = abort_handle.id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "panic-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+
+        recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+        );
+
+        let panic = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "agent_panic")
+            .expect("panic recovery emits an observer event");
+        assert_eq!(
+            panic.channel_id.as_deref(),
+            Some(channel_id.to_string().as_str())
+        );
+        assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+    }
+
+    // Fix #3: a panicked thread-scoped task must clear its EXACT scope from the
+    // in-flight set (via meta.scope), not `Conversation(channel_id)`. Otherwise
+    // the requeued batch stays wedged until the ~2h in-flight backstop.
+    #[tokio::test]
+    async fn panic_recovery_frees_the_exact_thread_scope() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Thread {
+            channel_id,
+            root_event_id: "a".repeat(64),
+        };
+
+        // A thread-scoped batch is in flight (queue marks the Thread scope).
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let event = EventBuilder::new(Kind::Custom(9), "x")
+            .tags([])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        queue.push(queue::QueuedEvent {
+            edit: None,
+            channel_id,
+            scope: scope.clone(),
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "t".into(),
+        });
+        let batch = queue.flush_next().expect("flush thread batch");
+        assert!(queue.is_scope_in_flight(&scope));
+
+        // Spawn a task we can panic/abort, wired to the same scope + a
+        // recoverable batch so recovery requeues it.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "panic-turn-id".to_string(),
+                recoverable_batch: Some(batch),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::new();
+        // Pre-open the circuit so recovery returns before attempting a real
+        // respawn subprocess (mark_complete runs before the circuit check).
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(3600)),
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+        );
+
+        // The exact Thread scope is freed and the requeued batch is flushable
+        // again immediately — not stranded behind a Conversation(channel_id)
+        // entry until the backstop deadline.
+        assert!(
+            !queue.is_scope_in_flight(&scope),
+            "panic recovery must clear the exact Thread scope"
+        );
+        // The requeued batch is queued again (recovery uses `requeue`, which
+        // applies a short retry backoff — so it is undispatched work now and
+        // becomes flushable once the backoff expires, rather than being stranded
+        // in-flight behind the wrong scope until the ~2h backstop).
+        assert!(
+            queue.has_undispatched_work(),
+            "requeued thread batch must be queued (undispatched) after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_emits_exactly_one_feed_event() {
+        assert_eq!(
+            turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Idle)).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_timeout_emits_exactly_one_feed_event() {
+        assert_eq!(
+            turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false
+            }))
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_drain_timeout_emits_exactly_one_feed_event() {
+        assert_eq!(
+            turn_errors_emitted_for(PromptOutcome::CancelDrainTimeout(
+                std::time::Duration::from_secs(5)
+            ))
+            .await,
+            1
+        );
+    }
+
+    /// idle_timeout outcome_label is "idle_timeout"; hard_timeout is "hard_timeout".
+    #[tokio::test]
+    async fn timeout_outcome_labels_differ() {
+        let check_label = |outcome: PromptOutcome, expected_label: &'static str| async move {
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    scope: None,
+                    turn_id: "test-turn-id".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+            let observer = ObserverHandle::in_process();
+            let result = PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation {
+                    channel_id: Uuid::new_v4(),
+                }),
+                turn_id: "test-turn-id".to_string(),
+                outcome,
+                batch: None,
+            };
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                Some(observer.clone()),
+                None,
+                &mut tokio::time::Instant::now(),
+            );
+            let events = observer.snapshot();
+            let turn_error = events.iter().find(|e| e.kind == "turn_error").unwrap();
+            assert_eq!(
+                turn_error.payload["outcome"].as_str().unwrap(),
+                expected_label
+            );
+        };
+        check_label(PromptOutcome::Timeout(TimeoutKind::Idle), "idle_timeout").await;
+        check_label(
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false,
+            }),
+            "hard_timeout",
+        )
+        .await;
+        check_label(
+            PromptOutcome::CancelDrainTimeout(std::time::Duration::from_secs(5)),
+            "cancel_drain_timeout",
+        )
+        .await;
+    }
+
+    /// hard-cap timeout dead-letters immediately (no requeue); idle timeout is requeued.
+    #[tokio::test]
+    async fn hard_timeout_not_requeued_idle_timeout_is_requeued() {
+        let make_batch = || {
+            let keys = Keys::generate();
+            let event = EventBuilder::new(Kind::Custom(9), "test")
+                .sign_with_keys(&keys)
+                .unwrap();
+            let __cid = Uuid::new_v4();
+            FlushBatch {
+                channel_id: __cid,
+                scope: scope::SessionScope::Conversation { channel_id: __cid },
+                events: vec![BatchEvent {
+                    edit: None,
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        // Returns (pending_channels, queued_event_count_for_channel).
+        let run = |outcome: PromptOutcome, batch: FlushBatch| async move {
+            let channel_id = batch.channel_id;
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    scope: None,
+                    turn_id: "test-turn-id".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+            let result = PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "test-turn-id".to_string(),
+                outcome,
+                batch: Some(batch),
+            };
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+                &mut tokio::time::Instant::now(),
+            );
+            (
+                queue.pending_channels(),
+                queue.queued_event_count(channel_id),
+            )
+        };
+
+        // Hard timeout (not recently active): dead-lettered immediately.
+        let hard_batch = make_batch();
+        let (hard_channels, hard_events) = run(
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false,
+            }),
+            hard_batch,
+        )
+        .await;
+        assert_eq!(
+            hard_channels, 0,
+            "hard-cap timeout (not recently active) must not requeue the batch"
+        );
+        assert_eq!(
+            hard_events, 0,
+            "hard-cap timeout (not recently active) must drop all events"
+        );
+
+        // Idle timeout: batch IS requeued (first attempt, not yet dead-lettered).
+        let idle_batch = make_batch();
+        let (idle_channels, idle_events) =
+            run(PromptOutcome::Timeout(TimeoutKind::Idle), idle_batch).await;
+        assert_eq!(
+            idle_channels, 1,
+            "idle timeout must requeue the batch for retry"
+        );
+        assert_eq!(
+            idle_events, 1,
+            "idle timeout must preserve the event for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_timeout_recently_active_requeues_batch() {
+        let channel_id = Uuid::new_v4();
+        let make_batch = || {
+            let keys = Keys::generate();
+            let event = EventBuilder::new(Kind::Custom(9), "test")
+                .sign_with_keys(&keys)
+                .unwrap();
+            FlushBatch {
+                channel_id,
+                scope: scope::SessionScope::Conversation { channel_id },
+                events: vec![BatchEvent {
+                    edit: None,
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        let run = |outcome: PromptOutcome, batch: FlushBatch| async move {
+            let channel_id = batch.channel_id;
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    scope: None,
+                    turn_id: "test-turn-id".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+            let result = PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "test-turn-id".to_string(),
+                outcome,
+                batch: Some(batch),
+            };
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+                &mut tokio::time::Instant::now(),
+            );
+            (
+                queue.pending_channels(),
+                queue.queued_event_count(channel_id),
+            )
+        };
+
+        let batch = make_batch();
+        let (channels, events) = run(
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            channels, 1,
+            "hard-cap timeout with recent activity must requeue the batch"
+        );
+        assert_eq!(
+            events, 1,
+            "hard-cap timeout with recent activity must preserve the event"
+        );
+    }
+
+    /// The hard-timeout `death_message` must report what actually happened to
+    /// the batch, not just the `recently_active` eligibility flag: a
+    /// recently-active batch within its retry budget is requeued, so the
+    /// observer payload must say so.
+    #[tokio::test]
+    async fn hard_timeout_recently_active_requeue_success_reports_requeued_for_retry() {
+        let channel_id = Uuid::new_v4();
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event: EventBuilder::new(Kind::Custom(9), "test")
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!(
+                "Agent turn exceeded the maximum duration ({}s) — requeued for retry (recently active)",
+                config.max_turn_duration_secs
+            ),
+        );
+        assert_eq!(
+            queue.pending_channels(),
+            1,
+            "batch must be requeued, not dead-lettered, while within the retry budget"
+        );
+    }
+
+    /// Same recently-active hard timeout, but the channel has already
+    /// exhausted its retry budget ([`crate::queue::MAX_RETRIES`] prior
+    /// attempts) — `queue.requeue()` dead-letters instead of requeueing, and
+    /// the observer payload must report that fate, not the requeue wording
+    /// above.
+    #[tokio::test]
+    async fn hard_timeout_recently_active_budget_exhausted_reports_dead_lettered() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        // Simulate MAX_RETRIES prior failed attempts on this channel so the
+        // upcoming requeue() call in handle_prompt_result crosses the
+        // dead-letter threshold.
+        queue.set_retry_count_for_test(channel_id, crate::queue::MAX_RETRIES);
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event: EventBuilder::new(Kind::Custom(9), "final-attempt")
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!(
+                "Agent turn exceeded the maximum duration ({}s) — dead-lettered (retry budget exhausted)",
+                config.max_turn_duration_secs
+            ),
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "batch with an exhausted retry budget must be dead-lettered, not requeued"
+        );
+    }
+
+    /// Cancel-drain-timeout batches are requeued as cancelled (merge into the
+    /// next flush, `CancelReason` preserved) — never dead-lettered like a real
+    /// hard-cap. The agent itself is NOT returned to the idle pool: it is
+    /// handed to `spawn_respawn_task` instead, mirroring a fatal `Timeout`.
+    ///
+    /// This reproduces the full steer-fallback incident, not just the
+    /// original batch in isolation: the steer ack handler already released
+    /// the new triggering event back to `queue` (`lib.rs`'s
+    /// `ExpectedRunIdMissing` path) before the cancel-drain expiry fires. The
+    /// next `flush_next()` must merge the surviving original event (via
+    /// `cancelled_events`) with that already-queued new event (via `events`)
+    /// exactly once each — proving no loss and no duplication.
+    #[tokio::test]
+    async fn cancel_drain_timeout_requeues_batch_and_does_not_return_agent() {
+        let keys = Keys::generate();
+        let original_event = EventBuilder::new(Kind::Custom(9), "original")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let new_event = EventBuilder::new(Kind::Custom(9), "new")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_ne!(
+            original_event.id, new_event.id,
+            "test fixture must use two distinct events"
+        );
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event: original_event.clone(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        // The steer ack handler releases the new event to the queue BEFORE
+        // signaling the fallback ControlSignal::Steer that ultimately times
+        // out on drain — so it is already queued by the time
+        // handle_prompt_result runs.
+        queue.push(QueuedEvent {
+            edit: None,
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            event: new_event.clone(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        });
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let grace = std::time::Duration::from_secs(5);
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::CancelDrainTimeout(grace),
+            batch: Some(batch),
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        // Batch preserved as a cancelled merge, not dead-lettered — same
+        // treatment as a normal `Cancelled` outcome. `handle_prompt_result`
+        // already called `mark_complete` internally, releasing the channel.
+        // `flush_next()` must merge the already-queued new event with the
+        // preserved original: each exactly once, in the correct bucket.
+        let requeued = queue.flush_next().expect("batch must be requeued");
+        assert_eq!(
+            requeued.events.len(),
+            1,
+            "exactly one new event must be in the regular events bucket"
+        );
+        assert_eq!(
+            requeued.events[0].event.id, new_event.id,
+            "the regular events bucket must hold the new (already-queued) event"
+        );
+        assert_eq!(
+            requeued.cancelled_events.len(),
+            1,
+            "exactly one original event must be in the cancelled_events bucket"
+        );
+        assert_eq!(
+            requeued.cancelled_events[0].event.id, original_event.id,
+            "the cancelled_events bucket must hold the original (interrupted) event"
+        );
+        assert_ne!(
+            requeued.events[0].event.id, requeued.cancelled_events[0].event.id,
+            "the new and original events must not be the same event"
+        );
+        assert_eq!(
+            requeued.cancel_reason,
+            Some(CancelReason::Steer),
+            "CancelReason must ride through to the requeued batch"
+        );
+
+        // Agent must NOT be back in the idle pool — it was handed to respawn.
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "agent must not be returned to the pool after a cancel-drain timeout"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            1,
+            "a respawn task must be spawned for the poisoned agent"
+        );
+
+        // The observer payload must be fate-neutral: it names the grace and
+        // the process replacement, and must NOT claim the batch was
+        // preserved — that claim is false for explicit Stop/removed-channel
+        // drops (see the sibling dropped-Stop test below), so the same
+        // wording is used regardless of fate.
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["outcome"].as_str().unwrap(),
+            "cancel_drain_timeout"
+        );
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            "observer message must name the actual grace and must not claim preservation"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "turn_error").count(),
+            1,
+            "exactly one turn_error event must be emitted"
+        );
+    }
+
+    /// Explicit Stop (`ControlSignal::Cancel`) on cancel-drain expiry drops
+    /// the triggering batch — `requeue_cancelled_batch` returns `None` for
+    /// `Cancel`/`Rotate`. The observer payload must be the SAME fate-neutral
+    /// text as the preserved-Steer case above: it must never claim work was
+    /// preserved when it was intentionally discarded. The poisoned agent is
+    /// still respawned exactly as in the preserved case.
+    #[tokio::test]
+    async fn cancel_drain_timeout_dropped_stop_batch_none_same_neutral_payload() {
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let grace = std::time::Duration::from_secs(5);
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::CancelDrainTimeout(grace),
+            // Explicit Stop already dropped the batch upstream in
+            // `classify_control_cancel_failure` — `handle_prompt_result`
+            // never sees one to requeue.
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        // No batch to merge — the queue has nothing pending for any channel.
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "a dropped Stop batch must not leave anything queued"
+        );
+
+        // Same respawn treatment as the preserved case: never returned idle.
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "agent must not be returned to the pool after a cancel-drain timeout"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            1,
+            "a respawn task must be spawned for the poisoned agent"
+        );
+
+        // The observer payload is byte-identical to the preserved-Steer case:
+        // fate-neutral, naming the grace, with no preservation claim.
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["outcome"].as_str().unwrap(),
+            "cancel_drain_timeout"
+        );
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            "observer message must be fate-neutral even though the batch was dropped"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "turn_error").count(),
+            1,
+            "exactly one turn_error event must be emitted"
+        );
     }
 
     #[tokio::test]
@@ -4124,6 +12774,631 @@ mod error_outcome_emission_tests {
     async fn application_error_emits_exactly_one_feed_event() {
         let app = AcpError::IdleTimeout(std::time::Duration::from_secs(1));
         assert_eq!(turn_errors_emitted_for(PromptOutcome::Error(app)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_project_context_requeues_without_poisoning_agent_or_circuit() {
+        let channel_id = Uuid::new_v4();
+        let session_scope = scope::SessionScope::Conversation { channel_id };
+        let event = EventBuilder::new(Kind::Custom(9), "project work")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            scope: session_scope.clone(),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let mut agent = dummy_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(session_scope.clone(), "healthy-session".into());
+        let mut pool = AgentPool::from_slots(vec![None]);
+        bind_agent_scope_owner(&mut pool, &mut agent, session_scope.clone());
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(session_scope.clone()),
+                turn_id: "indeterminate-project".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(session_scope.clone()),
+            turn_id: "indeterminate-project".into(),
+            outcome: PromptOutcome::ProjectContextIndeterminate(
+                "project context is indeterminate".into(),
+            ),
+            batch: Some(batch),
+        };
+
+        assert!(matches!(
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+                &mut tokio::time::Instant::now(),
+            ),
+            LoopAction::Continue
+        ));
+
+        let returned = pool.agents_mut()[0]
+            .as_ref()
+            .expect("healthy agent returns to its slot");
+        assert_eq!(
+            returned
+                .state
+                .sessions
+                .get(&session_scope)
+                .map(String::as_str),
+            Some("healthy-session")
+        );
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(crash_history[0].crash_times.is_empty());
+        assert!(crash_history[0].open_until.is_none());
+        assert!(!crash_history[0].respawn_in_flight);
+        assert!(respawn_tasks.is_empty());
+    }
+
+    // ── is_auth_error classification ───────────────────────────────────────
+
+    #[test]
+    fn is_auth_error_matches_reauthenticate_message() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "API Error: OAuth access token has expired. Re-authenticate to continue."
+                .to_string(),
+        };
+        assert!(
+            is_auth_error(&e),
+            "Re-authenticate variant must be classified as auth error"
+        );
+    }
+
+    #[test]
+    fn is_auth_error_matches_401_message() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
+        };
+        assert!(
+            is_auth_error(&e),
+            "API Error: 401 variant must be classified as auth error"
+        );
+    }
+
+    #[test]
+    fn is_auth_error_rejects_other_agent_error_message() {
+        let e = acp::AcpError::AgentError {
+            code: -32601,
+            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
+        };
+        assert!(
+            !is_auth_error(&e),
+            "usage-credit error must NOT be classified as auth error"
+        );
+    }
+
+    #[test]
+    fn is_auth_error_rejects_transport_errors() {
+        let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
+        assert!(
+            !is_auth_error(&io),
+            "I/O error must not be classified as auth error"
+        );
+        let timeout = acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5));
+        assert!(
+            !is_auth_error(&timeout),
+            "WriteTimeout must not be classified as auth error"
+        );
+    }
+
+    // ── auth error dead-letter behavior ────────────────────────────────────
+
+    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
+    /// (the batch is never requeued) so the user sees a re-auth hint at once
+    /// rather than after 10 futile retries.
+    #[tokio::test]
+    async fn auth_error_dead_letters_immediately_without_requeueing() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let auth_error = acp::AcpError::AgentError {
+            code: -32000,
+            message: "API Error: 401 OAuth access token has expired. Re-authenticate to continue."
+                .to_string(),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(auth_error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        // The batch must not be requeued: pending_channels returns 0.
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "auth error must dead-letter immediately — batch must not be requeued"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "auth error must dead-letter immediately — no events should be pending"
+        );
+    }
+
+    /// Run a model-not-found turn failure for `event` through
+    /// `handle_prompt_result` and capture the real signed notice it posts.
+    async fn capture_model_not_found_notice(
+        event: nostr::Event,
+        edit: Option<queue::ResolvedEdit>,
+    ) -> (nostr::Event, relay::RestClient, uuid::Uuid) {
+        capture_model_not_found_notice_with_lookup(event, edit, serde_json::json!([])).await
+    }
+
+    /// Like [`capture_model_not_found_notice`], but answers any `/query`
+    /// lookup made before the notice with `lookup`.
+    async fn capture_model_not_found_notice_with_lookup(
+        event: nostr::Event,
+        edit: Option<queue::ResolvedEdit>,
+        lookup: serde_json::Value,
+    ) -> (nostr::Event, relay::RestClient, uuid::Uuid) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let raw_error = r#"llm model not found: (gpt-6-astra) 404 Not Found: {"error_code":"NOT_FOUND","message":"'gpt-6-astra' does not exist."}"#;
+        let model_error = AcpError::AgentError {
+            code: -32002,
+            message: raw_error.to_string(),
+        };
+        let expected_error = model_error.to_string();
+        let observer = ObserverHandle::in_process();
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(model_error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            Some(&rest),
+            &mut tokio::time::Instant::now(),
+        );
+
+        // The batch must not be requeued: pending_channels returns 0.
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "model-not-found must stop immediately — batch must not be requeued"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "model-not-found must stop immediately — no events should be pending"
+        );
+
+        assert!(
+            pool.agents_mut()[0].is_some(),
+            "healthy process remains reusable"
+        );
+        assert!(respawn_tasks.is_empty());
+        let errors: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "turn_error")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].payload["code"], -32002);
+        assert_eq!(errors[0].payload["error"], expected_error);
+
+        // Capture the real signed notice sent by handle_prompt_result, without a live relay.
+        let notice: nostr::Event = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let is_lookup = line == "POST /query HTTP/1.1\r\n";
+                if !is_lookup {
+                    assert_eq!(line, "POST /events HTTP/1.1\r\n");
+                }
+                let mut content_length = None;
+                for _ in 0..64 {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let size = content_length.expect("request Content-Length");
+                assert!(size < 65536);
+                let mut body = vec![0; size];
+                reader.read_exact(&mut body).await.unwrap();
+                let reply = if is_lookup { lookup.to_string() } else { "{}".to_string() };
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                if !is_lookup {
+                    break serde_json::from_slice(&body).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("failure notice must be posted on the first failure");
+        (notice, rest, channel_id)
+    }
+
+    #[tokio::test]
+    async fn model_not_found_posts_recovery_notice_without_retrying() {
+        let keys = Keys::generate();
+        let root = nostr::EventId::from_byte_array([0xaa; 32]);
+        let parent = nostr::EventId::from_byte_array([0xbb; 32]);
+        let event = EventBuilder::new(Kind::Custom(9), "test")
+            .tags([
+                nostr::Tag::parse(["e", &root.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", &parent.to_hex(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let (notice, rest, channel_id) = capture_model_not_found_notice(event, None).await;
+        notice.verify().unwrap();
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(notice.kind, Kind::Custom(9));
+        assert_eq!(
+            notice.content,
+            "⚠️ I couldn't process the last request: the configured model wasn't found at the provider's endpoint. Open agent settings, select a different model from the dropdown, and save your changes. Restart the agent to apply the new configuration, then re-send your request."
+        );
+        let tags = serde_json::to_value(&notice.tags).unwrap();
+        assert!(tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag[0] == "h" && tag[1] == channel_id.to_string()));
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, Some(root.to_hex()));
+        assert_eq!(threading.parent_event_id, Some(parent.to_hex()));
+    }
+
+    /// A terminal failure for an edit posts into the original's thread, not
+    /// at channel top level (the edit's bare `e` tag is not a thread link).
+    #[tokio::test]
+    async fn failure_notice_for_threaded_edit_posts_in_original_thread() {
+        let root = "aa".repeat(32);
+        let original = crate::edit_routing::test_support::message(Some(&root));
+        let edit = crate::edit_routing::test_support::edit_event(&original.id.to_hex(), &[]);
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(&original),
+        };
+        let (notice, _, _) = capture_model_not_found_notice(edit.clone(), Some(resolved)).await;
+        notice.verify().unwrap();
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, Some(root.clone()));
+        assert_eq!(threading.parent_event_id, Some(root));
+        assert!(!notice_references(&notice, &edit.id.to_hex()));
+    }
+
+    /// A top-level edited message gets its notice as a reply to the original.
+    #[tokio::test]
+    async fn failure_notice_for_top_level_edit_replies_to_original() {
+        let original = crate::edit_routing::test_support::message(None);
+        let original_id = original.id.to_hex();
+        let edit = crate::edit_routing::test_support::edit_event(&original_id, &[]);
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original_id.clone(),
+            target_thread_tags: queue::parse_thread_tags(&original),
+        };
+        let (notice, _, _) = capture_model_not_found_notice(edit.clone(), Some(resolved)).await;
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, Some(original_id.clone()));
+        assert_eq!(threading.parent_event_id, Some(original_id));
+        assert!(!notice_references(&notice, &edit.id.to_hex()));
+    }
+
+    /// An original that was unresolved at admission is looked up again for
+    /// the notice. A threaded original then gets the notice in its thread.
+    #[tokio::test]
+    async fn failure_notice_retries_unresolved_edit_lookup() {
+        let root = "aa".repeat(32);
+        let original = crate::edit_routing::test_support::message(Some(&root));
+        let edit = crate::edit_routing::test_support::edit_event(&original.id.to_hex(), &[]);
+        let (notice, _, _) = capture_model_not_found_notice_with_lookup(
+            edit.clone(),
+            None,
+            serde_json::json!([original]),
+        )
+        .await;
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, Some(root.clone()));
+        assert_eq!(threading.parent_event_id, Some(root));
+        assert!(!notice_references(&notice, &edit.id.to_hex()));
+    }
+
+    /// If the original still cannot be fetched, the notice must not claim the
+    /// edit target as a thread root: the target can itself be a thread reply,
+    /// and the relay rejects a root that does not match its real ancestry.
+    /// The notice posts at channel top level instead.
+    #[tokio::test]
+    async fn failure_notice_for_unresolved_edit_claims_no_root() {
+        let target = "cc".repeat(32);
+        let edit = crate::edit_routing::test_support::edit_event(&target, &[]);
+        let (notice, _, _) = capture_model_not_found_notice(edit.clone(), None).await;
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, None);
+        assert_eq!(threading.parent_event_id, None);
+        assert!(!notice_references(&notice, &target));
+        assert!(!notice_references(&notice, &edit.id.to_hex()));
+    }
+
+    fn notice_references(notice: &nostr::Event, event_id: &str) -> bool {
+        notice.tags.iter().any(|tag| {
+            let values = tag.as_slice();
+            values.first().map(String::as_str) == Some("e")
+                && values.get(1).map(String::as_str) == Some(event_id)
+        })
+    }
+
+    /// A non-auth application error (e.g. usage credits) must still follow the
+    /// standard requeue path so today's behavior is unchanged.
+    #[tokio::test]
+    async fn non_auth_application_error_is_requeued() {
+        assert_application_error_is_requeued(acp::AcpError::AgentError {
+            code: -32000,
+            message: "Usage credits required for 1M context".to_string(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_model_resource_not_found_is_requeued() {
+        assert_application_error_is_requeued(acp::AcpError::AgentError {
+            code: -32002,
+            message: "Resource not found: session no longer exists".to_string(),
+        })
+        .await;
+    }
+
+    async fn assert_application_error_is_requeued(error: acp::AcpError) {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+            &mut tokio::time::Instant::now(),
+        );
+
+        // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
+        assert_eq!(
+            queue.pending_channels(),
+            1,
+            "non-auth application error must requeue the batch for retry"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            1,
+            "non-auth application error must preserve the event for retry"
+        );
     }
 }
 
@@ -4140,6 +13415,7 @@ mod observer_payload_trim_tests {
             channel_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
             session_id: Some("sess-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            started_at: None,
             payload,
         }
     }
@@ -4209,7 +13485,7 @@ mod observer_payload_trim_tests {
         // to 1).
         let sections = [
             "[Base]\nyou are a helpful agent".to_string(),
-            "[System]\npersona text".to_string(),
+            "[Agent Instructions]\npersona text".to_string(),
             "[Agent Memory — core]\nremember this".to_string(),
             "[Context]\nScope: thread".to_string(),
             // The triggering event body, oversized on its own.
@@ -4246,7 +13522,7 @@ mod observer_payload_trim_tests {
         let texts: Vec<&str> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
         for header in [
             "[Base]",
-            "[System]",
+            "[Agent Instructions]",
             "[Agent Memory — core]",
             "[Context]",
             "[Buzz event: @mention]",

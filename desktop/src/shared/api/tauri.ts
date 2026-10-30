@@ -1,17 +1,14 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
+import {
+  fromRawInstallRuntimeResult,
+  type RawInstallRuntimeResult,
+} from "@/shared/api/installTypes";
 import type {
   AddChannelMembersInput,
   AddChannelMembersResult,
   BackendProviderCandidate,
   BackendProviderProbeResult,
-  CanvasResponse,
-  Channel,
-  ChannelDetail,
-  ChannelMember,
-  ChannelMessagesPageResponse,
-  ChannelPageCursor,
-  ChannelType,
-  CreateChannelInput,
   GetHomeFeedInput,
   HomeFeedResponse,
   ManagedAgent,
@@ -24,71 +21,30 @@ import type {
   RelayEvent,
   SearchMessagesInput,
   SearchMessagesResponse,
-  SendChannelMessageResult,
-  SetCanvasInput,
-  SetCanvasResult,
-  SetChannelPurposeInput,
-  SetChannelTopicInput,
   ThreadCursor,
   ThreadRepliesResponse,
-  UpdateChannelInput,
   CreateManagedAgentInput,
   AgentModelsResponse,
   UpdateManagedAgentInput,
   AcpAvailabilityStatus,
   AcpRuntimeCatalogEntry,
+  AuthStatus,
   CommandAvailability,
   InstallRuntimeResult,
-  OpenDmInput,
+  GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
 
+export * from "@/shared/api/tauriChannels";
+export {
+  getCanvas,
+  getCanvasHistory,
+  setCanvas,
+} from "@/shared/api/tauriCanvas";
+export { sendChannelMessage } from "@/shared/api/tauriMessages";
+export { getEventById, getEventsByIds } from "@/shared/api/tauriEvents";
+
 type RawPresenceLookup = Record<string, PresenceStatus>;
-
-type RawChannel = {
-  id: string;
-  name: string;
-  channel_type: ChannelType;
-  visibility: "open" | "private";
-  description: string;
-  topic: string | null;
-  purpose: string | null;
-  member_count: number;
-  member_pubkeys: string[];
-  last_message_at: string | null;
-  archived_at: string | null;
-  participants: string[];
-  participant_pubkeys: string[];
-  is_member?: boolean;
-  ttl_seconds: number | null;
-  ttl_deadline: string | null;
-};
-
-type RawChannelDetail = RawChannel & {
-  created_by: string;
-  created_at: string;
-  updated_at: string;
-  topic_set_by: string | null;
-  topic_set_at: string | null;
-  purpose_set_by: string | null;
-  purpose_set_at: string | null;
-  topic_required: boolean;
-  max_members: number | null;
-  nip29_group_id: string | null;
-};
-
-type RawChannelMember = {
-  pubkey: string;
-  role: ChannelMember["role"];
-  is_agent?: boolean;
-  joined_at: string;
-  display_name: string | null;
-};
-
-type RawChannelMembersResponse = {
-  members: RawChannelMember[];
-  next_cursor: string | null;
-};
 
 type RawAddChannelMembersResult = {
   added: string[];
@@ -106,9 +62,9 @@ type RawFeedItem = {
   created_at: number;
   channel_id: string | null;
   channel_name: string;
-  channel_type: string;
+  channel_type: string | null;
   tags: string[][];
-  category: "mention" | "needs_action" | "activity" | "agent_activity";
+  category: HomeFeedResponse["feed"]["mentions"][number]["category"];
 };
 
 type RawHomeFeedResponse = {
@@ -141,16 +97,9 @@ type RawSearchResponse = {
   found: number;
 };
 
-type RawSendChannelMessageResult = {
-  event_id: string;
-  parent_event_id: string | null;
-  root_event_id: string | null;
-  depth: number;
-  created_at: number;
-};
-
 type RawRelayAgent = {
   pubkey: string;
+  owner_pubkey?: string | null;
   name: string;
   agent_type: string;
   channels: string[];
@@ -160,10 +109,14 @@ type RawRelayAgent = {
   respond_to?: RelayAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
+import type { RestartDiffEntry as RawRestartDiffEntry } from "./restartDiff";
 export type RawManagedAgent = {
   pubkey: string;
   name: string;
   persona_id: string | null;
+  // Optional: pre-feature fixtures may omit it. The record's harness/runtime id.
+  runtime?: string | null;
+  team_id?: string | null;
   relay_url: string;
   acp_command: string;
   agent_command: string;
@@ -174,14 +127,16 @@ export type RawManagedAgent = {
   idle_timeout_seconds: number | null;
   max_turn_duration_seconds: number | null;
   parallelism: number;
+  session_policy?: ManagedAgent["sessionPolicy"];
   system_prompt: string | null;
   avatar_url?: string | null;
   model: string | null;
+  model_source?: ManagedAgent["modelSource"];
   provider: string | null;
   persona_out_of_date: boolean;
   persona_orphaned: boolean;
   needs_restart: boolean;
-  mcp_toolsets: string | null;
+  restart_diff?: RawRestartDiffEntry[];
   env_vars?: Record<string, string>;
   status: ManagedAgent["status"];
   pid: number | null;
@@ -197,8 +152,7 @@ export type RawManagedAgent = {
   auto_restart_on_config_change?: boolean;
   backend: ManagedAgentBackend;
   backend_agent_id: string | null;
-  // Optional: pre-feature mock fixtures may omit these. Mapped to
-  // `"owner-only"` / `[]` in `fromRawManagedAgent`.
+  // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
@@ -224,25 +178,37 @@ export type RawAcpRuntimeCatalogEntry = {
   binary_path: string | null;
   default_args: string[];
   mcp_command: string | null;
+  model_env_var?: string | null;
+  provider_env_var?: string | null;
+  thinking_env_var?: string | null;
+  max_tokens_env_var?: string | null;
+  context_limit_env_var?: string | null;
+  max_rounds_env_var?: string | null;
   install_hint: string;
   install_instructions_url: string;
   can_auto_install: boolean;
+  requires_external_cli?: boolean;
   underlying_cli_path: string | null;
+  node_required: boolean;
+  auth_status: AuthStatus;
+  login_hint?: string;
+  source: "builtin" | "preset" | "custom";
+  /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
+  definition_env?: Record<string, string>;
+  max_parallelism?: number;
+  effort_canonical_values?: string[] | null;
 };
 
-export type RawInstallStepResult = {
-  step: string;
-  command: string;
-  success: boolean;
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-  hint?: string;
-};
+export type {
+  RawInstallRuntimeResult,
+  RawInstallStepResult,
+} from "./installTypes";
 
-export type RawInstallRuntimeResult = {
-  success: boolean;
-  steps: RawInstallStepResult[];
+type RawGitBashPrerequisite = {
+  available: boolean;
+  path: string | null;
+  install_instructions_url: string;
+  install_hint: string;
 };
 
 type RawCommandAvailability = {
@@ -267,24 +233,24 @@ type RawListRelayMembersResponse = {
   members: RawRelayMember[];
 };
 
-type RawCanvasResponse = {
-  content: string | null;
-  updated_at: number | null;
-  author: string | null;
-};
+/** Error normalized from a rejected Tauri invocation with its wire payload. */
+export class TauriInvokeError extends Error {
+  readonly payload: unknown;
 
-type RawSetCanvasResult = {
-  ok: boolean;
-  event_id: string;
-};
+  constructor(message: string, payload: unknown) {
+    super(message);
+    this.name = "TauriInvokeError";
+    this.payload = payload;
+  }
+}
 
-function toTauriError(error: unknown): Error {
+export function toTauriError(error: unknown): Error {
   if (error instanceof Error) {
     return error;
   }
 
   if (typeof error === "string") {
-    return new Error(error);
+    return new TauriInvokeError(error, error);
   }
 
   if (
@@ -293,13 +259,13 @@ function toTauriError(error: unknown): Error {
     "message" in error &&
     typeof error.message === "string"
   ) {
-    return new Error(error.message);
+    return new TauriInvokeError(error.message, error);
   }
 
   try {
-    return new Error(JSON.stringify(error));
+    return new TauriInvokeError(JSON.stringify(error), error);
   } catch {
-    return new Error("Unknown Tauri error");
+    return new TauriInvokeError("Unknown Tauri error", error);
   }
 }
 
@@ -310,58 +276,13 @@ export async function invokeTauri<T>(
   try {
     return await tauriInvoke<T>(command, args);
   } catch (error) {
+    // HTTP backoff lives in Rust. Do not apply its separate ApiCalls quota
+    // to the WebSocket gate, but preserve the failure for the caller.
     throw toTauriError(error);
   }
 }
 
-function fromRawChannel(channel: RawChannel): Channel {
-  return {
-    id: channel.id,
-    name: channel.name,
-    channelType: channel.channel_type,
-    visibility: channel.visibility,
-    description: channel.description,
-    topic: channel.topic,
-    purpose: channel.purpose,
-    memberCount: channel.member_count,
-    memberPubkeys: channel.member_pubkeys ?? [],
-    lastMessageAt: channel.last_message_at,
-    archivedAt: channel.archived_at,
-    participants: channel.participants,
-    participantPubkeys: channel.participant_pubkeys,
-    isMember: channel.is_member ?? true,
-    ttlSeconds: channel.ttl_seconds,
-    ttlDeadline: channel.ttl_deadline,
-  };
-}
-
-function fromRawChannelDetail(channel: RawChannelDetail): ChannelDetail {
-  return {
-    ...fromRawChannel(channel),
-    createdBy: channel.created_by,
-    createdAt: channel.created_at,
-    updatedAt: channel.updated_at,
-    topicSetBy: channel.topic_set_by,
-    topicSetAt: channel.topic_set_at,
-    purposeSetBy: channel.purpose_set_by,
-    purposeSetAt: channel.purpose_set_at,
-    topicRequired: channel.topic_required,
-    maxMembers: channel.max_members,
-    nip29GroupId: channel.nip29_group_id,
-  };
-}
-
-function fromRawChannelMember(member: RawChannelMember): ChannelMember {
-  return {
-    pubkey: member.pubkey,
-    role: member.role,
-    isAgent: member.is_agent ?? false,
-    joinedAt: member.joined_at,
-    displayName: member.display_name,
-  };
-}
-
-function fromRawFeedItem(item: RawFeedItem) {
+export function fromRawFeedItem(item: RawFeedItem) {
   return {
     id: item.id,
     kind: item.kind,
@@ -370,7 +291,10 @@ function fromRawFeedItem(item: RawFeedItem) {
     createdAt: item.created_at,
     channelId: item.channel_id,
     channelName: item.channel_name,
-    channelType: item.channel_type,
+    // Canonicalize the wire `null` to undefined so FeedItem's optional
+    // channelType contract holds at runtime (enrichment and the DM
+    // notification filter both key off `=== undefined`).
+    channelType: item.channel_type ?? undefined,
     tags: item.tags,
     category: item.category,
   };
@@ -406,6 +330,10 @@ export function getDefaultRelayUrl(): Promise<string> {
   return invokeTauri<string>("get_default_relay_url");
 }
 
+export function autoConnectDefaultRelayEnabled(): Promise<boolean> {
+  return invokeTauri<boolean>("auto_connect_default_relay_enabled");
+}
+
 export function isSharedIdentity(): Promise<boolean> {
   return invokeTauri<boolean>("is_shared_identity");
 }
@@ -418,90 +346,25 @@ export function getRelayHttpUrl(): Promise<string> {
   return invokeTauri<string>("get_relay_http_url");
 }
 
-export async function getChannels(): Promise<Channel[]> {
-  const channels = await invokeTauri<RawChannel[]>("get_channels");
-  return channels.map(fromRawChannel);
-}
-
-export async function createChannel(
-  input: CreateChannelInput,
-): Promise<Channel> {
-  return fromRawChannel(await invokeTauri<RawChannel>("create_channel", input));
-}
-
-export async function openDm(input: OpenDmInput): Promise<Channel> {
-  return fromRawChannel(await invokeTauri<RawChannel>("open_dm", input));
-}
-
-export async function hideDm(channelId: string): Promise<void> {
-  await invokeTauri<void>("hide_dm", { channelId });
-}
-
-export async function getChannelDetails(
-  channelId: string,
-): Promise<ChannelDetail> {
-  const channel = await invokeTauri<RawChannelDetail>("get_channel_details", {
-    channelId,
-  });
-  return fromRawChannelDetail(channel);
-}
-
-export async function getChannelMembers(
-  channelId: string,
-): Promise<ChannelMember[]> {
-  const response = await invokeTauri<RawChannelMembersResponse>(
-    "get_channel_members",
-    {
-      channelId,
-    },
-  );
-  return response.members.map(fromRawChannelMember);
-}
-
-export async function updateChannel(
-  input: UpdateChannelInput,
-): Promise<ChannelDetail> {
-  const channel = await invokeTauri<RawChannelDetail>("update_channel", {
-    input,
-  });
-  return fromRawChannelDetail(channel);
-}
-
-export async function setChannelTopic(
-  input: SetChannelTopicInput,
-): Promise<void> {
-  await invokeTauri("set_channel_topic", input);
-}
-
-export async function setChannelPurpose(
-  input: SetChannelPurposeInput,
-): Promise<void> {
-  await invokeTauri("set_channel_purpose", input);
-}
-
-export async function archiveChannel(channelId: string): Promise<void> {
-  await invokeTauri("archive_channel", { channelId });
-}
-
-export async function unarchiveChannel(channelId: string): Promise<void> {
-  await invokeTauri("unarchive_channel", { channelId });
-}
-
-export async function deleteChannel(channelId: string): Promise<void> {
-  await invokeTauri("delete_channel", { channelId });
-}
-
 export async function addChannelMembers(
   input: AddChannelMembersInput,
 ): Promise<AddChannelMembersResult> {
-  return invokeTauri<RawAddChannelMembersResult>("add_channel_members", input);
+  const record = beginChannelMembershipWrite();
+  const result = await invokeTauri<RawAddChannelMembersResult>(
+    "add_channel_members",
+    input,
+  );
+  record(input.channelId);
+  return result;
 }
 
 export async function removeChannelMember(
   channelId: string,
   pubkey: string,
 ): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("remove_channel_member", { channelId, pubkey });
+  record(channelId);
 }
 
 export async function changeChannelMemberRole(
@@ -509,39 +372,21 @@ export async function changeChannelMemberRole(
   pubkey: string,
   role: string,
 ): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("change_channel_member_role", { channelId, pubkey, role });
+  record(channelId);
 }
 
 export async function joinChannel(channelId: string): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("join_channel", { channelId });
+  record(channelId);
 }
 
 export async function leaveChannel(channelId: string): Promise<void> {
+  const record = beginChannelMembershipWrite();
   await invokeTauri("leave_channel", { channelId });
-}
-
-export async function getCanvas(channelId: string): Promise<CanvasResponse> {
-  const response = await invokeTauri<RawCanvasResponse>("get_canvas", {
-    channelId,
-  });
-  return {
-    content: response.content,
-    updatedAt: response.updated_at,
-    author: response.author,
-  };
-}
-
-export async function setCanvas(
-  input: SetCanvasInput,
-): Promise<SetCanvasResult> {
-  const response = await invokeTauri<RawSetCanvasResult>("set_canvas", {
-    channelId: input.channelId,
-    content: input.content,
-  });
-  return {
-    ok: response.ok,
-    eventId: response.event_id,
-  };
+  record(channelId);
 }
 
 export async function getHomeFeed(
@@ -571,17 +416,15 @@ export async function searchMessages(
     q: input.q,
     limit: input.limit,
     channelId: input.channelId,
+    authors: input.authors,
+    since: input.since,
+    until: input.until,
   });
 
   return {
     hits: response.hits.map(fromRawSearchHit),
     found: response.found,
   };
-}
-
-export async function getEventById(eventId: string): Promise<RelayEvent> {
-  const eventJson = await invokeTauri<string>("get_event", { eventId });
-  return JSON.parse(eventJson) as RelayEvent;
 }
 
 type RawThreadCursor = {
@@ -646,82 +489,6 @@ export async function getThreadReplies(
   };
 }
 
-type RawChannelMessagesPageResponse = {
-  events: RelayEvent[];
-  next_cursor: RawThreadCursor | null;
-};
-
-/**
- * Fetch one keyset page of top-level channel history strictly older than a
- * cursor, via the bridge composite `(createdAt, eventId)` cursor.
- *
- * The desktop timeline pages history over WS `REQ` with a bare `until`
- * (`createdAt`) cursor, which cannot advance past a `createdAt` second denser
- * than one page. This is the escape hatch: `beforeId` is the id of the oldest
- * event already loaded at `before`, and the relay returns strictly-older rows
- * (`created_at < before OR (created_at = before AND id > beforeId)`). Pass the
- * returned `nextCursor` back to page further; `nextCursor` is null once a short
- * page proves history is exhausted.
- */
-export async function getChannelMessagesBefore(
-  channelId: string,
-  cursor: ChannelPageCursor,
-  limit?: number,
-): Promise<ChannelMessagesPageResponse> {
-  const response = await invokeTauri<RawChannelMessagesPageResponse>(
-    "get_channel_messages_before",
-    {
-      channelId,
-      before: cursor.createdAt,
-      beforeId: cursor.eventId,
-      limit: limit ?? null,
-    },
-  );
-
-  return {
-    events: response.events,
-    nextCursor: response.next_cursor
-      ? {
-          createdAt: response.next_cursor.created_at,
-          eventId: response.next_cursor.event_id,
-        }
-      : null,
-  };
-}
-
-export async function sendChannelMessage(
-  channelId: string,
-  content: string,
-  parentEventId?: string | null,
-  mediaTags?: string[][],
-  mentionPubkeys?: string[],
-  kind?: number,
-  emojiTags?: string[][],
-  mentionTags?: string[][],
-): Promise<SendChannelMessageResult> {
-  const response = await invokeTauri<RawSendChannelMessageResult>(
-    "send_channel_message",
-    {
-      channelId,
-      content,
-      parentEventId,
-      mediaTags: mediaTags ?? null,
-      emojiTags: emojiTags ?? null,
-      mentionTags: mentionTags ?? null,
-      mentionPubkeys: mentionPubkeys ?? null,
-      kind: kind ?? null,
-    },
-  );
-
-  return {
-    eventId: response.event_id,
-    parentEventId: response.parent_event_id,
-    rootEventId: response.root_event_id,
-    depth: response.depth,
-    createdAt: response.created_at,
-  };
-}
-
 export type BlobDescriptor = {
   url: string;
   sha256: string;
@@ -746,11 +513,11 @@ export async function uploadMedia(
     isTemp,
   });
 }
-
-export async function pickAndUploadMedia(): Promise<BlobDescriptor[]> {
-  return invokeTauri<BlobDescriptor[]>("pick_and_upload_media", {});
+export async function pickAndUploadMedia(
+  progressId?: string,
+): Promise<BlobDescriptor[]> {
+  return invokeTauri<BlobDescriptor[]>("pick_and_upload_media", { progressId });
 }
-
 export async function uploadMediaBytes(
   data: number[],
   filename?: string,
@@ -764,21 +531,7 @@ export async function uploadMediaBytes(
   });
 }
 
-export async function editMessage(
-  channelId: string,
-  eventId: string,
-  content: string,
-  mediaTags?: string[][],
-  emojiTags?: string[][],
-): Promise<void> {
-  await invokeTauri("edit_message", {
-    channelId,
-    eventId,
-    content,
-    mediaTags: mediaTags ?? [],
-    emojiTags: emojiTags ?? [],
-  });
-}
+export { editMessage } from "@/shared/api/editMessage";
 
 export async function deleteMessage(
   channelId: string,
@@ -807,6 +560,19 @@ export async function signRelayEvent(input: {
   content: string;
   createdAt?: number;
   tags: string[][];
+  /**
+   * When true, the Rust signer calls `EventBuilder::allow_self_tagging()` so
+   * that `p` tags whose value equals the signing key are NOT stripped.
+   *
+   * nostr 0.44.x strips self-`p` tags by default (see `EventBuilder::
+   * build_with_ctx` in the vendored crate). Set this flag ONLY for report
+   * events (kind:1984) where the reporter and the reported author are the
+   * same person — otherwise the relay rejects with "must include a p tag".
+   *
+   * Default: false (matches the historical behaviour for all other event
+   * kinds where stripping self-tags is correct).
+   */
+  allowSelfTagging?: boolean;
 }): Promise<RelayEvent> {
   const eventJson = await invokeTauri<string>("sign_event", input);
   return JSON.parse(eventJson) as RelayEvent;
@@ -819,10 +585,10 @@ export async function createAuthEvent(input: {
   const eventJson = await invokeTauri<string>("create_auth_event", input);
   return JSON.parse(eventJson) as RelayEvent;
 }
-
 function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
   return {
     pubkey: agent.pubkey,
+    ownerPubkey: agent.owner_pubkey ?? null,
     name: agent.name,
     agentType: agent.agent_type,
     channels: agent.channels,
@@ -839,6 +605,8 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     pubkey: agent.pubkey,
     name: agent.name,
     personaId: agent.persona_id,
+    runtime: agent.runtime ?? null,
+    teamId: agent.team_id ?? null,
     relayUrl: agent.relay_url,
     acpCommand: agent.acp_command,
     agentCommand: agent.agent_command,
@@ -849,15 +617,16 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     idleTimeoutSeconds: agent.idle_timeout_seconds,
     maxTurnDurationSeconds: agent.max_turn_duration_seconds,
     parallelism: agent.parallelism,
+    sessionPolicy: agent.session_policy ?? "channel",
     systemPrompt: agent.system_prompt,
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
-    // Fallbacks for pre-feature mocks/fixtures. Real records always carry them.
+    modelSource: agent.model_source ?? null,
     provider: agent.provider ?? null,
     personaOutOfDate: agent.persona_out_of_date ?? false,
     personaOrphaned: agent.persona_orphaned ?? false,
     needsRestart: agent.needs_restart ?? false,
-    mcpToolsets: agent.mcp_toolsets,
+    restartDiff: agent.restart_diff ?? [],
     envVars: agent.env_vars ?? {},
     status: agent.status,
     pid: agent.pid,
@@ -873,14 +642,12 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     autoRestartOnConfigChange: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend,
     backendAgentId: agent.backend_agent_id,
-    // Fallbacks for pre-feature mocks/fixtures that don't carry these fields.
-    // Real agent records always include them (defaulted server-side).
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
   };
 }
 
-function fromRawAcpRuntimeCatalogEntry(
+export function fromRawAcpRuntimeCatalogEntry(
   entry: RawAcpRuntimeCatalogEntry,
 ): AcpRuntimeCatalogEntry {
   return {
@@ -892,27 +659,26 @@ function fromRawAcpRuntimeCatalogEntry(
     binaryPath: entry.binary_path,
     defaultArgs: entry.default_args,
     mcpCommand: entry.mcp_command,
+    modelEnvVar: entry.model_env_var ?? null,
+    providerEnvVar: entry.provider_env_var ?? null,
+    thinkingEnvVar: entry.thinking_env_var ?? null,
+    maxTokensEnvVar: entry.max_tokens_env_var ?? null,
+    contextLimitEnvVar: entry.context_limit_env_var ?? null,
+    maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
     installHint: entry.install_hint,
     installInstructionsUrl: entry.install_instructions_url,
     canAutoInstall: entry.can_auto_install,
+    requiresExternalCli: entry.requires_external_cli ?? false,
     underlyingCliPath: entry.underlying_cli_path,
-  };
-}
-
-function fromRawInstallRuntimeResult(
-  raw: RawInstallRuntimeResult,
-): InstallRuntimeResult {
-  return {
-    success: raw.success,
-    steps: raw.steps.map((step) => ({
-      step: step.step,
-      command: step.command,
-      success: step.success,
-      stdout: step.stdout,
-      stderr: step.stderr,
-      exitCode: step.exit_code,
-      hint: step.hint,
-    })),
+    nodeRequired: entry.node_required,
+    authStatus: entry.auth_status,
+    loginHint: entry.login_hint ?? null,
+    source: entry.source,
+    definitionEnv: entry.definition_env ?? {},
+    effortCanonicalValues: entry.effort_canonical_values ?? null,
+    ...(entry.max_parallelism !== undefined && {
+      maxParallelism: entry.max_parallelism,
+    }),
   };
 }
 
@@ -990,7 +756,6 @@ export async function listManagedAgents(): Promise<ManagedAgent[]> {
     fromRawManagedAgent,
   );
 }
-
 export async function createManagedAgent(input: CreateManagedAgentInput) {
   const response = await invokeTauri<RawCreateManagedAgentResponse>(
     "create_managed_agent",
@@ -998,13 +763,13 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
       input: {
         name: input.name,
         personaId: input.personaId,
+        teamId: input.teamId,
         relayUrl: input.relayUrl,
         acpCommand: input.acpCommand,
         agentCommand: input.agentCommand,
         harnessOverride: input.harnessOverride ?? false,
         agentArgs: input.agentArgs,
         mcpCommand: input.mcpCommand,
-        mcpToolsets: input.mcpToolsets,
         turnTimeoutSeconds: input.turnTimeoutSeconds,
         idleTimeoutSeconds: input.idleTimeoutSeconds,
         maxTurnDurationSeconds: input.maxTurnDurationSeconds,
@@ -1012,10 +777,12 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
         systemPrompt: input.systemPrompt,
         avatarUrl: input.avatarUrl,
         model: input.model,
+        provider: input.provider,
         envVars: input.envVars ?? {},
         spawnAfterCreate: input.spawnAfterCreate,
         startOnAppLaunch: input.startOnAppLaunch,
         backend: input.backend,
+        effortLevel: input.effortLevel,
         respondTo: input.respondTo,
         respondToAllowlist: input.respondToAllowlist,
         relayMesh: input.relayMesh,
@@ -1055,10 +822,57 @@ export async function getManagedAgentLog(pubkey: string, lineCount?: number) {
   };
 }
 
-export async function discoverAcpRuntimes(): Promise<AcpRuntimeCatalogEntry[]> {
+export async function discoverGitBashPrerequisite(): Promise<GitBashPrerequisite | null> {
+  const prerequisite = await invokeTauri<RawGitBashPrerequisite | null>(
+    "discover_git_bash_prerequisite",
+  );
   return (
-    await invokeTauri<RawAcpRuntimeCatalogEntry[]>("discover_acp_providers")
-  ).map(fromRawAcpRuntimeCatalogEntry);
+    prerequisite && {
+      available: prerequisite.available,
+      path: prerequisite.path,
+      installInstructionsUrl: prerequisite.install_instructions_url,
+      installHint: prerequisite.install_hint,
+    }
+  );
+}
+
+/** Input shape for creating or updating a custom harness. */
+export type HarnessDefinitionInput = {
+  id: string;
+  label: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  installInstructionsUrl?: string;
+  installHint?: string;
+};
+
+/** Save (create or overwrite) a custom harness definition. Returns the catalog entry. */
+export async function saveCustomHarness(
+  definition: HarnessDefinitionInput,
+  originalId?: string,
+): Promise<AcpRuntimeCatalogEntry> {
+  const raw = await invokeTauri<RawAcpRuntimeCatalogEntry>(
+    "save_custom_harness",
+    {
+      definition: {
+        id: definition.id,
+        label: definition.label,
+        command: definition.command,
+        args: definition.args ?? [],
+        env: definition.env ?? {},
+        installInstructionsUrl: definition.installInstructionsUrl ?? "",
+        installHint: definition.installHint ?? "",
+      },
+      originalId: originalId ?? null,
+    },
+  );
+  return fromRawAcpRuntimeCatalogEntry(raw);
+}
+
+/** Delete a custom harness definition by id. No-op if already gone. */
+export async function deleteCustomHarness(id: string): Promise<void> {
+  await invokeTauri<void>("delete_custom_harness", { id });
 }
 
 export async function installAcpRuntime(
@@ -1123,9 +937,8 @@ export type RuntimeFileConfigSubset = {
 };
 
 /**
- * Get the file-layer config for a runtime so dialogs can show
- * "Set in goose config" instead of surfacing a false required-field marker.
- * Returns `null` when the runtime has no config file or it cannot be parsed.
+ * Get the file-layer config for a runtime so dialogs can show "Set in goose config" instead of
+ * surfacing a false required-field marker. Returns `null` when unavailable or unparseable.
  */
 export async function getRuntimeFileConfig(
   runtimeId: string,
@@ -1139,13 +952,9 @@ export async function getRuntimeFileConfig(
 }
 
 /**
- * Return the key names of all non-empty baked build env vars.
- *
- * Internal (Block) builds bake provider credentials into the binary at compile
- * time. This returns the *key names only* — never the values — so dialogs can
- * treat them as satisfied without exposing secrets to the frontend.
- *
- * OSS builds return an empty array (no baked env).
+ * Return the key names of all non-empty baked build env vars. Internal (Block) builds bake
+ * provider credentials into the binary at compile time; this returns *key names only* (never
+ * values) so dialogs treat them as satisfied without exposing secrets. OSS builds return [].
  */
 export async function getBakedBuildEnvKeys(): Promise<string[]> {
   return invokeTauri<string[]>("get_baked_build_env_keys");
@@ -1156,7 +965,7 @@ export async function getBakedBuildEnvKeys(): Promise<string[]> {
  *
  * The value is already masked in Rust for secret keys (keys not in the
  * explicit safe-to-reveal allowlist: `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL`,
- * `DATABRICKS_HOST`, `DATABRICKS_MODEL`). Non-allowlisted keys have their
+ * `DATABRICKS_HOST`, `DATABRICKS_MODEL`, `DATABRICKS_MODEL_FILTER`). Non-allowlisted keys have their
  * values replaced with `••••••`. Non-secret values are shown as-is.
  * Empty-value keys are filtered out.
  */
@@ -1227,8 +1036,6 @@ export async function nip44DecryptFromSelf(
   return invokeTauri<string>("nip44_decrypt_from_self", { ciphertext });
 }
 
-// ── NIP-AB device pairing ───────────────────────────────────────────────────
-
 export async function startPairing(): Promise<string> {
   return invokeTauri<string>("start_pairing");
 }
@@ -1239,20 +1046,6 @@ export async function confirmPairingSas(): Promise<void> {
 
 export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
-}
-
-export async function applyWorkspace(
-  relayUrl: string,
-  nsec?: string,
-  token?: string,
-  reposDir?: string,
-): Promise<void> {
-  await invokeTauri("apply_workspace", {
-    relayUrl,
-    nsec: nsec ?? null,
-    token: token ?? null,
-    reposDir: reposDir ?? null,
-  });
 }
 
 // Validate a candidate repos dir without mutating the filesystem. Rejects

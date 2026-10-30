@@ -2,6 +2,7 @@ import * as React from "react";
 
 const BOUNDARY_EPSILON_PX = 1;
 const CONVERSATION_SCROLL_SELECTOR = "[data-buzz-conversation-scroll]";
+const TERMINAL_SUBSTRATE_SELECTOR = '[data-terminal-owner="terminal"]';
 const SCROLLABLE_OVERFLOW_VALUES = new Set(["auto", "scroll", "overlay"]);
 
 function isHTMLElement(value: EventTarget | null): value is HTMLElement {
@@ -80,8 +81,10 @@ function isConversationScroller(element: HTMLElement) {
  * remain; every other boundary — including all horizontal ones — is locked and
  * cannot chain to the viewport.
  */
-export function useWebviewScrollBoundaryLock() {
+export function useWebviewScrollBoundaryLock(enabled = true) {
   React.useEffect(() => {
+    if (!enabled) return;
+
     function handleWheel(event: WheelEvent) {
       if (event.defaultPrevented || event.ctrlKey) {
         return;
@@ -94,12 +97,14 @@ export function useWebviewScrollBoundaryLock() {
 
       const path = event.composedPath();
       let firstScrollable: HTMLElement | null = null;
+      let targetsTerminal = false;
 
       for (const target of path) {
         if (!isHTMLElement(target)) {
           continue;
         }
 
+        targetsTerminal ||= target.matches(TERMINAL_SUBSTRATE_SELECTOR);
         const scrollableY = deltaY !== 0 && isScrollableY(target);
         const scrollableX = deltaX !== 0 && isScrollableX(target);
         if (!scrollableY && !scrollableX) {
@@ -113,6 +118,13 @@ export function useWebviewScrollBoundaryLock() {
         ) {
           return;
         }
+      }
+
+      // Custom terminal scrollback consumes vertical wheel gestures without a
+      // native scroll container, so it must not be mistaken for dead space.
+      // Predominantly horizontal gestures remain locked below.
+      if (targetsTerminal && Math.abs(deltaY) >= Math.abs(deltaX)) {
+        return;
       }
 
       // Only the vertical elastic affordance of conversation scrollers is
@@ -137,5 +149,5 @@ export function useWebviewScrollBoundaryLock() {
     return () => {
       window.removeEventListener("wheel", handleWheel, { capture: true });
     };
-  }, []);
+  }, [enabled]);
 }

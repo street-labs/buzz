@@ -15,12 +15,13 @@ import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import {
   hasSameMessageAuthor,
   isWithinGroupingWindow,
+  startsNewMessageGroup,
 } from "@/features/messages/lib/messageGrouping";
 import { KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
 
 /**
  * One renderable row in the flattened timeline. Dividers carry no message and
- * never appear in the index map; the three message-bearing kinds do.
+ * never appear in the index map; the message-bearing kinds do.
  */
 export type TimelineItem =
   // `headingTimestamp` (not a prebaked label) so the render still resolves
@@ -28,6 +29,11 @@ export type TimelineItem =
   | { kind: "day-divider"; key: string; headingTimestamp: number }
   | { kind: "unread-divider"; key: string }
   | { kind: "system"; key: string; entry: MainTimelineEntry }
+  | {
+      kind: "system-group";
+      key: string;
+      entries: MainTimelineEntry[];
+    }
   | {
       kind: "message";
       key: string;
@@ -57,6 +63,109 @@ function entryRenderKey(entry: MainTimelineEntry): string {
   return entry.message.renderKey ?? entry.message.id;
 }
 
+type MembershipChangePayload =
+  | { mode: "self-arrival"; target: string }
+  | { actor: string; mode: "addition"; target: string }
+  | { mode: "departure"; target: string };
+
+function parseMembershipChangePayload(
+  entry: MainTimelineEntry,
+): MembershipChangePayload | null {
+  if (entry.message.kind !== KIND_SYSTEM_MESSAGE) return null;
+
+  try {
+    const payload = JSON.parse(entry.message.body) as {
+      type?: unknown;
+      actor?: unknown;
+      target?: unknown;
+    };
+    if (payload.type === "member_left" && typeof payload.actor === "string") {
+      const target = payload.actor.trim().toLowerCase();
+      return target ? { mode: "departure", target } : null;
+    }
+    if (
+      payload.type !== "member_joined" ||
+      typeof payload.actor !== "string" ||
+      typeof payload.target !== "string"
+    ) {
+      return null;
+    }
+
+    const actor = payload.actor.trim().toLowerCase();
+    const target = payload.target.trim().toLowerCase();
+    if (!actor || !target) return null;
+    return actor === target
+      ? { mode: "self-arrival", target }
+      : { actor, mode: "addition", target };
+  } catch {
+    return null;
+  }
+}
+
+function membershipChangesCanGroup(
+  first: MembershipChangePayload,
+  second: MembershipChangePayload,
+): boolean {
+  if (second.mode === "departure") {
+    return first.mode === "self-arrival" && first.target === second.target;
+  }
+  return first.mode !== "departure";
+}
+
+/**
+ * Membership groups are anchored from their newest entry so prepending older
+ * history cannot repartition the rows that are already loaded. Their key is
+ * likewise the newest entry's key: extending the oldest visible group changes
+ * its contents, but not its identity or the virtual list's existing key suffix.
+ *
+ * Compatible membership activities stay together while they are contiguous.
+ * Arrival cohorts are actor-neutral even when self-joins and additions mix, but
+ * one or more equivalent self-joins followed by that member leaving remain a
+ * single lifecycle summary — every contiguous self-arrival of the departing
+ * member is absorbed, since the relay re-emits `member_joined` on each
+ * PUT_USER. `buildGroupedMembershipPayload` must describe every group this
+ * emits; `membershipGroupPayload.test.mjs` pins that with a matrix invariant.
+ * Each adjacent event must fall within the one-hour activity window, so
+ * uninterrupted activity can extend beyond an hour overall.
+ */
+function buildMembershipGroups(
+  entries: readonly MainTimelineEntry[],
+  barrierIndexes: ReadonlySet<number>,
+): Map<number, MainTimelineEntry[]> {
+  const groups = new Map<number, MainTimelineEntry[]>();
+
+  for (let end = entries.length - 1; end >= 0; ) {
+    const newestEntry = entries[end];
+    const newestPayload = parseMembershipChangePayload(newestEntry);
+    if (!newestPayload) {
+      end -= 1;
+      continue;
+    }
+
+    let start = end;
+    while (start > 0) {
+      const candidate = entries[start - 1];
+      const nextEntry = entries[start];
+      const candidatePayload = parseMembershipChangePayload(candidate);
+      if (
+        barrierIndexes.has(start) ||
+        !candidatePayload ||
+        !membershipChangesCanGroup(candidatePayload, newestPayload) ||
+        newestEntry.message.createdAt < candidate.message.createdAt ||
+        nextEntry.message.createdAt - candidate.message.createdAt > 60 * 60
+      ) {
+        break;
+      }
+      start -= 1;
+    }
+
+    if (start < end) groups.set(start, entries.slice(start, end + 1));
+    end = start - 1;
+  }
+
+  return groups;
+}
+
 /**
  * Walks the (already top-level-filtered) entries once, emitting a day-divider
  * at each calendar-day boundary and an unread-divider above the first unread
@@ -78,6 +187,17 @@ export function buildTimelineItems(
     buildDayGroupBoundaries(entries.map((entry) => entry.message)).map(
       (boundary: DayGroupBoundary) => [boundary.startIndex, boundary] as const,
     ),
+  );
+  const membershipBarrierIndexes = new Set(dayBoundariesByStartIndex.keys());
+  if (firstUnreadMessageId) {
+    const unreadIndex = entries.findIndex(
+      (entry) => entry.message.id === firstUnreadMessageId,
+    );
+    if (unreadIndex > 0) membershipBarrierIndexes.add(unreadIndex);
+  }
+  const membershipGroupsByStartIndex = buildMembershipGroups(
+    entries,
+    membershipBarrierIndexes,
   );
 
   for (let i = 0; i < entries.length; i++) {
@@ -106,12 +226,31 @@ export function buildTimelineItems(
     if (kind === "system") {
       previousGroupEntry = null;
       previousMessageItemIndex = null;
+
+      const membershipGroup = membershipGroupsByStartIndex.get(i);
+      if (membershipGroup) {
+        const newestEntry = membershipGroup[membershipGroup.length - 1];
+        items.push({
+          kind: "system-group",
+          key: entryRenderKey(newestEntry),
+          entries: membershipGroup,
+        });
+        i += membershipGroup.length - 1;
+        continue;
+      }
+
       items.push({ kind, key: renderKey, entry });
       continue;
     }
 
+    // Pending rows render with their own header so the send status can sit
+    // beside the timestamp. Keep the timeline spacing and row estimate in
+    // that same standalone state until the send acknowledgement arrives.
     const isContinuation =
+      !message.pending &&
+      !startsNewMessageGroup(message) &&
       previousGroupEntry !== null &&
+      !previousGroupEntry.message.pending &&
       hasSameMessageAuthor(previousGroupEntry.message, message) &&
       isWithinGroupingWindow(
         previousGroupEntry.message.createdAt,

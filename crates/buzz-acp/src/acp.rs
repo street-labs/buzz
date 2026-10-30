@@ -8,17 +8,26 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+mod launch;
+
 use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::observer::{ObserverContext, ObserverHandle};
-use crate::usage::{TurnUsage, UsageTracker};
+use crate::usage::{
+    PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
+};
+
+#[path = "acp_frame_writer.rs"]
+mod frame_writer;
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+
+/// Package and binary name used by Buzz's Pi ACP fork.
+pub(crate) const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -89,8 +98,11 @@ pub enum AcpError {
     #[error("Idle timeout — no agent activity for {0:?}")]
     IdleTimeout(std::time::Duration),
 
-    #[error("Hard turn timeout exceeded")]
-    HardTimeout,
+    #[error("Hard turn timeout exceeded (silence {silence:?})")]
+    HardTimeout { silence: std::time::Duration },
+
+    #[error("Agent did not stop within {0:?} after cancellation")]
+    CancelDrainTimeout(std::time::Duration),
 
     #[error("Request timeout — agent did not respond within {0:?}")]
     Timeout(std::time::Duration),
@@ -118,6 +130,17 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     AcpError::AgentError { code, message }
 }
 
+fn build_initialize_params() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": 2,
+        "clientCapabilities": build_client_capabilities(),
+        "clientInfo": {
+            "name": "buzz-acp",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+    })
+}
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -125,8 +148,8 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
-    /// Write end of the agent's stdin pipe.
-    stdin: ChildStdin,
+    /// Sole stdin writer; None after an interrupted/failed frame closes it.
+    stdin: Option<ChildStdin>,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
     /// Uses `LinesCodec::new_with_max_length` to enforce MAX_LINE_SIZE at the
     /// read level — prevents OOM from rogue agents writing infinite non-newline bytes.
@@ -173,6 +196,17 @@ pub struct AcpClient {
     /// Other agents may leave this unset — readers must treat `None` as
     /// "no active run to steer into" and fall back to cancel+merge.
     active_run_id: Option<String>,
+    /// Whether the agent advertised `_meta.steering.supported: true` in its
+    /// `initialize` response, meaning it implements the cross-adapter
+    /// [`ACP_STEER_METHOD`] extension.
+    ///
+    /// Set once by [`initialize`](Self::initialize); `false` for agents that
+    /// omit the key. This is the **only** gate on writing an
+    /// [`ACP_STEER_METHOD`] request. It must never be replaced by error-code
+    /// probing: codex-acp answers unrecognized extension methods with `{}` —
+    /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
+    /// a delivered steer and drop the user's message from the queue.
+    steering_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -181,11 +215,213 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
-    /// Usage tracker — accumulates cumulative token counts from
-    /// `_goose/unstable/session/update` notifications and computes per-turn
-    /// deltas. Both goose and buzz-agent emit this notification; goose gates
-    /// on client capability advertisement, buzz-agent emits unconditionally.
+    /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
+    /// Per-turn prompt-response usage and Claude's optional cumulative cost.
+    standard_usage: StandardUsageTracker,
+    /// Known adapter identity for prompt-response usage mapping.
+    standard_adapter: Option<StandardAdapterKind>,
+    /// Ask Claude Code for summarized thinking on `session/new`. Opus omits
+    /// readable thinking unless asked; set only when the CLI the adapter runs
+    /// is new enough to accept `--thinking-display`.
+    claude_thinking_summaries: bool,
+}
+
+/// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
+/// collisions.  When both sides have an object for the same key, the merge recurses so
+/// unrelated nested keys from `base` are preserved.
+fn deep_merge(
+    base: &mut serde_json::Map<String, serde_json::Value>,
+    overlay: serde_json::Map<String, serde_json::Value>,
+) {
+    for (k, overlay_val) in overlay {
+        match base.get_mut(&k) {
+            Some(serde_json::Value::Object(base_obj))
+                if matches!(overlay_val, serde_json::Value::Object(_)) =>
+            {
+                // Both sides are objects — recurse to preserve unrelated nested keys.
+                if let serde_json::Value::Object(overlay_obj) = overlay_val {
+                    deep_merge(base_obj, overlay_obj);
+                }
+            }
+            _ => {
+                // Scalar, array, type mismatch, or new key — overlay wins.
+                base.insert(k, overlay_val);
+            }
+        }
+    }
+}
+
+/// Build the merged `CODEX_CONFIG` environment-variable value for a Codex agent spawn.
+///
+/// Returns `Some(json_string)` when `has_generated_codex_config` is true (Buzz injected a
+/// `CODEX_CONFIG` entry via `codex_network_env()`), `None` otherwise.
+///
+/// # Merge contract (when `has_generated_codex_config` is true)
+///
+/// 1. **Persona base** — the first `CODEX_CONFIG` value in `extra_env` is taken as
+///    the base object (all keys preserved, recursively).  When there is no persona entry,
+///    the generated entry serves as the base.
+/// 2. **Generated overlay** — all subsequent `CODEX_CONFIG` entries are deep-merged into
+///    the base so unrelated nested persona keys survive.
+/// 3. **Parent-env precedence** — if `parent_codex_config` is `Some`, its keys are
+///    deep-merged into the result (parent wins on colliding keys at every nesting level;
+///    unrelated keys from either side survive).
+/// 4. **Forced overlay** — `sandbox_workspace_write.network_access = true` is applied
+///    last so relay access is guaranteed regardless of operator / persona config.
+///
+/// When `has_generated_codex_config` is false, the function returns `None` and the
+/// caller handles any persona-supplied `CODEX_CONFIG` with ordinary operator-wins
+/// semantics (no merging, no sandbox widening).
+///
+/// # Errors
+///
+/// Returns `Err(AcpError::Protocol)` when `has_generated_codex_config` is true and any
+/// `CODEX_CONFIG` value is not valid JSON or is not a JSON object, or when
+/// `sandbox_workspace_write` is present but not an object after all merges.
+pub(crate) fn build_codex_config_env(
+    extra_env: &[(String, String)],
+    parent_codex_config: Option<&str>,
+    has_generated_codex_config: bool,
+) -> Result<Option<String>, AcpError> {
+    // Without an explicit Buzz-generated overlay signal, skip the merge entirely.
+    // Any persona CODEX_CONFIG is handled by the caller with operator-wins semantics.
+    if !has_generated_codex_config {
+        return Ok(None);
+    }
+
+    // Collect all CODEX_CONFIG entries from extra_env in order.
+    let codex_entries: Vec<&str> = extra_env
+        .iter()
+        .filter(|(k, _)| k == "CODEX_CONFIG")
+        .map(|(_, v)| v.as_str())
+        .collect();
+
+    if codex_entries.is_empty() {
+        // has_generated_codex_config is true but no entry in extra_env — shouldn't
+        // happen in practice, but treat as no-op rather than panic.
+        return Ok(None);
+    }
+
+    // Parse all entries; first one is the persona base (or the generated entry if no
+    // persona CODEX_CONFIG was set), rest are additional generated entries.
+    let mut parsed_entries: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+    for (i, raw) in codex_entries.iter().enumerate() {
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(obj)) => parsed_entries.push(obj),
+            Ok(_) => {
+                let source = if i == 0 { "persona" } else { "generated" };
+                return Err(AcpError::Protocol(format!(
+                    "CODEX_CONFIG {source} value is valid JSON but not an object"
+                )));
+            }
+            Err(e) => {
+                let source = if i == 0 { "persona" } else { "generated" };
+                return Err(AcpError::Protocol(format!(
+                    "CODEX_CONFIG {source} value is not valid JSON: {e}"
+                )));
+            }
+        }
+    }
+
+    // Start from first entry, deep-merge remaining entries.
+    let mut base = parsed_entries.remove(0);
+    for overlay in parsed_entries {
+        deep_merge(&mut base, overlay);
+    }
+
+    // Deep-merge parent env (parent wins on colliding keys at every nesting level).
+    if let Some(parent_raw) = parent_codex_config {
+        match serde_json::from_str::<serde_json::Value>(parent_raw) {
+            Ok(serde_json::Value::Object(parent_obj)) => {
+                deep_merge(&mut base, parent_obj);
+            }
+            Ok(_) => {
+                return Err(AcpError::Protocol(
+                    "CODEX_CONFIG in parent environment is valid JSON but not an object".into(),
+                ));
+            }
+            Err(e) => {
+                return Err(AcpError::Protocol(format!(
+                    "CODEX_CONFIG in parent environment is not valid JSON: {e}"
+                )));
+            }
+        }
+    }
+
+    // Force sandbox_workspace_write.network_access = true (our invariant, always wins).
+    let sws_entry = base
+        .entry("sandbox_workspace_write")
+        .or_insert_with(|| serde_json::json!({}));
+    match sws_entry {
+        serde_json::Value::Object(sws_obj) => {
+            sws_obj.insert("network_access".to_string(), serde_json::Value::Bool(true));
+        }
+        other => {
+            return Err(AcpError::Protocol(format!(
+                "CODEX_CONFIG sandbox_workspace_write is not an object (got {}); \
+                 cannot set network_access=true",
+                other
+            )));
+        }
+    }
+
+    Ok(Some(serde_json::Value::Object(base).to_string()))
+}
+
+/// goose's non-standard mid-turn steer method. Requires `expectedRunId`, so it
+/// is only usable once a `session_info_update` has supplied
+/// `_meta.goose.activeRunId`. Emitted by goose and buzz-agent only.
+const GOOSE_STEER_METHOD: &str = "_goose/unstable/session/steer";
+
+/// The cross-adapter mid-turn steer method, shipped by claude-agent-acp
+/// (`src/acp-agent.ts:200`) and codex-acp (`src/AcpExtensions.ts:11`).
+/// Params are `{sessionId, prompt}` — no run id — and the result is
+/// `{outcome}`. Gated on [`AcpClient::steering_supported`].
+const ACP_STEER_METHOD: &str = "_session/steering";
+
+/// `outcome` value meaning the steer was applied to the turn Buzz is waiting
+/// on, which therefore keeps running.
+const STEER_OUTCOME_INJECTED: &str = "injected";
+
+/// `outcome` value meaning the turn Buzz was steering had already finished, so
+/// the adapter began a fresh turn carrying the message. Still a delivery
+/// success, but the awaited turn is over — see the steer-response arm for why
+/// this must not renew the hard deadline.
+const STEER_OUTCOME_STARTED_NEW_TURN: &str = "startedNewTurn";
+
+/// Which wire method carried an in-flight steer request, recorded so the
+/// response arm decodes the shape that method actually returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerTransport {
+    /// [`GOOSE_STEER_METHOD`] — any success result is a delivered steer.
+    Goose,
+    /// [`ACP_STEER_METHOD`] — success carries an `outcome` that must be
+    /// positively recognized before the steer counts as delivered.
+    AcpExtension,
+}
+
+fn build_client_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        // Signal to ACP adapters that Buzz can hand users to terminal-native
+        // auth flows. Adapters decide which auth methods to expose; Buzz does
+        // not hardcode vendor login commands from this capability.
+        "auth": {
+            "terminal": true
+        },
+        // Signal to goose that we handle `_goose/unstable/session/update`
+        // notifications. Without this the custom notification is suppressed
+        // on goose's side and usage data is never emitted.
+        "_meta": {
+            "goose": {
+                "customNotifications": true
+            },
+            // Non-standard extension used by claude-agent-acp to advertise the
+            // exact terminal login argv for subscription auth. Unknown `_meta`
+            // keys are ignored by other adapters.
+            "terminal-auth": true
+        }
+    })
 }
 
 impl AcpClient {
@@ -220,17 +456,46 @@ impl AcpClient {
 
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
     ///
+    /// `has_generated_codex_config` must be true when `codex_network_env()` successfully
+    /// injected a `CODEX_CONFIG` entry into `extra_env`.  The spawn path uses it to
+    /// trigger the recursive merge + forced `network_access=true` in
+    /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
+    ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
     pub async fn spawn(
         command: &str,
         args: &[String],
         extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+    ) -> Result<Self, AcpError> {
+        Self::spawn_with_env(command, args, extra_env, has_generated_codex_config, &[]).await
+    }
+
+    /// Spawn with authoritative launch environment overrides. Unlike persona
+    /// defaults, these values take precedence over the inherited environment.
+    pub(crate) async fn spawn_with_env(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        launch_env: &[(String, String)],
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        // A launch prefix may change the CLI or environment the adapter sees,
+        // so the version check below could inspect the wrong binary.
+        let launch_prefixed = std::env::var_os(launch::PREFIX_ENV).is_some();
+        let mut cmd = launch::command(command, args)?;
+        if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
+            if !args.iter().any(|arg| arg == "--") {
+                cmd.arg("--");
+            }
+            // Desktop launches buzz-acp in the Buzz nest; adapters inherit that
+            // workspace. Keep managed skills tied to launch CWD across sessions.
+            cmd.arg("--skill")
+                .arg(std::env::current_dir()?.join(".agents/skills"));
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so agent logs are visible in the harness terminal.
             .stderr(Stdio::inherit())
@@ -239,10 +504,75 @@ impl AcpClient {
             .kill_on_drop(true);
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
-        // Only injected if not already set in parent env (operator precedence).
-        for (key, value) in extra_env {
-            if std::env::var(key).is_err() {
+        // For most keys, operator precedence wins: skip injection if already set
+        // in the parent environment.
+        //
+        // CODEX_CONFIG is handled specially via build_codex_config_env:
+        //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
+        //     recursively and force network_access=true.
+        //   • has_generated_codex_config=false: return None; any persona-supplied
+        //     CODEX_CONFIG falls through to the normal operator-wins loop below.
+        let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
+        let parent_codex_config = if has_generated_codex_config && has_codex_config {
+            std::env::var("CODEX_CONFIG").ok()
+        } else {
+            None
+        };
+        let codex_config_value = build_codex_config_env(
+            extra_env,
+            parent_codex_config.as_deref(),
+            has_generated_codex_config,
+        )?;
+        // When the merge path was not taken (None returned), any persona CODEX_CONFIG
+        // entry falls through to the standard operator-wins treatment below.
+        let codex_merge_active = codex_config_value.is_some();
+
+        // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
+        // Applied first so both persona `extra_env` (below, via `Command::env`
+        // key replacement) and inherited parent env (via the parent-presence
+        // check) override them.
+        for &(key, value) in crate::config::default_agent_env(command) {
+            if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
+            }
+        }
+
+        for (key, value) in extra_env {
+            if key == "CODEX_CONFIG" && codex_merge_active {
+                // Handled by build_codex_config_env; skip here to avoid double-setting.
+                continue;
+            }
+            if std::env::var_os(key).is_none() {
+                cmd.env(key, value);
+            }
+        }
+        if let Some(merged) = codex_config_value {
+            cmd.env("CODEX_CONFIG", merged);
+        }
+
+        // The harness composes the entire Git config block once. It must replace
+        // inherited counts/PATH rather than mixing two independently indexed blocks.
+        for (name, value) in extra_env
+            .iter()
+            .filter(|(name, _)| crate::git::is_managed_env(name))
+        {
+            cmd.env(name, value);
+        }
+        // Git applies this older injection channel after GIT_CONFIG_COUNT.
+        // Keeping it would let an ambient user.name or signing setting win
+        // over the harness-owned agent identity in native shells.
+        cmd.env_remove("GIT_CONFIG_PARAMETERS");
+        cmd.env_remove("NOSTR_PRIVATE_KEY");
+        if extra_env.iter().any(|(name, _)| name == "GIT_CONFIG_COUNT") {
+            // Native shells inherit these overrides, while buzz-agent clears
+            // them for MCP. Let both paths use the harness's agent identity.
+            for name in [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+            ] {
+                cmd.env_remove(name);
             }
         }
 
@@ -252,7 +582,29 @@ impl AcpClient {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        let mut child = cmd.spawn()?;
+        // Suppress the console window that Windows otherwise allocates for every
+        // console-subsystem child process spawned from a GUI/non-console parent.
+        configure_no_window(&mut cmd);
+
+        let standard_adapter =
+            match crate::config::normalize_agent_command_identity(command).as_str() {
+                "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => {
+                    Some(StandardAdapterKind::Claude)
+                }
+                "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
+                _ => None,
+            };
+        cmd.envs(launch_env.iter().cloned());
+        cmd.env_remove(launch::PREFIX_ENV);
+        let claude_thinking_summaries = standard_adapter == Some(StandardAdapterKind::Claude)
+            && !launch_prefixed
+            && claude_cli_accepts_thinking_display(&cmd).await;
+        let mut child = cmd.spawn().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to spawn {:?}: {error}", cmd.as_std().get_program()),
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -265,7 +617,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
             pending_permission_id: None,
@@ -276,8 +628,12 @@ impl AcpClient {
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
             active_run_id: None,
+            steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            standard_usage: StandardUsageTracker::default(),
+            standard_adapter,
+            claude_thinking_summaries,
         })
     }
 
@@ -318,50 +674,86 @@ impl AcpClient {
     ///
     /// Must be called exactly once, before any other ACP method.
     /// The caller may inspect `agentCapabilities` in the returned value.
+    ///
+    /// Records `_meta.steering.supported` into
+    /// [`steering_supported`](Self::steering_supported) so the read loop's steer
+    /// arm can choose [`ACP_STEER_METHOD`] for adapters that implement it.
+    /// Parsed here rather than at each call site so no caller can forget it.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
-        let params = serde_json::json!({
-            "protocolVersion": 2,
-            "clientCapabilities": {
-                // Signal to goose that we handle `_goose/unstable/session/update`
-                // notifications. Without this the custom notification is suppressed
-                // on goose's side and usage data is never emitted.
-                "_meta": {
-                    "goose": {
-                        "customNotifications": true
-                    }
-                }
-            },
-            "clientInfo": {
-                "name": "buzz-acp",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
+        let params = build_initialize_params();
         let result = self.send_request("initialize", params).await?;
+        self.steering_supported = result
+            .pointer("/_meta/steering/supported")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Send the ACP `authenticate` request for an adapter-advertised method.
+    pub async fn authenticate(&mut self, method_id: &str) -> Result<serde_json::Value, AcpError> {
+        let params = serde_json::json!({
+            "methodId": method_id,
+        });
+        self.send_request("authenticate", params).await
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
     ///
     /// `cwd` must be an absolute path. `mcp_servers` may be empty.
-    /// `system_prompt` is included in the request when `Some` — agents that
-    /// support the field will use it; others ignore unknown fields per JSON-RPC.
+    ///
+    /// `system_prompt` controls how the prompt text is delivered:
+    ///
+    /// - `None` — no system-prompt field in the request (legacy framing).
+    /// - `Some(SystemPromptTransport::Field(text))` — bare `systemPrompt` field
+    ///   (ACP protocol v2, buzz-agent; goose unused).
+    /// - `Some(SystemPromptTransport::PiMeta(text))` — `_meta.systemPrompt`
+    ///   as a replacement string for the Buzz pi-acp fork.
+    /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
+    ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
+    ///
+    /// `session_title` rides in `_meta.sessionTitle` when `Some`, and a Claude
+    /// CLI that supports it gets `_meta.claudeCode.options.extraArgs` asking
+    /// for summarized thinking. These and the metadata prompt transports merge
+    /// into a single object; with none of them, `_meta` is omitted entirely,
+    /// since adapters may distinguish an absent member from a null one.
+    ///
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
     /// to pull model info from the raw result.
     pub async fn session_new_full(
         &mut self,
         cwd: &str,
         mcp_servers: Vec<McpServer>,
-        system_prompt: Option<&str>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
         });
-        if let Some(sp) = system_prompt {
-            params["systemPrompt"] = serde_json::Value::String(sp.to_owned());
+        match system_prompt {
+            Some(SystemPromptTransport::Field(sp)) => {
+                params["systemPrompt"] = serde_json::Value::String(sp.to_owned());
+            }
+            Some(SystemPromptTransport::PiMeta(sp)) => {
+                params["_meta"]["systemPrompt"] = serde_json::Value::String(sp.to_owned());
+            }
+            Some(SystemPromptTransport::ClaudeMeta(sp)) => {
+                // Merge into _meta so sessionTitle (set below) is not clobbered.
+                params["_meta"]["systemPrompt"] = serde_json::json!({ "append": sp });
+            }
+            None => {}
+        }
+        if let Some(title) = session_title {
+            // Merge — _meta may already carry a system prompt from an adapter extension.
+            params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if self.claude_thinking_summaries {
+            // Merge — claude-agent-acp spreads these into the CLI's argv.
+            params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
+                serde_json::Value::String("summarized".to_owned());
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -383,12 +775,31 @@ impl AcpClient {
         &mut self,
         cwd: &str,
         mcp_servers: Vec<McpServer>,
-        system_prompt: Option<&str>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
     ) -> Result<String, AcpError> {
         Ok(self
-            .session_new_full(cwd, mcp_servers, system_prompt)
+            .session_new_full(cwd, mcp_servers, system_prompt, session_title)
             .await?
             .session_id)
+    }
+
+    /// Replace Goose's native system prompt after `session/new`.
+    pub async fn session_set_goose_system_prompt(
+        &mut self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.send_request(
+            "_goose/unstable/session/system-prompt/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "mode": "set",
+                "key": "buzz",
+                "text": text,
+            }),
+        )
+        .await
     }
 
     /// Send `session/set_config_option` (stable ACP path).
@@ -460,6 +871,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.standard_usage.begin_turn(session_id);
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -480,7 +892,13 @@ impl AcpClient {
         }
 
         let result = self
-            .read_until_response_with_idle_timeout(session_id, id, idle_timeout, hard_deadline)
+            .read_until_response_with_idle_timeout(
+                session_id,
+                id,
+                idle_timeout,
+                hard_deadline,
+                max_duration,
+            )
             .await;
 
         // On timeout errors, leave current_hard_deadline set so cancel_with_cleanup
@@ -490,7 +908,7 @@ impl AcpClient {
                 self.last_prompt_id = None;
                 self.current_hard_deadline = None;
             }
-            Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout) => {
+            Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout { .. }) => {
                 // Leave last_prompt_id and current_hard_deadline set —
                 // caller will invoke cancel_with_cleanup.
             }
@@ -499,7 +917,7 @@ impl AcpClient {
                 self.current_hard_deadline = None;
             }
         }
-        self.parse_stop_reason(&result?)
+        self.parse_prompt_response(session_id, &result?)
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -536,18 +954,33 @@ impl AcpClient {
         self.active_run_id.as_deref()
     }
 
-    /// Consume and return the per-turn usage record computed from the most
-    /// recent `_goose/unstable/session/update` notification.
+    /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
+    /// `initialize` time (`_meta.steering.supported`).
     ///
-    /// Returns `None` if no usage update arrived since the last call (i.e.
-    /// the harness did not emit one for this turn, or this is not a goose
-    /// agent). Must be called at most once per turn; subsequent calls return
-    /// `None` until the next `usage_update` notification is recorded.
-    ///
-    /// Intended for consumption by `publish_agent_turn_metric` in `pool.rs` to
-    /// publish a kind 44200 NIP-AM event.
+    /// The read loop's steer arm reads the field directly; this accessor exists
+    /// for the supervisor's post-initialize log line.
+    pub fn steering_supported(&self) -> bool {
+        self.steering_supported
+    }
+
+    /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
+    /// exclusive cumulative path; standard ACP prompt usage is used only when
+    /// goose emitted nothing for this turn.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
-        self.goose_usage.take()
+        let goose_usage = self.goose_usage.take();
+        let standard_usage = self.standard_usage.take();
+        goose_usage.or(standard_usage)
+    }
+
+    /// Notify the usage tracker that buzz-acp just spawned a new session.
+    ///
+    /// Seeds a zero baseline so the first usage notification for `session_id`
+    /// produces `delta_reliable: true` (turn delta == cumulative from zero).
+    /// Must be called only when buzz-acp created the session via `session/new`;
+    /// never when attaching to a pre-existing session.
+    pub(crate) fn notify_session_spawned(&mut self, session_id: &str) {
+        self.goose_usage.seed_zero_baseline(session_id);
+        self.standard_usage.seed_zero_baseline(session_id);
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -638,6 +1071,12 @@ impl AcpClient {
     /// cancellation look broken. This variant gives the agent a short chance to
     /// acknowledge cancellation, then returns a timeout so the caller can respawn
     /// the agent process and actually stop the work.
+    ///
+    /// The `grace` window is a cleanup deadline, not the turn's real max-turn
+    /// wall clock — a bounded drain that expires maps to
+    /// [`AcpError::CancelDrainTimeout`], never [`AcpError::HardTimeout`], so
+    /// callers can distinguish "agent didn't stop in time" from a genuine
+    /// configured hard-cap breach.
     pub async fn cancel_with_cleanup_grace(
         &mut self,
         session_id: &str,
@@ -645,8 +1084,13 @@ impl AcpClient {
     ) -> Result<StopReason, AcpError> {
         let _ = self.current_hard_deadline.take();
         let hard_deadline = tokio::time::Instant::now() + grace;
-        self.cancel_with_cleanup_until(session_id, hard_deadline)
+        match self
+            .cancel_with_cleanup_until(session_id, hard_deadline)
             .await
+        {
+            Err(AcpError::HardTimeout { .. }) => Err(AcpError::CancelDrainTimeout(grace)),
+            other => other,
+        }
     }
 
     async fn cancel_with_cleanup_until(
@@ -684,15 +1128,19 @@ impl AcpClient {
         // The separate hard_deadline bounds agents that keep producing output
         // but ignore cancellation.
         let cleanup_idle = std::time::Duration::from_secs(30);
+        let remaining = hard_deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
         let result = self
             .read_until_response_with_idle_timeout(
                 session_id,
                 prompt_id,
                 cleanup_idle,
                 hard_deadline,
+                remaining,
             )
             .await?;
-        self.parse_stop_reason(&result)
+        self.parse_prompt_response(session_id, &result)
     }
 
     /// Serialize `value` as a single NDJSON line and flush to the agent's stdin.
@@ -702,12 +1150,10 @@ impl AcpClient {
     async fn write_ndjson(&mut self, value: &serde_json::Value) -> Result<(), AcpError> {
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
-        tokio::time::timeout(WRITE_TIMEOUT, async {
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.write_all(b"\n").await?;
-            self.stdin.flush().await?;
-            Ok::<(), std::io::Error>(())
-        })
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            frame_writer::write_frame(&mut self.stdin, line.as_bytes()),
+        )
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
@@ -952,6 +1398,7 @@ impl AcpClient {
         expected_id: u64,
         idle_timeout: std::time::Duration,
         hard_deadline: tokio::time::Instant,
+        max_duration: std::time::Duration,
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
 
@@ -961,16 +1408,23 @@ impl AcpClient {
         // so the ack_tx oneshot is never leaked silently).
         let mut steer_rx = self.steer_rx.take();
 
-        // Tracks the in-flight steer write: `(request_id, ack_tx)`. While
-        // `Some`, the steer arm is gated off so we don't stack writes,
+        // Tracks the in-flight steer write: `(request_id, transport, ack_tx)`.
+        // While `Some`, the steer arm is gated off so we don't stack writes,
         // and a response matching `id` is routed to the ack_tx instead
-        // of being treated as the prompt result. Drained on every return
-        // path with `PromptCompletedNeutral` so callers are never left
-        // hanging.
-        let mut pending_steer: Option<(u64, tokio::sync::oneshot::Sender<crate::pool::SteerAck>)> =
-            None;
+        // of being treated as the prompt result. `transport` records which
+        // method was written so the response arm decodes the result shape
+        // that method actually returns. Drained on every return path with
+        // `PromptCompletedNeutral` so callers are never left hanging.
+        let mut pending_steer: Option<(
+            u64,
+            SteerTransport,
+            tokio::sync::oneshot::Sender<crate::pool::SteerAck>,
+        )> = None;
 
-        let mut idle_deadline = Instant::now() + idle_timeout;
+        let now = Instant::now();
+        let mut idle_deadline = now + idle_timeout;
+        let mut hard_deadline = hard_deadline;
+        let mut last_activity_at = now;
 
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
@@ -990,7 +1444,7 @@ impl AcpClient {
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
             if Instant::now() >= next_deadline {
-                if let Some((_, ack_tx)) = pending_steer.take() {
+                if let Some((_, _, ack_tx)) = pending_steer.take() {
                     // Prompt is timing out — release the withheld event via
                     // PromptCompletedNeutral (no fallback signal: there is
                     // no in-flight turn to signal once we return, and
@@ -1001,8 +1455,9 @@ impl AcpClient {
                     tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
                     return Err(AcpError::IdleTimeout(idle_timeout));
                 } else {
-                    tracing::warn!("hard turn timeout exceeded");
-                    return Err(AcpError::HardTimeout);
+                    let silence = Instant::now().saturating_duration_since(last_activity_at);
+                    tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
+                    return Err(AcpError::HardTimeout { silence });
                 }
             }
 
@@ -1024,39 +1479,64 @@ impl AcpClient {
                         None => None,
                     }
                 }, if pending_steer.is_none() => {
-                    // Selected: build steer params at write time using the
-                    // lexical `session_id` and the freshest `active_run_id`.
+                    // Selected: choose the steer transport and build its
+                    // params at write time using the lexical `session_id`
+                    // and the freshest `active_run_id`.
                     //
                     // `active_run_id` is updated by `session/update`
                     // notifications inside this very loop; reading it here
                     // (rather than snapshotting at dispatch) guarantees the
                     // value matches what goose's run-id check will compare
-                    // against. If it's `None`, no `session/update` has
-                    // arrived yet so we cannot form a valid `expectedRunId`
-                    // — ack `ExpectedRunIdMissing` and drop the request
-                    // without writing anything. The main loop maps this to
-                    // the universal cancel+merge `Steer` fallback.
-                    match self.active_run_id.clone() {
+                    // against.
+                    //
+                    // Transport precedence:
+                    //   Some(run_id)              → GOOSE_STEER_METHOD. goose
+                    //     wins whenever a run id exists: `expectedRunId` is
+                    //     strictly more precise about *which* run is steered.
+                    //   None + steering_supported → ACP_STEER_METHOD, the
+                    //     cross-adapter extension (claude-agent-acp,
+                    //     codex-acp), which takes no run id.
+                    //   None + !steering_supported → write nothing and ack
+                    //     `ExpectedRunIdMissing`; the main loop maps this to
+                    //     the universal cancel+merge `Steer` fallback.
+                    //
+                    // The capability flag is the ONLY gate on writing
+                    // ACP_STEER_METHOD. Probing an unknown method is unsafe:
+                    // codex-acp answers unrecognized extension methods with
+                    // `{}` — a JSON-RPC success — which would be read as a
+                    // delivered steer and silently drop the user's message.
+                    let prompt_block_refs: Vec<&str> =
+                        req.prompt_blocks.iter().map(String::as_str).collect();
+                    let selected = match (&self.active_run_id, self.steering_supported) {
+                        (Some(run_id), _) => Some((
+                            SteerTransport::Goose,
+                            GOOSE_STEER_METHOD,
+                            build_goose_steer_params(session_id, run_id, &prompt_block_refs),
+                        )),
+                        (None, true) => Some((
+                            SteerTransport::AcpExtension,
+                            ACP_STEER_METHOD,
+                            build_acp_steer_params(session_id, &prompt_block_refs),
+                        )),
+                        (None, false) => None,
+                    };
+                    match selected {
                         None => {
                             tracing::warn!(
-                                "goose-native steer: no active_run_id at write time \
-                                 (no session/update seen yet) — falling back to cancel+merge"
+                                "steer: no active_run_id and agent did not advertise \
+                                 {ACP_STEER_METHOD} — falling back to cancel+merge"
                             );
                             let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
                                 crate::pool::SteerError::ExpectedRunIdMissing,
                             ));
                         }
-                        Some(run_id) => {
+                        Some((transport, method, params)) => {
                             let id = self.next_id;
                             self.next_id += 1;
-                            let prompt_block_refs: Vec<&str> =
-                                req.prompt_blocks.iter().map(String::as_str).collect();
-                            let params =
-                                build_steer_params(session_id, &run_id, &prompt_block_refs);
                             let msg = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
-                                "method": "_goose/unstable/session/steer",
+                                "method": method,
                                 "params": params,
                             });
                             tracing::debug!(
@@ -1066,11 +1546,11 @@ impl AcpClient {
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
-                                    pending_steer = Some((id, req.ack_tx));
+                                    pending_steer = Some((id, transport, req.ack_tx));
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        "goose-native steer write failed: {e} — releasing withheld event"
+                                        "steer write failed ({method}): {e} — releasing withheld event"
                                     );
                                     let _ = req.ack_tx.send(crate::pool::SteerAck::Err(
                                         crate::pool::SteerError::Transport(e.to_string()),
@@ -1089,15 +1569,16 @@ impl AcpClient {
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
                     // round-trip when stdout is idle).
-                    if let Some((_, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     if idle_fires_first {
                         tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
                         return Err(AcpError::IdleTimeout(idle_timeout));
                     } else {
-                        tracing::warn!("hard turn timeout exceeded");
-                        return Err(AcpError::HardTimeout);
+                        let silence = Instant::now().saturating_duration_since(last_activity_at);
+                        tracing::warn!("hard turn timeout exceeded (silence {silence:?})");
+                        return Err(AcpError::HardTimeout { silence });
                     }
                 }
             };
@@ -1112,13 +1593,13 @@ impl AcpClient {
 
             match read_result {
                 None => {
-                    if let Some((_, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::AgentExited);
                 }
                 Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
-                    if let Some((_, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Protocol(
@@ -1126,7 +1607,7 @@ impl AcpClient {
                     ));
                 }
                 Some(Err(e)) => {
-                    if let Some((_, ack_tx)) = pending_steer.take() {
+                    if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
                     return Err(AcpError::Io(std::io::Error::other(e)));
@@ -1158,9 +1639,9 @@ impl AcpClient {
                     };
                     self.observe("acp_read", msg.clone());
 
-                    // Only reset the idle clock on lines that parse as valid JSON.
-                    // Malformed lines (skipped above) don't count as real agent activity.
-                    idle_deadline = Instant::now() + idle_timeout;
+                    let activity_now = Instant::now();
+                    idle_deadline = activity_now + idle_timeout;
+                    last_activity_at = activity_now;
 
                     // Steer response routing must come BEFORE the prompt
                     // response check: a steer response is a regular
@@ -1169,13 +1650,14 @@ impl AcpClient {
                     // share the `no method` guard.
                     if let Some(id) = msg.get("id") {
                         if msg.get("method").is_none() {
-                            if let Some((steer_id, _)) = pending_steer.as_ref() {
+                            if let Some((steer_id, _, _)) = pending_steer.as_ref() {
                                 if *id == serde_json::json!(*steer_id) {
                                     // Take the ack_tx out and route the
                                     // response. We do not return — keep
                                     // reading until the prompt response
                                     // arrives.
-                                    let (_, ack_tx) = pending_steer.take().expect("just checked");
+                                    let (_, transport, ack_tx) =
+                                        pending_steer.take().expect("just checked");
                                     let ack = if let Some(error) = msg.get("error") {
                                         let code = error
                                             .get("code")
@@ -1186,7 +1668,87 @@ impl AcpClient {
                                             crate::pool::SteerError::AgentError { code, message },
                                         )
                                     } else {
-                                        crate::pool::SteerAck::Success
+                                        // Success result. Whether it counts as
+                                        // a delivered steer — and whether the
+                                        // turn Buzz awaits is still running —
+                                        // depends on the transport.
+                                        let outcome = match transport {
+                                            // goose returns no outcome field;
+                                            // a success response means the
+                                            // steer landed in the live run.
+                                            SteerTransport::Goose => Some(STEER_OUTCOME_INJECTED),
+                                            // The outcome must be positively
+                                            // recognized. An unknown or absent
+                                            // value (codex-acp answers
+                                            // unrecognized ext methods with a
+                                            // bare `{}`) is a rejection, never
+                                            // a delivery — treating it as
+                                            // success would drop the event.
+                                            SteerTransport::AcpExtension => msg
+                                                .pointer("/result/outcome")
+                                                .and_then(|v| v.as_str())
+                                                .filter(|o| {
+                                                    *o == STEER_OUTCOME_INJECTED
+                                                        || *o == STEER_OUTCOME_STARTED_NEW_TURN
+                                                }),
+                                        };
+                                        match outcome {
+                                            Some(STEER_OUTCOME_STARTED_NEW_TURN) => {
+                                                // Delivered, but into a NEW
+                                                // turn: the one this read loop
+                                                // is awaiting had already
+                                                // finished. Renewing the hard
+                                                // deadline here would extend
+                                                // the clock on a settled turn,
+                                                // so leave it alone and let the
+                                                // prompt response land on its
+                                                // original budget.
+                                                tracing::info!(
+                                                    "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
+                                                     awaited turn had ended — hard deadline not renewed"
+                                                );
+                                                crate::pool::SteerAck::Success {
+                                                    session_id: session_id.to_owned(),
+                                                }
+                                            }
+                                            Some(_) => {
+                                                let renew_now = Instant::now();
+                                                let new_deadline = renew_now + max_duration;
+                                                if new_deadline > hard_deadline {
+                                                    hard_deadline = new_deadline;
+                                                    self.current_hard_deadline = Some(new_deadline);
+                                                    tracing::info!(
+                                                        "steer success: renewed hard deadline ({max_duration:?} from now)"
+                                                    );
+                                                }
+                                                crate::pool::SteerAck::Success {
+                                                    session_id: session_id.to_owned(),
+                                                }
+                                            }
+                                            None => {
+                                                // Report the raw string when
+                                                // there is one, so logs read
+                                                // `failed` not `"failed"`;
+                                                // fall back to the JSON for a
+                                                // non-string value.
+                                                let reported = match msg.pointer("/result/outcome")
+                                                {
+                                                    None => "<absent>".to_string(),
+                                                    Some(serde_json::Value::String(s)) => s.clone(),
+                                                    Some(other) => other.to_string(),
+                                                };
+                                                tracing::warn!(
+                                                    "steer rejected: {ACP_STEER_METHOD} returned \
+                                                     unrecognized outcome {reported} — releasing \
+                                                     withheld event for cancel+merge"
+                                                );
+                                                crate::pool::SteerAck::Err(
+                                                    crate::pool::SteerError::OutcomeRejected {
+                                                        outcome: reported,
+                                                    },
+                                                )
+                                            }
+                                        }
                                     };
                                     let _ = ack_tx.send(ack);
                                     continue;
@@ -1194,13 +1756,13 @@ impl AcpClient {
                             }
                             if *id == serde_json::json!(expected_id) {
                                 if let Some(error) = msg.get("error") {
-                                    if let Some((_, ack_tx)) = pending_steer.take() {
+                                    if let Some((_, _, ack_tx)) = pending_steer.take() {
                                         let _ = ack_tx
                                             .send(crate::pool::SteerAck::PromptCompletedNeutral);
                                     }
                                     return Err(agent_error_from_json(error));
                                 }
-                                if let Some((_, ack_tx)) = pending_steer.take() {
+                                if let Some((_, _, ack_tx)) = pending_steer.take() {
                                     let _ =
                                         ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                                 }
@@ -1214,11 +1776,10 @@ impl AcpClient {
                         match method {
                             "session/update" => {
                                 if self.handle_session_update(&msg) {
-                                    // Belt-and-suspenders — general reset already fired
-                                    // above, this is defense-in-depth in case the general
-                                    // reset is later narrowed.
+                                    let activity_now = Instant::now();
+                                    idle_deadline = activity_now + idle_timeout;
+                                    last_activity_at = activity_now;
                                     tracing::debug!("idle clock reset: tool call started");
-                                    idle_deadline = Instant::now() + idle_timeout;
                                 }
                             }
                             "_goose/unstable/session/update" => {
@@ -1260,7 +1821,10 @@ impl AcpClient {
     /// Takes `&mut self` (not `&self`) because some updates carry agent state
     /// the client must observe — notably goose's `session_info_update` with
     /// `_meta.goose.activeRunId`, which seeds [`active_run_id`](Self::active_run_id)
-    /// so callers can target `_goose/unstable/session/steer` at the correct run.
+    /// so the steer arm can target `_goose/unstable/session/steer` at the
+    /// correct run. Agents that never emit it (claude-agent-acp, codex-acp)
+    /// leave it `None` and are steered via `_session/steering` instead, which
+    /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
         let update = &msg["params"]["update"];
         let update_type = update
@@ -1357,12 +1921,40 @@ impl AcpClient {
                 }
                 false
             }
+            "usage_update" => {
+                self.handle_standard_usage_update(msg);
+                false
+            }
             "keepalive" => false,
             other => {
                 tracing::debug!(target: "acp::update", "session/update: {other}");
                 false
             }
         }
+    }
+
+    /// Record the standard ACP cumulative cost notification when emitted by
+    /// Claude. Unlike Goose's payload, `used`/`size` are context occupancy and
+    /// are intentionally not mapped to token accounting.
+    fn handle_standard_usage_update(&mut self, msg: &serde_json::Value) {
+        if self.standard_adapter != Some(StandardAdapterKind::Claude) {
+            return;
+        }
+        let session_id = match msg
+            .pointer("/params/sessionId")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(session_id) => session_id,
+            None => return,
+        };
+        let cost = match msg
+            .pointer("/params/update/cost/amount")
+            .and_then(serde_json::Value::as_f64)
+        {
+            Some(cost) => cost,
+            None => return,
+        };
+        self.standard_usage.record_cost(session_id, cost);
     }
 
     /// Parse a `_goose/unstable/session/update` notification and record the
@@ -1389,8 +1981,13 @@ impl AcpClient {
                     tracing::debug!(
                         target: "acp::usage",
                         session_id = %notif.session_id,
-                        input = payload.accumulated_input_tokens,
-                        output = payload.accumulated_output_tokens,
+                        input = ?payload.accumulated_input_tokens,
+                        output = ?payload.accumulated_output_tokens,
+                        // A subset of `input`, logged so downstream accounting can
+                        // price it at the provider's cached rate. Always emitted,
+                        // including as 0, so a parser can tell "no cache hits"
+                        // apart from "this build predates the field".
+                        cached = payload.accumulated_cached_input_tokens,
                         "goose usage update"
                     );
                     self.goose_usage.record(&notif.session_id, payload);
@@ -1491,6 +2088,28 @@ impl AcpClient {
         Ok(())
     }
 
+    /// Parse a completed prompt response and retain its optional per-turn usage.
+    fn parse_prompt_response(
+        &mut self,
+        session_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<StopReason, AcpError> {
+        let stop_reason = self.parse_stop_reason(result)?;
+        if let Some(adapter) = self.standard_adapter {
+            match serde_json::from_value::<PromptResponseUsage>(result["usage"].clone()) {
+                Ok(usage) => self
+                    .standard_usage
+                    .record_prompt_usage(session_id, usage, adapter),
+                Err(_) if result.get("usage").is_some() => tracing::debug!(
+                    target: "acp::usage",
+                    "session/prompt response contained malformed standard usage"
+                ),
+                Err(_) => {}
+            }
+        }
+        Ok(stop_reason)
+    }
+
     /// Parse `stopReason` from a `session/prompt` result value.
     fn parse_stop_reason(&self, result: &serde_json::Value) -> Result<StopReason, AcpError> {
         let raw = result["stopReason"].as_str().ok_or_else(|| {
@@ -1525,20 +2144,42 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
 /// matches goose's *current* run (it advances on each `session/update`).
 /// See [`crate::pool::SteerRequest`] for why this is the read loop's job
 /// and not the main loop's.
-fn build_steer_params(
+fn build_goose_steer_params(
     session_id: &str,
     expected_run_id: &str,
     prompt_blocks: &[&str],
 ) -> serde_json::Value {
-    let blocks: Vec<serde_json::Value> = prompt_blocks
-        .iter()
-        .map(|text| serde_json::json!({ "type": "text", "text": text }))
-        .collect();
     serde_json::json!({
         "sessionId": session_id,
         "expectedRunId": expected_run_id,
-        "prompt": blocks,
+        "prompt": steer_prompt_blocks(prompt_blocks),
     })
+}
+
+/// Build the params for an [`ACP_STEER_METHOD`] request.
+///
+/// Wire shape:
+/// ```json
+/// { "sessionId": "...", "prompt": [{"type":"text","text":"..."}, ...] }
+/// ```
+///
+/// Deliberately carries **no** `expectedRunId`: the cross-adapter method
+/// steers whatever turn is currently running and neither claude-agent-acp nor
+/// codex-acp emits a run id to target.
+fn build_acp_steer_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "prompt": steer_prompt_blocks(prompt_blocks),
+    })
+}
+
+/// Render steer body strings as ACP `text` content blocks. Shared by both
+/// steer transports so the prompt shape cannot drift between them.
+fn steer_prompt_blocks(prompt_blocks: &[&str]) -> Vec<serde_json::Value> {
+    prompt_blocks
+        .iter()
+        .map(|text| serde_json::json!({ "type": "text", "text": text }))
+        .collect()
 }
 
 /// Build a JSON-RPC permission response with `outcome: "selected"`.
@@ -1568,6 +2209,24 @@ pub struct SessionNewResponse {
     pub raw: serde_json::Value,
 }
 
+/// How to deliver a system prompt on `session/new`.
+///
+/// - **`Field`** — bare `systemPrompt` field (ACP protocol v2, buzz-agent).
+/// - **`PiMeta`** — `_meta.systemPrompt: text`, used by the Buzz pi-acp fork
+///   to replace Pi's native system prompt.
+/// - **`ClaudeMeta`** — `_meta.systemPrompt: {"append": text}`, used by
+///   `claude-agent-acp` to append to the adapter's own native system prompt
+///   while keeping its tool-use preset intact.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SystemPromptTransport<'a> {
+    /// Deliver as a bare top-level `systemPrompt` field.
+    Field(&'a str),
+    /// Deliver as `_meta.systemPrompt: text`.
+    PiMeta(&'a str),
+    /// Deliver as `_meta.systemPrompt: {"append": text}`.
+    ClaudeMeta(&'a str),
+}
+
 /// How to switch to a particular model on a session.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "type")]
@@ -1583,8 +2242,9 @@ pub enum ModelSwitchMethod {
 
 /// Extract `configOptions` entries with `category == "model"` from a `session/new` result.
 ///
-/// Returns the raw JSON array entries. Each entry has `configId`, `displayName`,
-/// `options: [{ value, displayName }]`, etc.
+/// Returns the raw JSON array entries. Each entry has `configId` (spelled `id`
+/// by some adapters, e.g. claude-agent-acp), `name`,
+/// `options: [{ value, name }]`, etc.
 pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_json::Value> {
     result["configOptions"]
         .as_array()
@@ -1604,6 +2264,28 @@ pub fn extract_model_state(result: &serde_json::Value) -> Option<serde_json::Val
     result.get("models").cloned()
 }
 
+/// Extract the `configId` for the `thought_level` category option from a
+/// `session/new` result, if the adapter advertised one.
+///
+/// Claude Code's adapter uses `category: "thought_level"` in its `configOptions`.
+/// The configId is adapter-defined (e.g. `"effort"` on claude-agent-acp) and must
+/// not be hardcoded in the harness — this function discovers it at session time so
+/// the spawn-scoped effort application forwards the adapter's real id. Accepts both
+/// `configId` (ACP spec) and `id` (claude-agent-acp), matching the model-switch path.
+pub fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<String> {
+    let arr = result["configOptions"].as_array()?;
+    for opt in arr {
+        if opt.get("category").and_then(|c| c.as_str()) == Some("thought_level") {
+            let config_id = opt
+                .get("configId")
+                .or_else(|| opt.get("id"))
+                .and_then(|v| v.as_str())?;
+            return Some(config_id.to_string());
+        }
+    }
+    None
+}
+
 /// Match a desired model ID against a fresh `session/new` response.
 ///
 /// Returns the correct ACP method to call, or `None` if no match.
@@ -1617,7 +2299,14 @@ pub fn resolve_model_switch_method(
     // 1. Search stable configOptions for a "model"-category entry whose
     //    options contain a value matching desired_model.
     for config_opt in extract_model_config_options(session_new_result) {
-        let config_id = match config_opt.get("configId").and_then(|v| v.as_str()) {
+        // Adapters disagree on the key: the ACP spec says `configId`, but
+        // claude-agent-acp emits `id`. Accept both; the set request always
+        // uses `configId` on the wire.
+        let config_id = match config_opt
+            .get("configId")
+            .or_else(|| config_opt.get("id"))
+            .and_then(|v| v.as_str())
+        {
             Some(id) => id,
             None => continue,
         };
@@ -1726,6 +2415,112 @@ fn kill_process_group(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) -> bool {
     false
+}
+
+/// First Claude Code release with `--thinking-display`. Older CLIs exit on
+/// unknown flags, so sending it to them would fail every `session/new`.
+const CLAUDE_THINKING_DISPLAY_MIN_VERSION: (u64, u64, u64) = (2, 1, 94);
+
+/// Parse `claude --version` output such as `2.1.284 (Claude Code)`. The
+/// first word must be exactly three dot-separated digit runs.
+fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = output.split_whitespace().next()?.split('.');
+    let mut next = || {
+        let part = parts.next()?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+/// Whether the CLI claude-agent-acp will run accepts `--thinking-display`.
+///
+/// The adapter runs `CLAUDE_CODE_EXECUTABLE` when set and its bundled CLI
+/// otherwise; the bundled one cannot be inspected from here, so an unset
+/// variable, a hung or failing binary, or unparseable output all answer
+/// `false` and leave the session exactly as before.
+async fn claude_cli_accepts_thinking_display(cmd: &tokio::process::Command) -> bool {
+    const KEY: &str = "CLAUDE_CODE_EXECUTABLE";
+    let executable = cmd
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == KEY)
+        .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        .unwrap_or_else(|| std::env::var_os(KEY))
+        .filter(|path| !path.is_empty());
+    let Some(executable) = executable else {
+        tracing::debug!(target: "acp::spawn", "{KEY} unset; not requesting thinking summaries");
+        return false;
+    };
+    let mut version_cmd = tokio::process::Command::new(&executable);
+    version_cmd.arg("--version");
+    configure_version_probe(&mut version_cmd);
+    let version = match version_cmd.spawn() {
+        Ok(child) => claude_version_within(child, std::time::Duration::from_secs(5)).await,
+        Err(_) => None,
+    };
+    let accepts = version.is_some_and(|v| v >= CLAUDE_THINKING_DISPLAY_MIN_VERSION);
+    tracing::debug!(
+        target: "acp::spawn",
+        "{executable:?} --version = {version:?}; thinking summaries requested: {accepts}"
+    );
+    accepts
+}
+
+/// Pipe stdout only, and put the probe in its own process group (like the
+/// adapter) so a timeout also kills a launcher's children.
+fn configure_version_probe(cmd: &mut tokio::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    configure_no_window(cmd);
+}
+
+/// Read at most a version line from `child` and require a clean exit within
+/// `limit`. On timeout the whole process group is killed.
+async fn claude_version_within(
+    mut child: tokio::process::Child,
+    limit: std::time::Duration,
+) -> Option<(u64, u64, u64)> {
+    use tokio::io::AsyncReadExt;
+    const MAX_VERSION_BYTES: u64 = 256;
+    let pid = child.id();
+    let probe = async {
+        let mut stdout = Vec::new();
+        let pipe = child.stdout.take()?;
+        pipe.take(MAX_VERSION_BYTES)
+            .read_to_end(&mut stdout)
+            .await
+            .ok()?;
+        child.wait().await.ok()?.success().then_some(stdout)
+    };
+    match tokio::time::timeout(limit, probe).await {
+        Ok(stdout) => parse_claude_version(&String::from_utf8_lossy(&stdout?)),
+        Err(_) => {
+            if !pid.is_some_and(kill_process_group) {
+                let _ = child.start_kill();
+            }
+            None
+        }
+    }
+}
+
+/// Suppress the console window that Windows otherwise allocates for every
+/// console-subsystem child process spawned from a GUI (non-console) parent.
+/// No-op on non-Windows platforms.
+fn configure_no_window(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
 }
 
 #[cfg(test)]
@@ -1876,13 +2671,7 @@ mod tests {
             "method": "initialize",
             "params": {
                 "protocolVersion": 2,
-                "clientCapabilities": {
-                    "_meta": {
-                        "goose": {
-                            "customNotifications": true
-                        }
-                    }
-                },
+                "clientCapabilities": build_client_capabilities(),
                 "clientInfo": {
                     "name": "buzz-acp",
                     "version": "0.1.0"
@@ -1895,6 +2684,11 @@ mod tests {
             Some("buzz-acp")
         );
         assert!(msg["params"]["clientCapabilities"].is_object());
+        assert_eq!(
+            msg["params"]["clientCapabilities"]["auth"]["terminal"].as_bool(),
+            Some(true),
+            "terminal auth capability must be advertised so adapters can expose terminal login methods"
+        );
         assert_eq!(
             msg["params"]["clientCapabilities"]["_meta"]["goose"]["customNotifications"].as_bool(),
             Some(true),
@@ -2096,17 +2890,17 @@ mod tests {
                 {
                     "configId": "model",
                     "category": "model",
-                    "displayName": "Model",
+                    "name": "Model",
                     "options": [
-                        { "value": "claude-sonnet-4-20250514", "displayName": "Claude Sonnet 4" },
-                        { "value": "claude-opus-4-20250514", "displayName": "Claude Opus 4" }
+                        { "value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" },
+                        { "value": "claude-opus-4-20250514", "name": "Claude Opus 4" }
                     ]
                 },
                 {
                     "configId": "theme",
                     "category": "appearance",
-                    "displayName": "Theme",
-                    "options": [{ "value": "dark", "displayName": "Dark" }]
+                    "name": "Theme",
+                    "options": [{ "value": "dark", "name": "Dark" }]
                 }
             ]
         });
@@ -2155,13 +2949,61 @@ mod tests {
     }
 
     #[test]
+    fn extract_thought_level_config_id_finds_config_id() {
+        let result = serde_json::json!({
+            "sessionId": "sess-1",
+            "configOptions": [
+                { "configId": "model", "category": "model" },
+                {
+                    "configId": "effort",
+                    "category": "thought_level",
+                    "options": [{ "value": "high" }, { "value": "low" }]
+                }
+            ]
+        });
+        assert_eq!(
+            super::extract_thought_level_config_id(&result).as_deref(),
+            Some("effort")
+        );
+    }
+
+    #[test]
+    fn extract_thought_level_config_id_falls_back_to_id_key() {
+        let result = serde_json::json!({
+            "configOptions": [
+                { "id": "effort", "category": "thought_level" }
+            ]
+        });
+        assert_eq!(
+            super::extract_thought_level_config_id(&result).as_deref(),
+            Some("effort")
+        );
+    }
+
+    #[test]
+    fn extract_thought_level_config_id_none_without_category() {
+        let result = serde_json::json!({
+            "configOptions": [
+                { "configId": "model", "category": "model" }
+            ]
+        });
+        assert!(super::extract_thought_level_config_id(&result).is_none());
+    }
+
+    #[test]
+    fn extract_thought_level_config_id_none_without_config_options() {
+        let result = serde_json::json!({ "sessionId": "sess-1" });
+        assert!(super::extract_thought_level_config_id(&result).is_none());
+    }
+
+    #[test]
     fn resolve_prefers_stable_over_unstable() {
         let result = serde_json::json!({
             "configOptions": [{
                 "configId": "model",
                 "category": "model",
                 "options": [
-                    { "value": "claude-sonnet-4-20250514", "displayName": "Sonnet 4" }
+                    { "value": "claude-sonnet-4-20250514", "name": "Sonnet 4" }
                 ]
             }],
             "models": {
@@ -2177,6 +3019,36 @@ mod tests {
             Some(super::ModelSwitchMethod::ConfigOption {
                 config_id: "model".to_string(),
                 option_value: "claude-sonnet-4-20250514".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_id_keyed_config_options() {
+        // claude-agent-acp (observed on v0.61.0) keys config options with
+        // `id` instead of the spec's `configId`. Payload mirrors its real
+        // `session/new` response.
+        let result = serde_json::json!({
+            "configOptions": [{
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "default",
+                "options": [
+                    { "value": "default", "name": "Default" },
+                    { "value": "opus[1m]", "name": "Opus" },
+                    { "value": "sonnet", "name": "Sonnet" }
+                ]
+            }],
+            "models": null
+        });
+        let method = super::resolve_model_switch_method(&result, "opus[1m]");
+        assert_eq!(
+            method,
+            Some(super::ModelSwitchMethod::ConfigOption {
+                config_id: "model".to_string(),
+                option_value: "opus[1m]".to_string(),
             })
         );
     }
@@ -2316,7 +3188,9 @@ mod tests {
 
     #[test]
     fn hard_timeout_error_display() {
-        let err = AcpError::HardTimeout;
+        let err = AcpError::HardTimeout {
+            silence: std::time::Duration::from_secs(120),
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("Hard turn timeout"),
@@ -2324,22 +3198,140 @@ mod tests {
         );
     }
 
+    /// Spawn `script` under bash and return once it is running.
+    ///
+    /// Process startup can take hundreds of milliseconds on a loaded host,
+    /// which would otherwise eat into the idle and timing windows the tests
+    /// measure. The script prints a ready line first, consumed here, so each
+    /// test's clock starts only after the child is actually executing.
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[])
+        const READY: &str = "buzz-acp-test-script-ready";
+        let mut client = AcpClient::spawn(
+            "bash",
+            &["-c".into(), format!("echo {READY}; {script}")],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test script");
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(10), client.reader.next())
             .await
-            .expect("failed to spawn test script")
+            .expect("test script should start within 10s");
+        assert!(
+            matches!(&ready, Some(Ok(line)) if line == READY),
+            "expected ready line, got {ready:?}"
+        );
+        client
+    }
+
+    #[cfg(unix)]
+    async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp adapter dir");
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/usr/bin/env bash\n{script}\n"))
+            .expect("write fake adapter");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("adapter metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod fake adapter");
+        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false)
+            .await
+            .expect("spawn named fake adapter");
+        (client, dir)
+    }
+
+    /// Spawn a probe script whose file name carries a runtime identity (e.g.
+    /// `hermes-acp`) and return the value of `var` as the child observed it.
+    /// `<unset>` means the child did not receive the var.
+    #[cfg(unix)]
+    async fn spawn_named_and_read_child_env(
+        file_name: &str,
+        var: &str,
+        extra_env: &[(String, String)],
+    ) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create env probe dir");
+        let path = dir.join(file_name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' \"${{{var}:-<unset>}}\"\n"),
+        )
+        .expect("write env probe script");
+        let mut permissions = std::fs::metadata(&path).expect("stat probe").permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).expect("chmod probe");
+
+        let mut client = AcpClient::spawn(
+            path.to_str().expect("probe path is UTF-8"),
+            &[],
+            extra_env,
+            false,
+        )
+        .await
+        .expect("spawn env probe script");
+        let observed = client
+            .reader
+            .next()
+            .await
+            .unwrap_or_else(|| panic!("child produced no output for {var}"))
+            .expect("child stdout was not readable");
+        client.shutdown().await;
+        std::fs::remove_dir_all(&dir).expect("remove env probe dir");
+        observed
+    }
+
+    /// Buzz-owned Hermes processes get the configured-MCP isolation default,
+    /// and an explicit persona entry still overrides it (defaults are applied
+    /// before `extra_env`, so the later `Command::env` write wins).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_applies_runtime_env_defaults_with_extra_env_precedence() {
+        const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
+        if std::env::var_os(VAR).is_some() {
+            // Inherited parent values win over both layers; the default and
+            // override behavior below is unobservable in such an environment.
+            return;
+        }
+
+        assert_eq!(
+            spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
+            "1",
+            "Hermes spawns must default {VAR}=1"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env("hermes-acp", VAR, &[(VAR.into(), "0".into())]).await,
+            "0",
+            "an explicit extra_env entry must override the runtime default"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env("other-agent", VAR, &[]).await,
+            "<unset>",
+            "non-Hermes spawns must not receive Hermes defaults"
+        );
     }
 
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script("sleep 10").await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let max_dur = std::time::Duration::from_secs(30);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
             .read_until_response_with_idle_timeout(
                 "test",
                 999,
                 std::time::Duration::from_millis(100),
                 hard_deadline,
+                max_dur,
             )
             .await;
         assert!(
@@ -2351,7 +3343,8 @@ mod tests {
     #[tokio::test]
     async fn hard_timeout_fires_when_deadline_is_immediate() {
         let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+        let max_dur = std::time::Duration::from_millis(1);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let result = client
             .read_until_response_with_idle_timeout(
@@ -2359,37 +3352,117 @@ mod tests {
                 999,
                 std::time::Duration::from_secs(60),
                 hard_deadline,
+                max_dur,
             )
             .await;
         assert!(
-            matches!(result, Err(AcpError::HardTimeout)),
+            matches!(result, Err(AcpError::HardTimeout { .. })),
             "expected HardTimeout, got {result:?}"
+        );
+    }
+
+    /// `cancel_with_cleanup_grace`'s bounded drain deadline must map to
+    /// [`AcpError::CancelDrainTimeout`], never [`AcpError::HardTimeout`] —
+    /// the two share an underlying deadline mechanism but must not share
+    /// classification, since callers dead-letter a real `HardTimeout` and
+    /// must not dead-letter a drain that simply ran past its grace window.
+    #[tokio::test]
+    async fn cancel_with_cleanup_grace_maps_expiry_to_cancel_drain_timeout() {
+        // Agent ignores `session/cancel` on stdin and keeps producing noise
+        // forever — never drains within the grace window.
+        let mut client = spawn_script("while true; do echo 'noise'; sleep 0.01; done").await;
+        client.last_prompt_id = Some(999);
+        let grace = std::time::Duration::from_millis(200);
+        let result = client
+            .cancel_with_cleanup_grace("test-session", grace)
+            .await;
+        assert!(
+            matches!(result, Err(AcpError::CancelDrainTimeout(g)) if g == grace),
+            "expected CancelDrainTimeout({grace:?}), got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn idle_resets_on_stdout_activity() {
-        // Send valid JSON (session/update notifications) to reset the idle timer.
-        // Non-JSON lines no longer reset idle (Finding #6 hardening).
-        let mut client = spawn_script(
-            r#"for i in $(seq 1 10); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}}}}'; sleep 0.05; done; sleep 10"#,
-        )
+        assert_activity_resets_idle(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk", "content": { "text": "thinking" }
+        }))
         .await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let start = std::time::Instant::now();
-        let result = client
-            .read_until_response_with_idle_timeout(
+    }
+
+    /// Exercise the real stdout reader with a paused clock. Advance only after
+    /// each notification is observed, so OS scheduling cannot consume the idle
+    /// window. Each update must extend the deadline; silence must still expire.
+    async fn assert_activity_resets_idle(update: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+
+        let mut client =
+            spawn_script(r#"while IFS= read -r line; do printf '%s\n' "$line"; done"#).await;
+        let mut stdin = client.stdin.take().expect("test stdin");
+        let observer = ObserverHandle::in_process();
+        let mut events = observer.subscribe();
+        client.set_observer(Some(observer), 0);
+        // Prevent Tokio from auto-advancing while waiting for real pipe I/O.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::pause();
+        let idle = std::time::Duration::from_secs(1);
+        let hard = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + hard;
+        let mut frame = serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/update", "params": { "update": update }
+        })
+        .to_string();
+        frame.push('\n');
+        {
+            let read = client.read_until_response_with_idle_timeout(
                 "test",
                 999,
-                std::time::Duration::from_millis(200),
+                idle,
                 hard_deadline,
-            )
-            .await;
-        let elapsed = start.elapsed();
-        // 10 messages × 50ms = ~500ms of activity, then idle timeout fires after 200ms more
-        assert!(elapsed >= std::time::Duration::from_millis(400));
-        assert!(elapsed < std::time::Duration::from_secs(3));
-        assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
+                hard,
+            );
+            tokio::pin!(read);
+            assert!(futures_util::poll!(&mut read).is_pending());
+            for _ in 0..3 {
+                tokio::time::advance(std::time::Duration::from_millis(750)).await;
+                stdin
+                    .write_all(frame.as_bytes())
+                    .await
+                    .expect("write activity");
+                let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    assert!(
+                        futures_util::poll!(&mut read).is_pending(),
+                        "activity must extend the idle deadline"
+                    );
+                    if let Ok(event) = events.try_recv() {
+                        assert_eq!(event.kind, "acp_read");
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < watchdog,
+                        "activity was not read from the pipe"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::advance(idle - std::time::Duration::from_millis(1)).await;
+            assert!(
+                futures_util::poll!(&mut read).is_pending(),
+                "the last activity must reset the full idle window"
+            );
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            // Pipe I/O is done. Let Tokio drive the timer wheel, whose wakeup
+            // can round the deadline up to the next millisecond.
+            clock_guard.abort();
+            assert!(matches!(read.await, Err(AcpError::IdleTimeout(duration)) if duration == idle));
+        }
+        tokio::time::resume();
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -2397,13 +3470,15 @@ mod tests {
         let mut client =
             spawn_script(r#"echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#)
                 .await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
             .read_until_response_with_idle_timeout(
                 "test",
                 42,
                 std::time::Duration::from_secs(2),
                 hard_deadline,
+                max_dur,
             )
             .await;
         assert!(result.is_ok());
@@ -2414,13 +3489,15 @@ mod tests {
     async fn agent_exit_detected_as_eof() {
         let mut client = spawn_script("exit 0").await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
             .read_until_response_with_idle_timeout(
                 "test",
                 999,
                 std::time::Duration::from_secs(2),
                 hard_deadline,
+                max_dur,
             )
             .await;
         assert!(matches!(result, Err(AcpError::AgentExited)));
@@ -2442,13 +3519,15 @@ mod tests {
             sleep 1
         "#;
         let mut client = spawn_script(script).await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
             .read_until_response_with_idle_timeout(
                 "test",
                 0,
                 std::time::Duration::from_secs(3),
                 hard_deadline,
+                max_dur,
             )
             .await;
         assert!(result.is_ok(), "expected Ok response, got {result:?}");
@@ -2459,9 +3538,10 @@ mod tests {
     async fn idle_fires_before_hard_when_idle_is_shorter() {
         let mut client = spawn_script("sleep 10").await;
         let idle = std::time::Duration::from_millis(100);
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
-            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline)
+            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline, max_dur)
             .await;
         assert!(
             matches!(result, Err(AcpError::IdleTimeout(_))),
@@ -2508,11 +3588,11 @@ mod tests {
         let idle = std::time::Duration::from_secs(60); // idle ≫ hard
         let start = std::time::Instant::now();
         let result = client
-            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline)
+            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline, hard)
             .await;
         let elapsed = start.elapsed();
         assert!(
-            matches!(result, Err(AcpError::HardTimeout)),
+            matches!(result, Err(AcpError::HardTimeout { .. })),
             "expected HardTimeout under gapless valid-JSON stream, got {result:?} (elapsed {elapsed:?})"
         );
         // Must fire close to the hard deadline, not late. Without the
@@ -2557,31 +3637,7 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_resets_idle_past_deadline() {
-        // Keepalive session/update lines every 50ms against a 100ms idle deadline.
-        // The turn should survive well past the 100ms deadline (proves the fix).
-        let mut client = spawn_script(
-            r#"for i in $(seq 1 20); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}'; sleep 0.05; done; sleep 10"#,
-        )
-        .await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let start = std::time::Instant::now();
-        let result = client
-            .read_until_response_with_idle_timeout(
-                "test",
-                999,
-                std::time::Duration::from_millis(100),
-                hard_deadline,
-            )
-            .await;
-        let elapsed = start.elapsed();
-        // 20 keepalives × 50ms = ~1000ms of activity, then idle fires after 100ms more.
-        // Must survive well past the 100ms deadline.
-        assert!(
-            elapsed >= std::time::Duration::from_millis(500),
-            "keepalive should reset idle past the deadline; elapsed only {elapsed:?}"
-        );
-        assert!(elapsed < std::time::Duration::from_secs(5));
-        assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
+        assert_activity_resets_idle(serde_json::json!({ "sessionUpdate": "keepalive" })).await;
     }
 
     #[tokio::test]
@@ -2597,7 +3653,8 @@ mod tests {
             r#"echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","title":"long_running","kind":"shell"}}}'; sleep 0.08; sleep 10"#,
         )
         .await;
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let start = std::time::Instant::now();
         let result = client
             .read_until_response_with_idle_timeout(
@@ -2605,6 +3662,7 @@ mod tests {
                 999,
                 std::time::Duration::from_millis(200),
                 hard_deadline,
+                max_dur,
             )
             .await;
         let elapsed = start.elapsed();
@@ -2639,7 +3697,12 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], Some("Custom system prompt"))
+            .session_new_full(
+                "/tmp",
+                vec![],
+                Some(SystemPromptTransport::Field("Custom system prompt")),
+                None,
+            )
             .await
             .expect("session_new_full should succeed");
 
@@ -2650,6 +3713,61 @@ mod tests {
             Some("Custom system prompt"),
             "systemPrompt should be included in params when Some"
         );
+    }
+
+    #[tokio::test]
+    async fn goose_system_prompt_request_uses_set_contract() {
+        let script = r#"
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":0,"result":{"_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let result = client
+            .session_set_goose_system_prompt("ses_goose", "Be terse")
+            .await
+            .expect("custom request succeeds");
+        let received = &result["_receivedRequest"];
+        assert_eq!(
+            received["method"],
+            "_goose/unstable/session/system-prompt/set"
+        );
+        assert_eq!(received["params"]["sessionId"], "ses_goose");
+        assert_eq!(received["params"]["mode"], "set");
+        assert_eq!(received["params"]["key"], "buzz");
+        assert_eq!(received["params"]["text"], "Be terse");
+    }
+
+    #[tokio::test]
+    async fn goose_system_prompt_preserves_method_not_found_for_fallback() {
+        let script = r#"
+            read -t 2 _REQ
+            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        assert!(matches!(
+            client
+                .session_set_goose_system_prompt("ses_goose", "Be terse")
+                .await,
+            Err(AcpError::AgentError { code: -32601, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn goose_system_prompt_preserves_invalid_params_as_error() {
+        let script = r#"
+            read -t 2 _REQ
+            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"Invalid params"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        assert!(matches!(
+            client
+                .session_set_goose_system_prompt("ses_goose", "Be terse")
+                .await,
+            Err(AcpError::AgentError { code: -32602, .. })
+        ));
     }
 
     #[tokio::test]
@@ -2669,7 +3787,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None)
+            .session_new_full("/tmp", vec![], None, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -2681,44 +3799,195 @@ mod tests {
         );
     }
 
-    // ── Goose-native steer scaffold (PR follow-up to #1160) ──────────────
-
-    /// Helper: spawn an inert `cat` subprocess so we have a real AcpClient
-    /// to drive `handle_session_update` against. `cat` never writes back,
-    /// which is fine — these tests don't read from the agent, they just
-    /// feed JSON into the parser.
-    async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[])
+    #[tokio::test]
+    async fn session_new_full_sends_session_title_in_meta_when_some() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
             .await
-            .expect("spawn cat as inert client")
+            .expect("initialize should succeed");
+
+        let resp = client
+            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
+            .await
+            .expect("session_new_full should succeed");
+
+        let received = &resp.raw["_receivedRequest"];
+        assert_eq!(
+            received["params"]["_meta"]["sessionTitle"].as_str(),
+            Some("Fizz · #buzz-dev"),
+            "title should ride in _meta.sessionTitle, out of band from the prompt"
+        );
     }
 
-    /// Build a `session/update` JSON-RPC notification carrying a
-    /// `session_info_update` with the given `_meta.goose.activeRunId` value.
-    /// Pass `None` to omit the `activeRunId` field entirely.
-    ///
-    /// `_meta` is nested inside the `update` object (per the ACP
-    /// `SessionInfoUpdate` schema), matching what goose and buzz-agent
-    /// emit on the wire.
-    fn session_info_update_msg(active_run_id: Option<serde_json::Value>) -> serde_json::Value {
-        let mut goose = serde_json::Map::new();
-        if let Some(v) = active_run_id {
-            goose.insert("activeRunId".to_string(), v);
-        }
-        let mut meta = serde_json::Map::new();
-        meta.insert("goose".to_string(), serde_json::Value::Object(goose));
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "test-session",
-                "update": {
-                    "sessionUpdate": "session_info_update",
-                    "_meta": serde_json::Value::Object(meta),
-                },
-            }
-        })
+    #[tokio::test]
+    async fn session_new_full_omits_meta_when_session_title_none() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let resp = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session_new_full should succeed");
+
+        let received = &resp.raw["_receivedRequest"];
+        assert!(
+            received["params"].get("_meta").is_none(),
+            "_meta should be absent entirely, not an empty object or null"
+        );
     }
+
+    #[test]
+    fn claude_version_gate_admits_only_cli_with_thinking_display() {
+        let accepts = |out: &str| {
+            parse_claude_version(out).is_some_and(|v| v >= CLAUDE_THINKING_DISPLAY_MIN_VERSION)
+        };
+        assert!(!accepts("2.1.92 (Claude Code)"), "below the minimum");
+        assert!(!accepts("1.0.100 (Claude Code)"), "older major");
+        assert!(accepts("2.1.94 (Claude Code)"), "exactly the minimum");
+        assert!(accepts("2.1.284 (Claude Code)"), "newer");
+        assert!(accepts("3.0.0"), "newer major");
+        assert!(!accepts(""), "empty output");
+        assert!(!accepts("error: unknown"), "unparseable output");
+        assert!(!accepts("2.1.284.garbage"), "trailing junk");
+        assert!(!accepts("2.1.+284"), "sign in a component");
+    }
+
+    #[tokio::test]
+    async fn claude_thinking_display_check_fails_closed_without_readable_cli() {
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env("CLAUDE_CODE_EXECUTABLE", "/nonexistent/claude");
+        assert!(!claude_cli_accepts_thinking_display(&cmd).await);
+        cmd.env("CLAUDE_CODE_EXECUTABLE", "");
+        assert!(!claude_cli_accepts_thinking_display(&cmd).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_version_timeout_kills_launcher_children() {
+        let dir = std::env::temp_dir().join(format!("buzz-acp-hang-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let pidfile = dir.join("child.pid");
+        // A launcher that starts a child holding stdout open, then hangs.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 300 & echo $! > {}; wait", pidfile.display()));
+        configure_version_probe(&mut cmd);
+        let child = cmd.spawn().expect("spawn launcher");
+        let version = claude_version_within(child, std::time::Duration::from_millis(500)).await;
+        assert_eq!(version, None);
+        let grandchild = std::fs::read_to_string(&pidfile).expect("pidfile");
+        let grandchild = nix::unistd::Pid::from_raw(grandchild.trim().parse().expect("pid"));
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = nix::sys::signal::kill(grandchild, None).is_ok();
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::fs::remove_dir_all(&dir).expect("remove dir");
+        assert!(!alive, "the launcher's child must not outlive the timeout");
+    }
+
+    /// Spawn a fake `claude-agent-acp` whose `CLAUDE_CODE_EXECUTABLE` is a
+    /// fake CLI running `cli_body`, then return the `_meta` its `session/new`
+    /// actually received.
+    #[cfg(unix)]
+    async fn claude_session_meta_with_cli(cli_body: &str) -> serde_json::Value {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("buzz-acp-claude-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake dir");
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake");
+            path
+        };
+        let cli = write("claude", cli_body);
+        let adapter = write(
+            "claude-agent-acp",
+            r#"read -r _init
+echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+read -r REQ
+echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
+sleep 1"#,
+        );
+        let mut client = AcpClient::spawn_with_env(
+            adapter.to_str().expect("utf8 path"),
+            &[],
+            &[],
+            false,
+            &[(
+                "CLAUDE_CODE_EXECUTABLE".into(),
+                cli.to_str().expect("utf8 path").into(),
+            )],
+        )
+        .await
+        .expect("spawn fake claude adapter");
+        client.initialize().await.expect("initialize");
+        let resp = client
+            .session_new_full(
+                "/tmp",
+                vec![],
+                Some(SystemPromptTransport::ClaudeMeta("be brief")),
+                Some("Fizz"),
+            )
+            .await
+            .expect("session_new_full");
+        client.shutdown().await;
+        std::fs::remove_dir_all(&dir).expect("remove fake dir");
+        resp.raw["_receivedRequest"]["params"]["_meta"].clone()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_spawn_requests_thinking_summaries_only_from_supporting_cli() {
+        let meta = claude_session_meta_with_cli("echo '2.1.284 (Claude Code)'").await;
+        assert_eq!(
+            meta["claudeCode"]["options"]["extraArgs"],
+            serde_json::json!({ "thinking-display": "summarized" })
+        );
+        assert_eq!(
+            meta["systemPrompt"],
+            serde_json::json!({ "append": "be brief" })
+        );
+        assert_eq!(meta["sessionTitle"], "Fizz");
+
+        for (case, cli) in [
+            ("old CLI", "echo '2.1.93 (Claude Code)'"),
+            ("failing CLI", "echo '2.1.284 (Claude Code)'; exit 1"),
+            ("unclean version", "echo '2.1.284.garbage'"),
+        ] {
+            let meta = claude_session_meta_with_cli(cli).await;
+            assert!(meta.get("claudeCode").is_none(), "{case}: {meta}");
+            assert_eq!(meta["sessionTitle"], "Fizz", "{case}");
+        }
+    }
+
+    // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
+
+    include!("acp/system_prompt_tests.rs");
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {
@@ -2835,9 +4104,10 @@ mod tests {
         // be matched (the script writes nothing); the read loop will
         // exit via IdleTimeout shortly after the steer arm fires.
         let idle = std::time::Duration::from_millis(500);
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let read_result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline)
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -2902,9 +4172,10 @@ mod tests {
         // the script so the read loop exits via idle timeout after the
         // steer response is routed to ack.
         let idle = std::time::Duration::from_secs(2);
-        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
         let read_result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline)
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -2926,9 +4197,724 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
+    }
+
+    /// Steer-success renewal keeps the turn alive past the original hard
+    /// deadline. This is the red-on-old/green-on-new test for the core bug
+    /// fix (acp.rs:1440-1444): without renewal, the read loop returns
+    /// `HardTimeout` before the prompt response arrives.
+    ///
+    /// Timeline:
+    ///   t≈0:    read loop starts, `hard_deadline = now + 1s`
+    ///   t≈0.5s: script emits steer response (id=0) → Success renewal
+    ///           moves `hard_deadline` to `now + 3s` (≈3.5s from start)
+    ///   t≈1.5s: script emits prompt response (id=999) → `Ok`
+    ///
+    /// Old code: `HardTimeout` at t≈1s (before prompt response).
+    /// New code: deadline renewed at t≈0.5s → prompt response at t≈1.5s → `Ok`.
+    #[tokio::test]
+    async fn steer_success_renews_hard_deadline_and_survives_past_original() {
+        let script = "sleep 0.5; \
+                      echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"stopReason\":\"end_turn\"}}'; \
+                      sleep 1; \
+                      echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
+        let mut client = spawn_script(script).await;
+
+        let update = session_info_update_msg(Some(serde_json::json!("run-99")));
+        let _ = client.handle_session_update(&update);
+
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        client.install_steer_rx(steer_rx);
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let send_task = tokio::spawn(async move {
+            steer_tx
+                .send(crate::pool::SteerRequest {
+                    prompt_blocks: vec!["steer body".into()],
+                    ack_tx,
+                })
+                .await
+                .expect("steer_tx send should succeed");
+        });
+
+        let idle = std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(3);
+        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = client
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .await;
+        send_task.await.expect("send_task should complete");
+
+        assert!(
+            result.is_ok(),
+            "expected Ok (prompt response after renewed deadline), got {result:?}"
+        );
+        assert_eq!(result.unwrap()["done"], serde_json::json!(true));
+
+        let ack = ack_rx
+            .await
+            .expect("ack oneshot must have received a SteerAck");
+        match ack {
+            crate::pool::SteerAck::Success { .. } => {}
+            other => panic!("expected SteerAck::Success, got {other:?}"),
+        }
+    }
+
+    // ── Cross-harness steer transport tests ───────────────────────────────
+    //
+    // These cover the `_session/steering` transport added alongside the
+    // goose-native method: capability capture at `initialize`, write-time
+    // transport selection, and outcome decoding. Wire-shape assertions read
+    // the actual serialized request bytes via `capture_steer_request` rather
+    // than inferring the shape from response-id routing.
+
+    /// Spawn a client whose script captures the first line written to its
+    /// stdin into `capture_path`, then emits `response` (already-serialized
+    /// JSON-RPC) and idles.
+    ///
+    /// The steer request is the first thing this read loop writes, so the
+    /// captured line IS the steer request bytes.
+    async fn spawn_steer_capture_script(
+        capture_path: &std::path::Path,
+        response: &str,
+    ) -> AcpClient {
+        let script = format!(
+            "read -r line; printf '%s' \"$line\" > {capture}; \
+             printf '%s\\n' '{response}'; sleep 10",
+            capture = capture_path.display(),
+            response = response,
+        );
+        spawn_script(&script).await
+    }
+
+    /// Drive one steer through the read loop and return
+    /// `(captured_request_bytes, ack)`.
+    ///
+    /// `capture_path` may be absent afterwards when the arm wrote nothing —
+    /// callers assert on that. The read loop is expected to exit via a
+    /// timeout or EOF; the ack is what these tests care about.
+    async fn run_one_steer(
+        client: &mut AcpClient,
+        capture_path: &std::path::Path,
+    ) -> (Option<String>, crate::pool::SteerAck) {
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        client.install_steer_rx(steer_rx);
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let send_task = tokio::spawn(async move {
+            steer_tx
+                .send(crate::pool::SteerRequest {
+                    prompt_blocks: vec!["steer body".into()],
+                    ack_tx,
+                })
+                .await
+                .expect("steer_tx send should succeed");
+        });
+
+        let idle = std::time::Duration::from_millis(800);
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let _ = client
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .await;
+        send_task.await.expect("send_task should complete");
+
+        let ack = ack_rx
+            .await
+            .expect("ack oneshot must have received a SteerAck");
+        (std::fs::read_to_string(capture_path).ok(), ack)
+    }
+
+    /// Unique temp path for one test's captured request bytes.
+    fn capture_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("buzz-acp-steer-capture");
+        std::fs::create_dir_all(&dir).expect("create capture dir");
+        let path = dir.join(format!("{name}.json"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Mark a client as having advertised `_meta.steering.supported` without
+    /// running a real `initialize` handshake. The capability-parsing tests
+    /// cover the handshake itself.
+    fn set_steering_supported(client: &mut AcpClient) {
+        client.steering_supported = true;
+    }
+
+    /// Run `initialize` against a script that replies with `init_result` as
+    /// the JSON-RPC result, and return the resulting `steering_supported`.
+    async fn steering_supported_after_initialize(init_result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
+             sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.steering_supported()
+    }
+
+    /// Test 1a: an adapter advertising `_meta.steering.supported: true`
+    /// (claude-agent-acp `src/acp-agent.ts:1444`, codex-acp
+    /// `src/CodexAcpServer.ts:247`) is recorded as steering-capable.
+    #[tokio::test]
+    async fn initialize_records_steering_supported_when_advertised() {
+        let supported = steering_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{},"_meta":{"steering":{"supported":true}}}"#,
+        )
+        .await;
+        assert!(
+            supported,
+            "_meta.steering.supported: true must set steering_supported"
+        );
+    }
+
+    /// Test 1b: no `_meta` at all (goose, buzz-agent, any older adapter) must
+    /// leave the capability off — this is what keeps a steer off the wire for
+    /// agents that never implemented it.
+    #[tokio::test]
+    async fn initialize_leaves_steering_unsupported_when_meta_absent() {
+        let supported =
+            steering_supported_after_initialize(r#"{"protocolVersion":2,"agentCapabilities":{}}"#)
+                .await;
+        assert!(
+            !supported,
+            "absent _meta must leave steering_supported false"
+        );
+    }
+
+    /// Test 1c: an explicit `supported: false` is respected, not treated as
+    /// "the key exists so it must work".
+    #[tokio::test]
+    async fn initialize_leaves_steering_unsupported_when_explicitly_false() {
+        let supported = steering_supported_after_initialize(
+            r#"{"protocolVersion":2,"_meta":{"steering":{"supported":false}}}"#,
+        )
+        .await;
+        assert!(
+            !supported,
+            "_meta.steering.supported: false must leave steering_supported false"
+        );
+    }
+
+    /// Test 2: no `active_run_id` + capability advertised → the bytes on the
+    /// wire are an `_session/steering` request carrying `sessionId` and
+    /// `prompt`, and carrying **no** `expectedRunId` (the adapters reject
+    /// unknown required fields, and there is no run id to report anyway).
+    #[tokio::test]
+    async fn acp_steer_request_omits_expected_run_id_and_carries_session_and_prompt() {
+        let capture = capture_path("acp_shape");
+        let mut client = spawn_steer_capture_script(
+            &capture,
+            r#"{"jsonrpc":"2.0","id":0,"result":{"outcome":"injected"}}"#,
+        )
+        .await;
+        set_steering_supported(&mut client);
+        assert!(
+            client.active_run_id().is_none(),
+            "precondition: no active_run_id"
+        );
+
+        let (written, ack) = run_one_steer(&mut client, &capture).await;
+
+        let written = written.expect("steer request must have been written");
+        let msg: serde_json::Value =
+            serde_json::from_str(&written).expect("written line must be valid JSON");
+        assert_eq!(
+            msg["method"].as_str(),
+            Some(ACP_STEER_METHOD),
+            "must use the cross-adapter steer method; wrote: {written}"
+        );
+        assert_eq!(msg["params"]["sessionId"].as_str(), Some("sess-test"));
+        assert_eq!(
+            msg["params"]["prompt"][0]["text"].as_str(),
+            Some("steer body"),
+            "prompt must carry the steer body as a text block"
+        );
+        assert!(
+            msg["params"].get("expectedRunId").is_none(),
+            "_session/steering must not carry expectedRunId; wrote: {written}"
+        );
+        assert!(
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            "injected outcome must ack Success, got {ack:?}"
+        );
+    }
+
+    /// Test 3: goose keeps priority. With both an `active_run_id` and the
+    /// advertised capability, the goose method wins — `expectedRunId` is
+    /// strictly more precise about which run is being steered.
+    #[tokio::test]
+    async fn goose_transport_wins_when_both_run_id_and_capability_present() {
+        let capture = capture_path("goose_priority");
+        let mut client =
+            spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        set_steering_supported(&mut client);
+        let update = session_info_update_msg(Some(serde_json::json!("run-77")));
+        let _ = client.handle_session_update(&update);
+
+        let (written, ack) = run_one_steer(&mut client, &capture).await;
+
+        let written = written.expect("steer request must have been written");
+        let msg: serde_json::Value =
+            serde_json::from_str(&written).expect("written line must be valid JSON");
+        assert_eq!(
+            msg["method"].as_str(),
+            Some(GOOSE_STEER_METHOD),
+            "goose method must win when a run id exists; wrote: {written}"
+        );
+        assert_eq!(msg["params"]["expectedRunId"].as_str(), Some("run-77"));
+        // A bare `{}` result is a success on the goose transport (goose sends
+        // no `outcome`) — the OutcomeRejected guard applies only to
+        // `_session/steering`.
+        assert!(
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            "goose success result must ack Success, got {ack:?}"
+        );
+    }
+
+    /// Test 7: codex-acp's third outcome, `failed`
+    /// (`src/AcpExtensions.ts:92`), is a delivery rejection despite being a
+    /// JSON-RPC success — release the event and fall back.
+    #[tokio::test]
+    async fn acp_steer_failed_outcome_acks_outcome_rejected() {
+        let capture = capture_path("outcome_failed");
+        let mut client = spawn_steer_capture_script(
+            &capture,
+            r#"{"jsonrpc":"2.0","id":0,"result":{"outcome":"failed"}}"#,
+        )
+        .await;
+        set_steering_supported(&mut client);
+
+        let (_written, ack) = run_one_steer(&mut client, &capture).await;
+
+        match ack {
+            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
+                assert_eq!(
+                    outcome, "failed",
+                    "rejected outcome must report what the agent said, unquoted"
+                );
+            }
+            other => panic!("expected Err(OutcomeRejected), got {other:?}"),
+        }
+    }
+
+    /// Test 8: **codex `extMethod` silent-loss regression guard.** codex-acp's
+    /// ext dispatcher answers unrecognized methods with a bare `{}` — a
+    /// JSON-RPC *success*, not `-32601` (`src/CodexAcpServer.ts:255-258`).
+    /// Buzz maps `SteerAck::Success` to `queue.remove_event`, so decoding
+    /// `{}` as success would delete the user's message with no error, no
+    /// fallback, and no log. An absent `outcome` must therefore be a
+    /// rejection, which releases the event and fires cancel+merge.
+    #[tokio::test]
+    async fn acp_steer_missing_outcome_acks_outcome_rejected_and_never_drops_event() {
+        let capture = capture_path("outcome_absent");
+        let mut client =
+            spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        set_steering_supported(&mut client);
+
+        let (_written, ack) = run_one_steer(&mut client, &capture).await;
+
+        match ack {
+            crate::pool::SteerAck::Err(crate::pool::SteerError::OutcomeRejected { outcome }) => {
+                assert_eq!(
+                    outcome, "<absent>",
+                    "a result with no outcome field must be reported as absent"
+                );
+            }
+            other => panic!(
+                "expected Err(OutcomeRejected) for a bare {{}} success — \
+                 anything else risks dropping the event, got {other:?}"
+            ),
+        }
+    }
+
+    /// Test 5: `injected` renews the hard deadline, so the turn survives past
+    /// its original one. Mirrors
+    /// `steer_success_renews_hard_deadline_and_survives_past_original` for
+    /// the `_session/steering` transport.
+    ///
+    /// Timeline: original hard deadline at t≈1s; steer response at t≈0.5s
+    /// renews it to t≈3.5s; prompt response at t≈1.5s lands inside it.
+    #[tokio::test]
+    async fn acp_steer_injected_renews_hard_deadline_and_survives_past_original() {
+        let script = "sleep 0.5; \
+                      echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"injected\"}}'; \
+                      sleep 1; \
+                      echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
+        let mut client = spawn_script(script).await;
+        set_steering_supported(&mut client);
+
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        client.install_steer_rx(steer_rx);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let send_task = tokio::spawn(async move {
+            steer_tx
+                .send(crate::pool::SteerRequest {
+                    prompt_blocks: vec!["steer body".into()],
+                    ack_tx,
+                })
+                .await
+                .expect("steer_tx send should succeed");
+        });
+
+        let idle = std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(3);
+        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = client
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .await;
+        send_task.await.expect("send_task should complete");
+
+        assert!(
+            result.is_ok(),
+            "injected must renew the deadline so the prompt response still lands, got {result:?}"
+        );
+        assert_eq!(result.unwrap()["done"], serde_json::json!(true));
+        let ack = ack_rx.await.expect("ack must be received");
+        assert!(
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            "injected must ack Success, got {ack:?}"
+        );
+    }
+
+    /// Test 6: **red/green for the no-renewal rule.** `startedNewTurn` means
+    /// the turn Buzz was steering had already ended and the adapter began a
+    /// fresh, detached one. It acks `Success` (the message WAS delivered, so
+    /// the event must not be redelivered) but must NOT renew the hard
+    /// deadline — that clock belongs to a turn which is already settled.
+    ///
+    /// Same timeline as the `injected` test, so the only difference is the
+    /// outcome string: original hard deadline at t≈1s, steer response at
+    /// t≈0.5s, prompt response at t≈1.5s. With renewal the prompt response
+    /// would land and this returns `Ok`; without renewal the original
+    /// deadline fires first and we get `HardTimeout`.
+    #[tokio::test]
+    async fn acp_steer_started_new_turn_acks_success_without_renewing_hard_deadline() {
+        let script = "sleep 0.5; \
+             echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"startedNewTurn\"}}'; \
+             sleep 1; \
+             echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"done\":true}}'";
+        let mut client = spawn_script(script).await;
+        set_steering_supported(&mut client);
+
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        client.install_steer_rx(steer_rx);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let send_task = tokio::spawn(async move {
+            steer_tx
+                .send(crate::pool::SteerRequest {
+                    prompt_blocks: vec!["steer body".into()],
+                    ack_tx,
+                })
+                .await
+                .expect("steer_tx send should succeed");
+        });
+
+        let idle = std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(3);
+        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = client
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .await;
+        send_task.await.expect("send_task should complete");
+
+        // The original deadline must still fire — renewal here would extend
+        // the clock on a turn the adapter has already finished.
+        assert!(
+            matches!(result, Err(AcpError::HardTimeout { .. })),
+            "startedNewTurn must NOT renew the hard deadline, so the original \
+             one must still fire; got {result:?}"
+        );
+        // Delivery still succeeded, so the withheld event must be dropped
+        // rather than released — hence Success, not an Err.
+        let ack = ack_rx.await.expect("ack must be received");
+        assert!(
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
+            "startedNewTurn is a delivery success, got {ack:?}"
+        );
+    }
+
+    /// Test 4 (companion to the existing
+    /// `native_steer_with_no_active_run_id_acks_expected_run_id_missing`):
+    /// no run id AND no advertised capability means nothing is written at
+    /// all. This is the gate that keeps a steer off the wire for adapters
+    /// that never implemented either method.
+    #[tokio::test]
+    async fn steer_writes_nothing_when_no_run_id_and_capability_absent() {
+        let capture = capture_path("no_transport");
+        let mut client =
+            spawn_steer_capture_script(&capture, r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        assert!(!client.steering_supported(), "precondition: not advertised");
+        assert!(
+            client.active_run_id().is_none(),
+            "precondition: no active_run_id"
+        );
+
+        let (written, ack) = run_one_steer(&mut client, &capture).await;
+
+        assert!(
+            written.is_none(),
+            "no transport available must write nothing; wrote: {written:?}"
+        );
+        match ack {
+            crate::pool::SteerAck::Err(crate::pool::SteerError::ExpectedRunIdMissing) => {}
+            other => panic!("expected Err(ExpectedRunIdMissing), got {other:?}"),
+        }
+    }
+
+    // ── Standard ACP prompt-response usage ─────────────────────────────────
+
+    fn prompt_response_usage(
+        input: u64,
+        output: u64,
+        total: u64,
+        cached_read: Option<u64>,
+        cached_write: Option<u64>,
+    ) -> serde_json::Value {
+        let mut usage = serde_json::json!({
+            "inputTokens": input,
+            "outputTokens": output,
+            "totalTokens": total,
+        });
+        if let Some(cached_read) = cached_read {
+            usage["cachedReadTokens"] = serde_json::json!(cached_read);
+        }
+        if let Some(cached_write) = cached_write {
+            usage["cachedWriteTokens"] = serde_json::json!(cached_write);
+        }
+        serde_json::json!({"stopReason": "end_turn", "usage": usage})
+    }
+
+    fn standard_cost_update(session_id: &str, cost: f64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "cost": {"amount": cost, "currency": "USD"}
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn claude_prompt_response_usage_merges_with_cumulative_cost() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.notify_session_spawned("claude-session");
+        client.standard_usage.begin_turn("claude-session");
+        client.handle_session_update(&standard_cost_update("claude-session", 0.042));
+        assert_eq!(
+            client
+                .parse_prompt_response(
+                    "claude-session",
+                    &prompt_response_usage(100, 20, 175, Some(30), Some(25)),
+                )
+                .unwrap(),
+            StopReason::EndTurn
+        );
+
+        let usage = client.take_turn_usage().expect("prompt usage");
+        assert!(usage.delta_reliable, "response tokens need no baseline");
+        assert_eq!(usage.turn_input_tokens, Some(155));
+        assert_eq!(usage.turn_output_tokens, Some(20));
+        assert_eq!(
+            usage.turn_total_tokens, None,
+            "Claude total is adapter-derived"
+        );
+        assert_eq!(usage.turn_cache_read_tokens, Some(30));
+        assert_eq!(usage.turn_cache_write_tokens, Some(25));
+        assert_eq!(usage.turn_cost_usd, Some(0.042));
+        assert_eq!(usage.cumulative_cost_usd, Some(0.042));
+        assert_eq!(usage.cumulative_input_tokens, None);
+        assert_eq!(usage.cumulative_output_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn codex_prompt_response_usage_preserves_provider_total_without_cost() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Codex);
+        client.standard_usage.begin_turn("codex-session");
+        client.handle_session_update(&standard_cost_update("codex-session", 0.042));
+        client
+            .parse_prompt_response(
+                "codex-session",
+                &prompt_response_usage(90, 10, 140, Some(40), None),
+            )
+            .unwrap();
+
+        let usage = client.take_turn_usage().expect("prompt usage");
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(130));
+        assert_eq!(usage.turn_output_tokens, Some(10));
+        assert_eq!(usage.turn_total_tokens, Some(140));
+        assert_eq!(usage.turn_cache_read_tokens, Some(40));
+        assert_eq!(usage.turn_cache_write_tokens, None);
+        assert_eq!(
+            usage.cumulative_cost_usd, None,
+            "Codex cost update is ignored"
+        );
+        assert_eq!(usage.cumulative_input_tokens, None);
+        assert_eq!(usage.cumulative_output_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn standard_prompt_input_overflow_fails_closed() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_usage.begin_turn("overflow-session");
+        client
+            .parse_prompt_response(
+                "overflow-session",
+                &prompt_response_usage(u64::MAX, 10, u64::MAX, Some(1), None),
+            )
+            .unwrap();
+
+        assert!(
+            client.take_turn_usage().is_none(),
+            "overflow without another valid signal must not emit all-null usage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_named_adapter_wire_lifecycle_records_prompt_and_cost() {
+        let script = r#"
+            read -r REQ
+            ID=$(printf '%s' "$REQ" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"wire-session","update":{"sessionUpdate":"usage_update","cost":{"amount":0.5,"currency":"USD"}}}}'
+            echo '{"jsonrpc":"2.0","id":'"$ID"',"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10,"cachedReadTokens":2}}}'
+            sleep 1
+        "#;
+        let (mut client, dir) = spawn_named_script("claude-code", script).await;
+        assert_eq!(client.standard_adapter, Some(StandardAdapterKind::Claude));
+        client.notify_session_spawned("wire-session");
+
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                "wire-session",
+                "hello",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("wire prompt");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let usage = client.take_turn_usage().expect("wire usage");
+        assert_eq!(usage.turn_seq, 1);
+        assert_eq!(usage.turn_input_tokens, Some(9));
+        assert_eq!(usage.turn_output_tokens, Some(3));
+        assert_eq!(usage.turn_cost_usd, Some(0.5));
+        assert_eq!(usage.cumulative_cost_usd, Some(0.5));
+        drop(client);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claude_cost_only_record_survives_missing_prompt_usage() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.notify_session_spawned("cost-only-session");
+        client.standard_usage.begin_turn("cost-only-session");
+        client.handle_session_update(&standard_cost_update("cost-only-session", 0.125));
+
+        let usage = client.take_turn_usage().expect("cost-only usage");
+        assert_eq!(usage.turn_seq, 1);
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, None);
+        assert_eq!(usage.turn_cost_usd, Some(0.125));
+        assert_eq!(usage.cumulative_cost_usd, Some(0.125));
+    }
+
+    #[tokio::test]
+    async fn attached_claude_session_does_not_invent_first_cost_delta() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.standard_usage.begin_turn("attached-session");
+        client.handle_session_update(&standard_cost_update("attached-session", 1.25));
+        client
+            .parse_prompt_response(
+                "attached-session",
+                &prompt_response_usage(10, 2, 12, None, None),
+            )
+            .unwrap();
+
+        let usage = client.take_turn_usage().expect("attached usage");
+        assert_eq!(usage.turn_cost_usd, None);
+        assert_eq!(usage.cumulative_cost_usd, Some(1.25));
+    }
+
+    #[tokio::test]
+    async fn standard_usage_two_prompts_preserve_both_monotonic_sequences() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.notify_session_spawned("two-prompt-session");
+
+        client.standard_usage.begin_turn("two-prompt-session");
+        client.handle_session_update(&standard_cost_update("two-prompt-session", 0.1));
+        client
+            .parse_prompt_response(
+                "two-prompt-session",
+                &prompt_response_usage(10, 2, 12, None, None),
+            )
+            .unwrap();
+        let initial = client.take_turn_usage().expect("initial prompt usage");
+
+        client.standard_usage.begin_turn("two-prompt-session");
+        client.handle_session_update(&standard_cost_update("two-prompt-session", 0.25));
+        client
+            .parse_prompt_response(
+                "two-prompt-session",
+                &prompt_response_usage(20, 3, 23, None, None),
+            )
+            .unwrap();
+        let user = client.take_turn_usage().expect("user prompt usage");
+
+        assert_eq!((initial.turn_seq, user.turn_seq), (1, 2));
+        assert_eq!(
+            (initial.turn_input_tokens, user.turn_input_tokens),
+            (Some(10), Some(20))
+        );
+        assert_eq!(
+            (initial.turn_cost_usd, user.turn_cost_usd),
+            (Some(0.1), Some(0.15))
+        );
+    }
+
+    #[tokio::test]
+    async fn goose_usage_stays_exclusive_and_drains_standard_usage() {
+        let mut client = spawn_inert_client().await;
+        client.standard_adapter = Some(StandardAdapterKind::Claude);
+        client.goose_usage.begin_turn("goose-session");
+        client.standard_usage.begin_turn("goose-session");
+        client.handle_goose_usage_update(&goose_usage_update_msg("goose-session", 1000, 200, None));
+        client
+            .parse_prompt_response(
+                "goose-session",
+                &prompt_response_usage(100, 20, 120, None, None),
+            )
+            .unwrap();
+
+        let usage = client.take_turn_usage().expect("goose usage");
+        assert_eq!(usage.cumulative_input_tokens, Some(1000));
+        assert_eq!(
+            usage.turn_input_tokens, None,
+            "goose first delta remains exclusive"
+        );
+        assert!(
+            client.take_turn_usage().is_none(),
+            "standard usage was drained"
+        );
     }
 
     // ── Goose usage notification integration ──────────────────────────────
@@ -2976,8 +4962,8 @@ mod tests {
         assert_eq!(usage.session_id, "s1");
         assert_eq!(usage.turn_seq, 1);
         assert!(!usage.delta_reliable, "first turn must be unreliable");
-        assert_eq!(usage.cumulative_input_tokens, 1000);
-        assert_eq!(usage.cumulative_output_tokens, 200);
+        assert_eq!(usage.cumulative_input_tokens, Some(1000));
+        assert_eq!(usage.cumulative_output_tokens, Some(200));
         assert_eq!(usage.cumulative_cost_usd, Some(0.01));
 
         // Second take must be None.
@@ -3048,5 +5034,237 @@ mod tests {
             }
             other => panic!("expected AgentError, got {other:?}"),
         }
+    }
+
+    // ── build_codex_config_env ────────────────────────────────────────────────
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    const GENERATED: &str = r#"{"sandbox_workspace_write":{"network_access":true}}"#;
+
+    #[test]
+    fn build_codex_config_env_returns_none_when_no_codex_config_in_extra_env() {
+        // Non-Codex agents: extra_env has no CODEX_CONFIG → None regardless of signal.
+        let extra = env(&[("GOOSE_PROVIDER", "openai")]);
+        let result = build_codex_config_env(&extra, None, false).unwrap();
+        assert_eq!(
+            result, None,
+            "no CODEX_CONFIG in extra_env must return None"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_generated_only_single_entry_with_signal_true_merges_with_parent() {
+        // No persona: Buzz injects one CODEX_CONFIG; signal=true.
+        // Parent may have its own CODEX_CONFIG — deep_merge applies, network_access forced.
+        let extra = env(&[("CODEX_CONFIG", GENERATED)]);
+        let parent =
+            r#"{"some_operator_key":"val","sandbox_workspace_write":{"operator_key":"keep"}}"#;
+        let merged = build_codex_config_env(&extra, Some(parent), true)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        // network_access forced true even though only one entry in extra_env.
+        assert_eq!(
+            v["sandbox_workspace_write"]["network_access"], true,
+            "network_access must be forced true with signal=true"
+        );
+        // Operator key preserved via deep_merge.
+        assert_eq!(
+            v["sandbox_workspace_write"]["operator_key"], "keep",
+            "operator nested key must survive"
+        );
+        assert_eq!(
+            v["some_operator_key"], "val",
+            "operator top-level key must survive"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_persona_only_signal_false_returns_none() {
+        // Persona set CODEX_CONFIG; Buzz did not inject a generated overlay (signal=false).
+        // Must return None — no merging, no sandbox widening.
+        let persona = r#"{"some_feature":"on"}"#;
+        let extra = env(&[("CODEX_CONFIG", persona)]);
+        let result = build_codex_config_env(&extra, None, false).unwrap();
+        assert_eq!(
+            result, None,
+            "persona-only CODEX_CONFIG with signal=false must return None"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_returns_none_for_persona_only_no_generated_overlay() {
+        // Alias: same scenario as above, confirms the old count-based path no longer exists.
+        let persona = r#"{"some_feature":"on"}"#;
+        let extra = env(&[("CODEX_CONFIG", persona)]);
+        let result = build_codex_config_env(&extra, None, false).unwrap();
+        assert_eq!(
+            result, None,
+            "persona-only CODEX_CONFIG with signal=false must return None"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_sets_network_access_from_scratch() {
+        // Persona + generated overlay, signal=true: network_access is forced true.
+        let persona = r#"{}"#;
+        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
+        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
+    }
+
+    #[test]
+    fn build_codex_config_env_persona_keys_survive_merge() {
+        // Persona has CODEX_CONFIG with unrelated keys; generated overlay must
+        // force network_access=true without erasing persona keys.
+        let persona_cfg = r#"{"some_feature":{"enabled":true}}"#;
+        // Config::from_args appends generated AFTER persona env vars.
+        let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
+        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(
+            v["some_feature"]["enabled"], true,
+            "persona key must survive merge"
+        );
+        assert_eq!(
+            v["sandbox_workspace_write"]["network_access"], true,
+            "network_access must be forced true"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_nested_persona_keys_survive_when_parent_has_same_top_level_key() {
+        // Persona has sandbox_workspace_write.persona_only; parent has
+        // sandbox_workspace_write.parent_only.  A flat top-level spread would drop
+        // persona_only.  deep_merge must preserve both nested keys, and
+        // network_access must be forced true last.
+        let persona_cfg = r#"{"sandbox_workspace_write":{"persona_only":"keep_me"}}"#;
+        let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
+        let parent = r#"{"sandbox_workspace_write":{"parent_only":"also_here"}}"#;
+        let merged = build_codex_config_env(&extra, Some(parent), true)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        // Both nested keys survive — no flat-spread drop.
+        assert_eq!(
+            v["sandbox_workspace_write"]["persona_only"], "keep_me",
+            "nested persona key must survive when parent has the same top-level key"
+        );
+        assert_eq!(
+            v["sandbox_workspace_write"]["parent_only"], "also_here",
+            "nested parent key must be present"
+        );
+        // Forced last.
+        assert_eq!(
+            v["sandbox_workspace_write"]["network_access"], true,
+            "network_access must be forced true"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_parent_env_wins_on_collisions_persona_keys_survive() {
+        // Parent env has CODEX_CONFIG with some keys; persona has different keys.
+        // Parent wins on collision; unrelated persona keys survive.
+        // network_access is always forced true.
+        let persona_cfg = r#"{"persona_key":"persona_val","shared_key":"persona_version"}"#;
+        // Config::from_args appends generated AFTER persona env vars.
+        let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
+        let parent = r#"{"parent_key":"parent_val","shared_key":"parent_version"}"#;
+        let merged = build_codex_config_env(&extra, Some(parent), true)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        // Parent-only key present
+        assert_eq!(
+            v["parent_key"], "parent_val",
+            "parent-only key must be present"
+        );
+        // Unrelated persona key survives (no collision with parent)
+        assert_eq!(
+            v["persona_key"], "persona_val",
+            "unrelated persona key must survive"
+        );
+        // Collision: parent wins
+        assert_eq!(
+            v["shared_key"], "parent_version",
+            "parent must win on colliding key"
+        );
+        // network_access always true (forced last)
+        assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
+    }
+
+    #[test]
+    fn build_codex_config_env_parent_has_existing_sandbox_other_keys_survive() {
+        // Parent env has sandbox_workspace_write with extra keys; after merge
+        // those extra keys survive alongside network_access=true.
+        let persona = r#"{}"#;
+        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
+        let parent =
+            r#"{"sandbox_workspace_write":{"network_access":false,"other_sandbox_key":"val"}}"#;
+        let merged = build_codex_config_env(&extra, Some(parent), true)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        // network_access forced true even though parent set false
+        assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
+        // other_sandbox_key survives (parent's sws merged, then network_access forced)
+        assert_eq!(v["sandbox_workspace_write"]["other_sandbox_key"], "val");
+    }
+
+    #[test]
+    fn build_codex_config_env_errors_on_invalid_persona_json() {
+        // Bad persona JSON + generated overlay, signal=true → parse error before merging.
+        let extra = env(&[("CODEX_CONFIG", "not-json"), ("CODEX_CONFIG", GENERATED)]);
+        let result = build_codex_config_env(&extra, None, true);
+        assert!(result.is_err(), "invalid persona JSON must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("CODEX_CONFIG"),
+            "error must mention CODEX_CONFIG"
+        );
+    }
+
+    #[test]
+    fn build_codex_config_env_errors_on_non_object_persona_json() {
+        // Non-object persona JSON + generated overlay, signal=true → parse error.
+        let extra = env(&[("CODEX_CONFIG", "[1,2,3]"), ("CODEX_CONFIG", GENERATED)]);
+        let result = build_codex_config_env(&extra, None, true);
+        assert!(result.is_err(), "non-object persona JSON must return Err");
+    }
+
+    #[test]
+    fn build_codex_config_env_errors_on_invalid_parent_json() {
+        let persona = r#"{}"#;
+        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
+        let result = build_codex_config_env(&extra, Some("bad-json"), true);
+        assert!(result.is_err(), "invalid parent env JSON must return Err");
+    }
+
+    #[test]
+    fn build_codex_config_env_errors_on_non_object_sandbox_workspace_write() {
+        // sandbox_workspace_write must be an object for network_access forcing.
+        // If the parent env sets it to a non-object scalar, deep_merge replaces
+        // our object with the scalar, and the force step must fail clearly.
+        let persona = r#"{}"#;
+        let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
+        // Parent replaces the object with a scalar — deep_merge: scalar overlay wins.
+        let parent = r#"{"sandbox_workspace_write": 42}"#;
+        let result = build_codex_config_env(&extra, Some(parent), true);
+        assert!(
+            result.is_err(),
+            "non-object sandbox_workspace_write must return Err"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("sandbox_workspace_write"),
+            "error must mention sandbox_workspace_write"
+        );
     }
 }

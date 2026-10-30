@@ -2,6 +2,13 @@ part of '../compose_bar.dart';
 
 class _MentionSuggestions extends StatelessWidget {
   final List<MentionCandidate> suggestions;
+
+  /// Shown rows that can no longer be chosen. They stay in place, disabled.
+  final Set<String> unavailable;
+
+  /// The directory search failed: show its error and a retry below the rows.
+  final bool searchFailed;
+  final VoidCallback? onRetry;
   final Map<String, UserProfile> userCache;
   final String? currentPubkey;
   final bool isDmChannel;
@@ -9,6 +16,9 @@ class _MentionSuggestions extends StatelessWidget {
 
   const _MentionSuggestions({
     required this.suggestions,
+    this.unavailable = const {},
+    this.searchFailed = false,
+    this.onRetry,
     required this.userCache,
     required this.currentPubkey,
     required this.isDmChannel,
@@ -17,62 +27,82 @@ class _MentionSuggestions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      constraints: const BoxConstraints(maxHeight: 240),
+    return Material(
+      key: const ValueKey('mention-suggestions-popover'),
+      type: MaterialType.card,
+      color: appPopoverColor(context),
+      surfaceTintColor: Colors.transparent,
+      elevation: appPopoverElevation,
+      shadowColor: appPopoverShadowColor(context),
+      shape: appPopoverShape(context),
       clipBehavior: Clip.hardEdge,
-      decoration: BoxDecoration(
-        color: context.colors.surfaceContainerHighest,
-        borderRadius: const BorderRadius.vertical(
-          top: Radius.circular(Radii.dialog),
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: context.colors.shadow.withValues(alpha: 0.08),
-            blurRadius: 8,
-            offset: const Offset(0, -2),
-          ),
-        ],
-      ),
-      child: ListView.separated(
-        shrinkWrap: true,
-        padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
-        itemCount: suggestions.length,
-        separatorBuilder: (_, _) => const SizedBox.shrink(),
-        itemBuilder: (context, index) {
-          final candidate = suggestions[index];
-          final name = candidate.label;
-          final avatarUrl =
-              candidate.avatarUrl ?? userCache[candidate.pubkey]?.avatarUrl;
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 240),
+        child: ListView.separated(
+          shrinkWrap: true,
+          padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
+          itemCount: suggestions.length + (searchFailed ? 1 : 0),
+          separatorBuilder: (_, _) => const SizedBox.shrink(),
+          itemBuilder: (context, index) {
+            if (index == suggestions.length) {
+              return ListTile(
+                key: const ValueKey('mention-search-error'),
+                dense: true,
+                visualDensity: VisualDensity.compact,
+                title: Text(
+                  'Could not search community people.',
+                  style: context.textTheme.bodySmall?.copyWith(
+                    color: context.colors.error,
+                  ),
+                ),
+                trailing: TextButton(
+                  onPressed: onRetry == null
+                      ? null
+                      : () => _runComposerAction(onRetry!),
+                  child: const Text('Retry'),
+                ),
+              );
+            }
+            final candidate = suggestions[index];
+            final name = candidate.pickerLabel;
+            final avatarUrl =
+                candidate.avatarUrl ?? userCache[candidate.pubkey]?.avatarUrl;
 
-          return ListTile(
-            dense: true,
-            visualDensity: VisualDensity.compact,
-            leading: CircleAvatar(
-              radius: 14,
-              backgroundColor: context.colors.primaryContainer,
-              backgroundImage: avatarUrl != null
-                  ? NetworkImage(avatarUrl)
+            final available = !unavailable.contains(candidate.pubkey);
+            return ListTile(
+              enabled: available,
+              dense: true,
+              visualDensity: VisualDensity.compact,
+              leading: AvatarImage(
+                imageUrl: avatarUrl,
+                radius: 18,
+                backgroundColor: context.controlSurface,
+                fallback: Text(
+                  // Name-derived for named candidates; keyed to the hex
+                  // public key for unnamed ones so the compact-npub label
+                  // doesn't render `N` for everyone.
+                  candidate.initial,
+                  style: context.textTheme.labelMedium?.copyWith(
+                    color: context.colors.onPrimaryContainer,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                isAgent: candidate.isAgent,
+              ),
+              title: Text(name, style: context.textTheme.titleSmall),
+              subtitle: _MentionSuggestionInfo.build(
+                context,
+                candidate: candidate,
+                currentPubkey: currentPubkey,
+                isDmChannel: isDmChannel,
+                userCache: userCache,
+              ),
+              onTap: available
+                  ? () => _runComposerAction(() => onSelect(candidate))
                   : null,
-              child: avatarUrl == null
-                  ? Text(
-                      name[0].toUpperCase(),
-                      style: context.textTheme.labelSmall?.copyWith(
-                        color: context.colors.onPrimaryContainer,
-                      ),
-                    )
-                  : null,
-            ),
-            title: Text(name, style: context.textTheme.bodyMedium),
-            subtitle: _MentionSuggestionInfo.build(
-              context,
-              candidate: candidate,
-              currentPubkey: currentPubkey,
-              isDmChannel: isDmChannel,
-              userCache: userCache,
-            ),
-            onTap: () => onSelect(candidate),
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }
@@ -80,7 +110,7 @@ class _MentionSuggestions extends StatelessWidget {
 
 /// The secondary info line under a mention suggestion — mirrors desktop's
 /// `MentionAutocomplete` subtitle: bot icon + "agent" (or an "admin" badge
-/// for human admins), then "owned by …" / "not in channel".
+/// for human admins), then "managed by …" / "not in channel" (or "not in DM").
 abstract final class _MentionSuggestionInfo {
   static Widget? build(
     BuildContext context, {
@@ -92,16 +122,17 @@ abstract final class _MentionSuggestionInfo {
     final ownerLabel = candidate.isAgent
         ? formatOwnerLabel(candidate.ownerPubkey, currentPubkey, userCache)
         : null;
-    final notInChannel = !isDmChannel && !candidate.isMember;
+    final notInChannel = !candidate.isMember;
+    final outside = isDmChannel ? 'not in DM' : 'not in channel';
     final isAdmin = !candidate.isAgent && candidate.role == 'admin';
 
     final String? detail;
     if (ownerLabel != null && notInChannel) {
-      detail = 'owned by $ownerLabel \u00b7 not in channel';
+      detail = 'managed by $ownerLabel \u00b7 $outside';
     } else if (ownerLabel != null) {
-      detail = 'owned by $ownerLabel';
+      detail = 'managed by $ownerLabel';
     } else if (notInChannel) {
-      detail = 'not in channel';
+      detail = outside;
     } else {
       detail = null;
     }
@@ -115,11 +146,7 @@ abstract final class _MentionSuggestionInfo {
     return Row(
       children: [
         if (candidate.isAgent) ...[
-          Icon(
-            LucideIcons.bot,
-            size: 12,
-            color: context.colors.onSurfaceVariant,
-          ),
+          Icon(BuzzIcons.bot, size: 12, color: context.colors.onSurfaceVariant),
           const SizedBox(width: Grid.half),
           Text('agent', style: style),
         ] else if (isAdmin)
@@ -175,50 +202,41 @@ class _ChannelSuggestions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      constraints: const BoxConstraints(maxHeight: 240),
+    return Material(
+      key: const ValueKey('channel-suggestions-popover'),
+      type: MaterialType.card,
+      color: appPopoverColor(context),
+      surfaceTintColor: Colors.transparent,
+      elevation: appPopoverElevation,
+      shadowColor: appPopoverShadowColor(context),
+      shape: appPopoverShape(context),
       clipBehavior: Clip.hardEdge,
-      decoration: BoxDecoration(
-        color: context.colors.surfaceContainerHighest,
-        borderRadius: const BorderRadius.vertical(
-          top: Radius.circular(Radii.dialog),
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: context.colors.shadow.withValues(alpha: 0.08),
-            blurRadius: 8,
-            offset: const Offset(0, -2),
-          ),
-        ],
-      ),
-      child: ListView.separated(
-        shrinkWrap: true,
-        padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
-        itemCount: suggestions.length,
-        separatorBuilder: (_, _) => const SizedBox.shrink(),
-        itemBuilder: (context, index) {
-          final channel = suggestions[index];
-          return ListTile(
-            dense: true,
-            visualDensity: VisualDensity.compact,
-            leading: Icon(
-              channel.isForum ? LucideIcons.messageSquare : LucideIcons.hash,
-              size: 18,
-              color: context.colors.onSurfaceVariant,
-            ),
-            title: Text(
-              '#${channel.name}',
-              style: context.textTheme.bodyMedium,
-            ),
-            trailing: Text(
-              channel.channelType,
-              style: context.textTheme.labelSmall?.copyWith(
-                color: context.colors.onSurfaceVariant,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 240),
+        child: ListView.separated(
+          shrinkWrap: true,
+          padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
+          itemCount: suggestions.length,
+          separatorBuilder: (_, _) => const SizedBox.shrink(),
+          itemBuilder: (context, index) {
+            final channel = suggestions[index];
+            return ListTile(
+              dense: true,
+              visualDensity: VisualDensity.compact,
+              horizontalTitleGap: 0,
+              leading: SizedBox.square(
+                dimension: 36,
+                child: Icon(
+                  BuzzIcons.hash,
+                  size: 20,
+                  color: context.colors.onSurfaceVariant,
+                ),
               ),
-            ),
-            onTap: () => onSelect(channel),
-          );
-        },
+              title: Text(channel.name, style: context.textTheme.bodyLarge),
+              onTap: () => _runComposerAction(() => onSelect(channel)),
+            );
+          },
+        ),
       ),
     );
   }

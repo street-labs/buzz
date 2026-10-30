@@ -45,8 +45,6 @@ pub struct ManagedAgentEventContent {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_toolsets: Option<String>,
     /// `persona_content_hash` of the persona snapshot pinned at create time.
     /// Public drift indicator (not a secret) — lets other clients flag a stale
     /// snapshot without re-reading the source persona.
@@ -97,7 +95,6 @@ pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventCont
         } else {
             record.provider.clone()
         },
-        mcp_toolsets: record.mcp_toolsets.clone(),
         persona_source_version: if definition_linked {
             None
         } else {
@@ -114,6 +111,12 @@ pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventCont
 /// Returns an unsigned `EventBuilder` — the caller signs and submits. The
 /// `d_tag` is the agent's pubkey.
 pub fn build_agent_event(record: &ManagedAgentRecord) -> Result<EventBuilder, String> {
+    super::validate_managed_agent_definition_text(
+        &record.name,
+        record.persona_id.as_deref(),
+        record.system_prompt.as_deref(),
+    )
+    .map_err(|error| format!("Managed agent definition is unsafe to publish: {error}"))?;
     let content = serde_json::to_string(&agent_event_content(record))
         .map_err(|e| format!("failed to serialize managed-agent content: {e}"))?;
     let tags =
@@ -161,6 +164,8 @@ mod tests {
 
     fn sample_agent() -> ManagedAgentRecord {
         ManagedAgentRecord {
+            session_policy: Default::default(),
+            description: None,
             pubkey: "agentpubkeyhex".to_string(),
             name: "Test Agent".to_string(),
             persona_id: Some("persona-1".to_string()),
@@ -181,7 +186,6 @@ mod tests {
             model: Some("claude-opus-4".to_string()),
             provider: Some("anthropic".to_string()),
             persona_source_version: Some("abc123".to_string()),
-            mcp_toolsets: Some("default".to_string()),
             env_vars: BTreeMap::from([("OPENAI_API_KEY".to_string(), "sk-secret".to_string())]),
             start_on_app_launch: true,
             auto_restart_on_config_change: true,
@@ -191,7 +195,9 @@ mod tests {
                 config: serde_json::json!({ "api_key": "sk-provider-secret" }),
             },
             backend_agent_id: Some("remote-id".to_string()),
+            provider_policy_pending: false,
             provider_binary_path: Some("/path/to/binary".to_string()),
+            team_id: None,
             persona_team_dir: None,
             persona_name_in_team: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
@@ -211,13 +217,16 @@ mod tests {
             name_pool: vec!["poolname".to_string()],
             is_builtin: true,
             is_active: false,
+            shared: false,
             source_team: None,
             source_team_persona_slug: None,
+            catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
-            definition_mcp_toolsets: None,
             definition_parallelism: None,
             relay_mesh: None,
+            effort_level: None,
         }
     }
 
@@ -227,6 +236,31 @@ mod tests {
         let keys = nostr::Keys::generate();
         let event = builder.sign_with_keys(&keys).unwrap();
         assert_eq!(event.kind.as_u16() as u32, KIND_MANAGED_AGENT);
+    }
+
+    #[test]
+    fn publication_rejects_unsafe_definition_less_name_and_prompt() {
+        let mut unsafe_name = sample_agent();
+        unsafe_name.persona_id = None;
+        unsafe_name.name = "Review\u{200B}er".to_string();
+        let error = build_agent_event(&unsafe_name)
+            .expect_err("publication must reject an invisible agent name");
+        assert!(error.contains("U+200B"), "unexpected error: {error}");
+
+        let mut unsafe_prompt = sample_agent();
+        unsafe_prompt.persona_id = None;
+        unsafe_prompt.system_prompt = Some("Review\u{202E} code.".to_string());
+        let error = build_agent_event(&unsafe_prompt)
+            .expect_err("publication must reject bidi formatting in instructions");
+        assert!(error.contains("U+202E"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn publication_ignores_inert_linked_record_prompt() {
+        let mut linked = sample_agent();
+        linked.system_prompt = Some("stale\u{200B} prompt".to_string());
+        build_agent_event(&linked)
+            .expect("linked record prompt is omitted in favor of the validated persona");
     }
 
     #[test]
@@ -319,7 +353,6 @@ mod tests {
         // Instance fields stay on the wire.
         assert!(json.contains("parallelism"));
         assert!(json.contains("respond_to"));
-        assert!(json.contains("mcp_toolsets"));
 
         let mut standalone = sample_agent();
         standalone.persona_id = None;

@@ -2,19 +2,39 @@ import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { relayClient } from "@/shared/api/relayClient";
+import { isRateLimited } from "@/shared/api/relayRateLimitGate";
+import { useRelayConnection } from "@/shared/api/useRelayConnection";
+import { getOsIdleSeconds } from "@/shared/api/osIdle";
 import { getPresence } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import {
+  activePresencePubkeys,
   mergePresenceUpdate,
   parseLivePresenceEvent,
   presenceQueryWantsPubkey,
+  PRESENCE_HEARTBEAT_INTERVAL_MS,
+  PRESENCE_TTL_SECONDS,
+  resolveAutomaticPresenceStatus,
 } from "@/features/presence/lib/presence";
+import { PresenceSubscriptionReconciler } from "@/features/presence/lib/presenceSubscriptionReconciler";
+import { openPresenceSubscription } from "@/shared/api/presenceRelaySubscription";
 import type { PresenceLookup, PresenceStatus } from "@/shared/api/types";
 
-const PRESENCE_HEARTBEAT_INTERVAL_MS = 30_000;
-const PRESENCE_IDLE_TIMEOUT_MS = 5 * 60_000;
 const PRESENCE_STATUS_TICK_INTERVAL_MS = 30_000;
-const PRESENCE_TTL_SECONDS = 90;
+/** Keeps focused polling for presence at the established 60-second backstop cadence. */
+export const PRESENCE_REFETCH_INTERVAL_MS = 60_000;
+/** Suppresses the focus refetch until presence data is genuinely stale.
+ * The live subscription (setQueriesData) and reconnect invalidation are the
+ * primary freshness paths; the 60s poll is the backstop. */
+export const PRESENCE_FOCUS_STALE_TIME_MS = 5 * 60_000;
+
+/** Focus-refetch policy for the presence query; consumed by focusRefetchPolicy.test.mjs. */
+export const presenceFocusRefetchPolicy = {
+  staleTime: PRESENCE_FOCUS_STALE_TIME_MS,
+  refetchOnWindowFocus: false,
+} as const;
+const PRESENCE_ACTIVITY_THROTTLE_MS = 1_000;
 const PRESENCE_PREFERENCE_STORAGE_KEY = "buzz-presence-preference";
 
 type PresencePreference = "auto" | "away" | "offline" | null;
@@ -25,7 +45,8 @@ function normalizePubkeys(pubkeys: string[]) {
     .sort();
 }
 
-function presenceQueryKey(pubkeys: string[]) {
+/** Canonical normalized key shared by observers and action-time readers. */
+export function presenceQueryKey(pubkeys: string[]) {
   return ["presence", ...normalizePubkeys(pubkeys)] as const;
 }
 
@@ -62,16 +83,11 @@ function writeStoredPresencePreference(
   window.localStorage.setItem(presencePreferenceStorageKey(pubkey), preference);
 }
 
-function resolveAutomaticPresenceStatus(
-  isDocumentHidden: boolean,
+function resolveAutomaticPresenceStatusSync(
   lastActivityAt: number,
   now: number,
 ): PresenceStatus {
-  if (isDocumentHidden) {
-    return "away";
-  }
-
-  return now - lastActivityAt >= PRESENCE_IDLE_TIMEOUT_MS ? "away" : "online";
+  return resolveAutomaticPresenceStatus(null, lastActivityAt, now);
 }
 
 export function usePresenceQuery(
@@ -82,31 +98,35 @@ export function usePresenceQuery(
 ) {
   const normalizedPubkeys = normalizePubkeys(pubkeys);
   const enabled = (options?.enabled ?? true) && normalizedPubkeys.length > 0;
+  const connectionState = useRelayConnection();
+  const connected = connectionState === "connected";
+  const refetchInterval = useFocusedRefetchInterval(
+    connected ? PRESENCE_REFETCH_INTERVAL_MS : false,
+  );
 
   return useQuery<PresenceLookup>({
     enabled,
     queryKey: presenceQueryKey(normalizedPubkeys),
     queryFn: () => getPresence(normalizedPubkeys),
-    staleTime: 30_000,
     // Backstop poll: catches REST-only writers (ACP agents) and TTL expiry
-    // (crashed clients). WS events handle the fast path.
-    refetchInterval: 60_000,
+    // (crashed clients). WS events handle the fast path. Pause on degraded
+    // connections — HTTP presence calls fail anyway and consume relay quota.
+    refetchInterval,
+    ...presenceFocusRefetchPolicy,
   });
 }
 
 /**
- * Subscribe to kind:20001 presence events over WebSocket and update the
- * TanStack Query presence cache in-place when updates arrive. Call once
- * in AppShell. Uses setQueriesData for targeted per-pubkey updates without
- * triggering refetches. Retries with exponential backoff on failure.
+ * Keep one live presence subscription scoped to pubkeys requested by active
+ * TanStack queries. Replacement subscriptions open before the old one closes,
+ * avoiding a live-update gap while query observers change.
  */
 export function usePresenceSubscription() {
   const queryClient = useQueryClient();
 
   React.useEffect(() => {
-    let unsub: (() => Promise<void>) | null = null;
     let isCancelled = false;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
     function handlePresenceEvent(event: { pubkey: string; content: string }) {
       if (isCancelled) return;
@@ -116,35 +136,47 @@ export function usePresenceSubscription() {
       queryClient.setQueriesData<PresenceLookup>(
         {
           queryKey: ["presence"],
+          // A single live author cannot heal a failed aggregate snapshot:
+          // setQueriesData would mark every cached sibling successful again.
           predicate: (query) =>
+            query.state.status === "success" &&
             presenceQueryWantsPubkey(query.queryKey, pubkey),
         },
         (old) => mergePresenceUpdate(old, pubkey, status),
       );
     }
 
-    function subscribeWithRetry(attempt = 0) {
-      if (isCancelled) return;
-      void relayClient
-        .subscribeToPresenceUpdates(handlePresenceEvent)
-        .then((unsubFn) => {
-          if (isCancelled) {
-            void unsubFn();
-            return;
-          }
-          unsub = unsubFn;
-        })
-        .catch(() => {
-          if (!isCancelled) {
-            const delay = Math.min(1000 * 2 ** attempt, 30_000);
-            retryTimer = setTimeout(
-              () => subscribeWithRetry(attempt + 1),
-              delay,
-            );
-          }
-        });
+    const reconciler = new PresenceSubscriptionReconciler({
+      open: (authors) =>
+        openPresenceSubscription(authors, handlePresenceEvent, (...args) =>
+          relayClient.subscribeLive(...args),
+        ),
+    });
+
+    function reconcileActiveQueries() {
+      reconciler.setAuthors(
+        activePresencePubkeys(queryClient.getQueryCache().getAll()),
+      );
     }
-    subscribeWithRetry();
+
+    function scheduleReconcile() {
+      if (reconcileTimer) return;
+      reconcileTimer = setTimeout(() => {
+        reconcileTimer = null;
+        reconcileActiveQueries();
+      }, 100);
+    }
+
+    const unsubQueryCache = queryClient.getQueryCache().subscribe((event) => {
+      if (
+        event.type === "observerAdded" ||
+        event.type === "observerRemoved" ||
+        event.type === "observerOptionsUpdated"
+      ) {
+        scheduleReconcile();
+      }
+    });
+    reconcileActiveQueries();
 
     const unsubReconnect = relayClient.subscribeToReconnects(() => {
       if (!isCancelled)
@@ -153,9 +185,10 @@ export function usePresenceSubscription() {
 
     return () => {
       isCancelled = true;
+      unsubQueryCache();
       unsubReconnect();
-      if (retryTimer) clearTimeout(retryTimer);
-      if (unsub) void unsub();
+      if (reconcileTimer) clearTimeout(reconcileTimer);
+      reconciler.dispose();
     };
   }, [queryClient]);
 }
@@ -177,7 +210,9 @@ export function useSetPresenceMutation(pubkey?: string) {
       queryClient.setQueriesData<PresenceLookup>(
         {
           queryKey: ["presence"],
+          // A successful self heartbeat is not a fresh roster snapshot.
           predicate: (query) =>
+            query.state.status === "success" &&
             presenceQueryWantsPubkey(query.queryKey, normalizedPubkey),
         },
         (old) => mergePresenceUpdate(old, normalizedPubkey, status),
@@ -208,25 +243,41 @@ export function usePresenceSession(pubkey?: string) {
   const lastActivityAtRef = React.useRef(Date.now());
   const [automaticStatus, setAutomaticStatus] = React.useState<PresenceStatus>(
     () =>
-      resolveAutomaticPresenceStatus(
-        typeof document === "undefined" ? false : document.hidden,
-        lastActivityAtRef.current,
-        Date.now(),
-      ),
+      resolveAutomaticPresenceStatusSync(lastActivityAtRef.current, Date.now()),
   );
   const automaticStatusRef = React.useRef(automaticStatus);
   const skipNextSyncRef = React.useRef<PresenceStatus | null>(null);
 
-  const reevaluateAutomaticStatus = React.useEffectEvent(() => {
-    const next = resolveAutomaticPresenceStatus(
-      typeof document === "undefined" ? false : document.hidden,
-      lastActivityAtRef.current,
-      Date.now(),
-    );
+  const applyAutomaticStatus = React.useEffectEvent((next: PresenceStatus) => {
     if (next !== automaticStatusRef.current) {
       automaticStatusRef.current = next;
       setAutomaticStatus(next);
     }
+  });
+
+  const reevaluateAutomaticStatus = React.useEffectEvent(() => {
+    applyAutomaticStatus(
+      resolveAutomaticPresenceStatusSync(lastActivityAtRef.current, Date.now()),
+    );
+  });
+
+  // OS-wide idle is authoritative when available; async, so tick-driven only.
+  const reevaluateFromOsIdle = React.useEffectEvent(async () => {
+    const osIdleSeconds = await getOsIdleSeconds().catch(() => null);
+    if (typeof osIdleSeconds === "number") {
+      // Keep the fallback clock consistent so a later null reading can't flap.
+      lastActivityAtRef.current = Math.max(
+        lastActivityAtRef.current,
+        Date.now() - osIdleSeconds * 1000,
+      );
+    }
+    applyAutomaticStatus(
+      resolveAutomaticPresenceStatus(
+        typeof osIdleSeconds === "number" ? osIdleSeconds : null,
+        lastActivityAtRef.current,
+        Date.now(),
+      ),
+    );
   });
 
   React.useEffect(() => {
@@ -249,37 +300,36 @@ export function usePresenceSession(pubkey?: string) {
       return;
     }
 
+    // Fallback activity signal: wheel/pointermove count (passive reading),
+    // throttled to 1/s; window visibility never affects presence.
+    let lastRecordedAt = 0;
+
     function handleUserActivity() {
-      if (typeof document !== "undefined" && document.hidden) {
+      const now = Date.now();
+      if (now - lastRecordedAt < PRESENCE_ACTIVITY_THROTTLE_MS) {
         return;
       }
-
+      lastRecordedAt = now;
       recordActivity();
-    }
-
-    function handleFocus() {
-      recordActivity();
-    }
-
-    function handleVisibilityChange() {
-      if (!document.hidden) {
-        recordActivity();
-        return;
-      }
-      // Going hidden can flip the automatic status to away.
-      reevaluateAutomaticStatus();
     }
 
     window.addEventListener("pointerdown", handleUserActivity, true);
+    window.addEventListener("pointermove", handleUserActivity, true);
+    window.addEventListener("wheel", handleUserActivity, {
+      capture: true,
+      passive: true,
+    });
     window.addEventListener("keydown", handleUserActivity, true);
-    window.addEventListener("focus", handleFocus);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleUserActivity);
 
     return () => {
       window.removeEventListener("pointerdown", handleUserActivity, true);
+      window.removeEventListener("pointermove", handleUserActivity, true);
+      window.removeEventListener("wheel", handleUserActivity, {
+        capture: true,
+      });
       window.removeEventListener("keydown", handleUserActivity, true);
-      window.removeEventListener("focus", handleFocus);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleUserActivity);
     };
   }, [normalizedPubkey]);
 
@@ -288,8 +338,9 @@ export function usePresenceSession(pubkey?: string) {
       return;
     }
 
+    void reevaluateFromOsIdle();
     const intervalId = window.setInterval(() => {
-      reevaluateAutomaticStatus();
+      void reevaluateFromOsIdle();
     }, PRESENCE_STATUS_TICK_INTERVAL_MS);
 
     return () => {
@@ -357,6 +408,11 @@ export function usePresenceSession(pubkey?: string) {
     }
 
     const intervalId = window.setInterval(() => {
+      // Skip heartbeat ticks while the relay is unavailable or rate-limited —
+      // the publish would fail anyway and consumes quota the recovery needs.
+      if (relayClient.getConnectionState() !== "connected" || isRateLimited()) {
+        return;
+      }
       syncPresence(currentStatus);
     }, PRESENCE_HEARTBEAT_INTERVAL_MS);
 

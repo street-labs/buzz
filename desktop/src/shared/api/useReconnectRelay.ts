@@ -4,7 +4,7 @@
  * Delegates all reconnect logic to the module-level `relayReconnectController`
  * singleton so that all mounted hook instances (banner + sidebar card) share
  * a single in-flight state. Deliberately uses `preconnect()` rather than the
- * full `reconnectWorkspace()` path to avoid unmounting the React tree and
+ * full `reconnectCommunity()` path to avoid unmounting the React tree and
  * clearing draft state.
  *
  * See `relayReconnectController.ts` for the three-phase strategy details.
@@ -30,8 +30,6 @@ function buildDeps(onSuccess: () => void, onBackstop: () => void) {
     onBackstop,
     setTimeout: window.setTimeout.bind(window),
     clearTimeout: window.clearTimeout.bind(window),
-    setInterval: window.setInterval.bind(window),
-    clearInterval: window.clearInterval.bind(window),
   };
 }
 

@@ -11,6 +11,7 @@ use tauri::{http, Manager};
 use tokio::net::TcpListener;
 
 use crate::app_state::AppState;
+use crate::commands::media::mint_media_get_auth;
 use crate::relay;
 
 /// Defense-in-depth cap: refuse to buffer responses larger than this into RAM.
@@ -56,6 +57,12 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
         .get(&upstream_url)
         .timeout(std::time::Duration::from_secs(120));
 
+    // `upstream_url` is always `{relay base}{path}`, so the token can't reach
+    // a third-party origin (mint_media_get_auth safety contract).
+    if let Some(auth) = mint_media_get_auth(&app_state, &base_url) {
+        upstream = upstream.header("authorization", auth);
+    }
+
     if let Some(range) = req.headers().get("range") {
         if let Ok(v) = range.to_str() {
             upstream = upstream.header("range", v);
@@ -67,6 +74,38 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
         Err(_) => {
             return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
         }
+    };
+
+    // Re-mint and retry once on an auth failure (401 missing_evidence or 403
+    // evidence_rejected). Under NIP-FI strict mode a read token expires after
+    // 60s, so a long video range-request stream will exhaust its token mid-flight.
+    // Single retry; if the fresh token also fails, propagate the error to the caller.
+    let resp = if (resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        || resp.status() == reqwest::StatusCode::FORBIDDEN)
+        && has_range
+    {
+        if let Some(fresh_auth) = mint_media_get_auth(&app_state, &base_url) {
+            let mut retry = state
+                .client
+                .get(&upstream_url)
+                .timeout(std::time::Duration::from_secs(120))
+                .header("authorization", fresh_auth);
+            if let Some(range) = req.headers().get("range") {
+                if let Ok(v) = range.to_str() {
+                    retry = retry.header("range", v);
+                }
+            }
+            match retry.send().await {
+                Ok(r) => r,
+                Err(_) => {
+                    return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
+                }
+            }
+        } else {
+            resp
+        }
+    } else {
+        resp
     };
 
     let status =
@@ -143,11 +182,11 @@ pub async fn spawn_media_proxy(http_client: reqwest::Client, app_handle: tauri::
     port
 }
 
-/// Proxy media requests through the Rust backend so they traverse the WARP tunnel.
+/// Proxy media requests through the Rust backend so they traverse the VPN tunnel.
 ///
-/// WKWebView's networking stack bypasses WARP, causing 403s from Cloudflare Access.
+/// WKWebView's networking stack bypasses the VPN tunnel, causing 403s from Cloudflare Access.
 /// This handler routes `buzz-media://localhost/{path}` through reqwest, which
-/// runs in the Tauri process and goes through WARP.
+/// runs in the Tauri process and goes through the VPN.
 pub async fn handle_buzz_media(
     app: &tauri::AppHandle,
     request: &http::Request<Vec<u8>>,
@@ -177,6 +216,13 @@ pub async fn handle_buzz_media(
         .http_client
         .get(&upstream_url)
         .timeout(std::time::Duration::from_secs(60));
+
+    // `upstream_url` is always `{relay base}{path}`, so the token can't reach
+    // a third-party origin (mint_media_get_auth safety contract).
+    if let Some(auth) = mint_media_get_auth(&state, &base) {
+        upstream = upstream.header("authorization", auth);
+    }
+
     if let Some(range) = request.headers().get("range") {
         if let Ok(v) = range.to_str() {
             upstream = upstream.header("range", v);
@@ -184,6 +230,34 @@ pub async fn handle_buzz_media(
     }
 
     let result = upstream.send().await;
+
+    // Re-mint and retry once on auth failure (401/403) for range requests.
+    // Under NIP-FI strict mode a read token expires after 60s, exhausting
+    // mid-stream. Single retry with a fresh token; propagate on second failure.
+    let result = match result {
+        Ok(resp)
+            if (resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN)
+                && has_range =>
+        {
+            if let Some(fresh_auth) = mint_media_get_auth(&state, &base) {
+                let mut retry = state
+                    .http_client
+                    .get(&upstream_url)
+                    .timeout(std::time::Duration::from_secs(60))
+                    .header("authorization", fresh_auth);
+                if let Some(range) = request.headers().get("range") {
+                    if let Ok(v) = range.to_str() {
+                        retry = retry.header("range", v);
+                    }
+                }
+                retry.send().await
+            } else {
+                Ok(resp)
+            }
+        }
+        other => other,
+    };
 
     match result {
         Ok(resp) => {

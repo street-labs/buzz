@@ -10,7 +10,7 @@ import {
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
   PERSONA_LABEL_OPTIONAL_CLASS,
-} from "./personaDialogPickers";
+} from "./agentConfigOptions";
 
 type PersonaModelFieldProps = {
   disabled: boolean;
@@ -18,6 +18,7 @@ type PersonaModelFieldProps = {
   model: string;
   modelDiscoveryStatus: PersonaModelDiscoveryStatus | null;
   modelDropdownOptions: readonly PersonaDropdownOption[];
+  showSharedComputeAutoHint: boolean;
   modelSelectValue: string;
   onCustomModelChange: (value: string) => void;
   onModelValueChange: (value: string) => void;
@@ -32,6 +33,7 @@ export function PersonaModelField({
   modelDiscoveryStatus,
   modelDropdownOptions,
   modelSelectValue,
+  showSharedComputeAutoHint,
   onCustomModelChange,
   onModelValueChange,
   showCustomModelInput,
@@ -87,6 +89,12 @@ export function PersonaModelField({
               value={model}
             />
           </div>
+        ) : null}
+        {showSharedComputeAutoHint ? (
+          <p className="text-xs text-muted-foreground">
+            Auto uses Mesh collective intelligence when two or more models stay
+            available, otherwise it chooses one available model.
+          </p>
         ) : null}
         {modelDiscoveryStatus ? (
           <p

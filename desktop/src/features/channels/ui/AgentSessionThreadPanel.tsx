@@ -9,22 +9,29 @@ import {
 import { toast } from "sonner";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import {
   mergeObserverEventWindows,
+  observerEventScrollId,
   scopeByChannel,
 } from "@/features/agents/ui/agentSessionPanelLayout";
+import { deriveTranscriptBlockIds } from "@/features/agents/ui/agentSessionTranscriptGrouping";
 import type { ObserverEvent } from "@/features/agents/ui/agentSessionTypes";
 import { ManagedAgentSessionPanel } from "@/features/agents/ui/ManagedAgentSessionPanel";
 import {
   useArchivedChannelEvents,
   useObserverEvents,
 } from "@/features/agents/ui/useObserverEvents";
+import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
+import { useStableArrayShallow } from "@/shared/hooks/useStableReference";
 import { cancelManagedAgentTurn } from "@/shared/api/agentControl";
+import { awaitCancelTurnOutcome } from "@/features/agents/lib/cancelTurnOutcome";
+import {
+  ensureRelayObserverSubscription,
+  subscribeControlResults,
+} from "@/features/agents/observerRelayStore";
 import type { Channel } from "@/shared/api/types";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
-import { useStickToBottom } from "@/shared/hooks/useStickToBottom";
 import { useNow } from "@/shared/lib/useNow";
 import { AuxiliaryPanel } from "@/shared/layout/AuxiliaryPanel";
 import { AuxiliaryPanelBody } from "@/shared/layout/AuxiliaryPanel";
@@ -32,10 +39,12 @@ import {
   AuxiliaryPanelHeader,
   AuxiliaryPanelHeaderActions,
   AuxiliaryPanelHeaderGroup,
-  AuxiliaryPanelHeaderTitleBlock,
 } from "@/shared/layout/AuxiliaryPanel";
 import { Button } from "@/shared/ui/button";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { resolveUserLabel } from "@/features/profile/lib/identity";
+import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -55,7 +64,7 @@ import {
 import { useLoadArchivedObserverEvents } from "@/features/agents/ui/useObserverEvents";
 import { useLoadOlderOnScroll } from "@/features/messages/ui/useLoadOlderOnScroll";
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { useChannelReference } from "@/features/channels/openChannelDirectory";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
@@ -91,7 +100,7 @@ export function AgentSessionThreadPanel({
   widthPx,
   transparentChrome = false,
 }: AgentSessionThreadPanelProps) {
-  const isLive = isManagedAgentActive(agent);
+  const isLive = agent.status === "running" || agent.status === "deployed";
   const isOverlay = useIsThreadPanelOverlay();
   const sessionChannelId = channelId ?? channel?.id ?? null;
   // Unified working signal, scoped to this panel's channel (or all channels
@@ -100,13 +109,15 @@ export function AgentSessionThreadPanel({
     agent.pubkey,
     sessionChannelId,
   );
-  const canStopCurrentTurn = isWorking && canInterruptTurn;
+  const canStopCurrentTurn =
+    Boolean(sessionChannelId) && isWorking && canInterruptTurn;
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
-  const { ref: scrollRef, onScroll } = useStickToBottom<HTMLDivElement>();
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+  const contentRef = React.useRef<HTMLDivElement>(null);
   const topSentinelRef = React.useRef<HTMLDivElement>(null);
   const now = useNow(1000);
-  const { events } = useObserverEvents(isLive, agent.pubkey);
+  const { connectionState, events } = useObserverEvents(isLive, agent.pubkey);
   const scopedEvents = React.useMemo(
     () => scopeByChannel(events, sessionChannelId),
     [events, sessionChannelId],
@@ -150,29 +161,6 @@ export function AgentSessionThreadPanel({
     sentinelRef: topSentinelRef,
   });
   const rawFeedScopeKey = `${agent.pubkey}:${sessionChannelId ?? "all"}`;
-  // Scope label input: prefer the passed channel's name; when the pane is
-  // channel-scoped without a full Channel object (#1380's channelId prop),
-  // resolve the name from the channels cache.
-  const channelsQuery = useChannelsQuery({
-    enabled: Boolean(sessionChannelId),
-  });
-  const scopeChannelName = React.useMemo(() => {
-    if (!sessionChannelId) {
-      return null;
-    }
-    if (channel && channel.id === sessionChannelId) {
-      return channel.name;
-    }
-    return (
-      channelsQuery.data?.find((entry) => entry.id === sessionChannelId)
-        ?.name ?? null
-    );
-  }, [channel, channelsQuery.data, sessionChannelId]);
-  const scopeLabel = sessionChannelId
-    ? scopeChannelName
-      ? `#${scopeChannelName}`
-      : "1 channel"
-    : "All channels";
   const [rawFeedState, setRawFeedState] = React.useState(() => ({
     scopeKey: rawFeedScopeKey,
     show: false,
@@ -185,15 +173,117 @@ export function AgentSessionThreadPanel({
     },
     [rawFeedScopeKey],
   );
+
+  // --- Transcript block ids for default Activity mode ---
+  // Derive the same display-block keys the inner AgentSessionTranscriptList
+  // renders as `data-message-id` so useAnchoredScroll anchors on real DOM rows
+  // instead of raw event ids (which live in a disjoint namespace and cause
+  // per-event floor writes → flicker + jump-to-tail).
+  //
+  // latestLiveSessionId is omitted: it only affects boundary `labelState`,
+  // never keys (agentSessionTranscriptGrouping.ts:557-574), so we avoid
+  // subscribing to the observer store from the outer panel.
+  const transcriptBlockIds = React.useMemo(
+    () => (showRawFeed ? [] : deriveTranscriptBlockIds(combinedHeaderEvents)),
+    [combinedHeaderEvents, showRawFeed],
+  );
+
+  // Stabilize the id array by VALUE so the hook's restoration effect (keyed on
+  // the `messages` reference) does not fire on every raw event when the block
+  // id sequence is unchanged. useStableArrayShallow shallow-compares with
+  // Object.is on each string element.
+  const stableTranscriptBlockIds = useStableArrayShallow(transcriptBlockIds);
+
+  // Map to {id} objects only when the stabilized array reference changes.
+  const transcriptScrollMessages = React.useMemo(
+    () => stableTranscriptBlockIds.map((id) => ({ id })),
+    [stableTranscriptBlockIds],
+  );
+
+  // Raw-mode ids: keyed on (seq, timestamp) — matches RawEventRail's
+  // data-message-id. seq resets on agent restart so bare seq can collide;
+  // observerEventScrollId disambiguates.
+  const rawScrollMessages = React.useMemo(
+    () =>
+      combinedHeaderEvents.map((event) => ({
+        id: observerEventScrollId(event),
+      })),
+    [combinedHeaderEvents],
+  );
+
+  const { onScroll } = useAnchoredScroll({
+    // Fold view mode into the reset key so toggling raw ↔ transcript
+    // re-initializes the anchor (clean re-pin) instead of carrying an anchor
+    // across disjoint id namespaces.
+    channelId: `${rawFeedScopeKey}:${showRawFeed ? "raw" : "transcript"}`,
+    contentRef,
+    isLoading: connectionState === "connecting",
+    messages: showRawFeed ? rawScrollMessages : transcriptScrollMessages,
+    scrollContainerRef: scrollRef,
+  });
+  // Scope label input: prefer the passed channel's name; when the pane is
+  // channel-scoped without a full Channel object (#1380's channelId prop),
+  // resolve that one id through the bounded reference query.
+  const referencedChannel = useChannelReference(sessionChannelId);
+  const scopeChannelName =
+    channel && channel.id === sessionChannelId
+      ? channel.name
+      : (referencedChannel?.name ?? null);
+  const scopeLabel = sessionChannelId
+    ? scopeChannelName
+      ? `#${scopeChannelName}`
+      : "1 channel"
+    : "All channels";
+  const agentProfile = profiles?.[normalizePubkey(agent.pubkey)] ?? null;
+  const agentLabel = resolveUserLabel({
+    pubkey: agent.pubkey,
+    fallbackName: agent.name,
+    profiles,
+    preferResolvedSelfLabel: true,
+  });
+  const viewLabel = showRawFeed ? "Raw ACP activity" : "Activity";
+  const headerScopeLabel = `${viewLabel} · ${scopeLabel}`;
   const animateActivity = useTranscriptAnimationEnabled();
   const showTimestamps = useTranscriptTimestampsEnabled();
   async function handleInterruptTurn() {
-    if (!channel) {
+    if (!sessionChannelId) {
       return;
     }
 
     try {
-      await cancelManagedAgentTurn(agent.pubkey, channel.id);
+      const requestId = crypto.randomUUID();
+      const outcome = await awaitCancelTurnOutcome({
+        requestId,
+        channelId: sessionChannelId,
+        subscribe: (listener) =>
+          subscribeControlResults(agent.pubkey, listener),
+        sendCancel: async () => {
+          await ensureRelayObserverSubscription();
+          await cancelManagedAgentTurn(
+            agent.pubkey,
+            sessionChannelId,
+            requestId,
+          );
+        },
+        scheduleTimeout: (onTimeout) => {
+          const timeout = window.setTimeout(onTimeout, 8_000);
+          return () => window.clearTimeout(timeout);
+        },
+      });
+      if (outcome === "ambiguous_target") {
+        toast.error(
+          "This channel has multiple agent sessions. Stopping a specific thread isn't available here yet.",
+        );
+        return;
+      }
+      if (outcome === "no_active_turn") {
+        toast.info("No active turn to stop.");
+        return;
+      }
+      if (outcome === "unconfirmed") {
+        toast.info("Stop requested, but the agent hasn't confirmed it.");
+        return;
+      }
       toast.success(
         `Stop signal sent to ${agent.name}. It may take a moment to respond.`,
       );
@@ -332,9 +422,11 @@ export function AgentSessionThreadPanel({
               title={
                 canStopCurrentTurn
                   ? "Interrupt the current ACP turn without stopping the agent process."
-                  : isWorking
-                    ? "Only locally managed agents can be interrupted from this workspace."
-                    : "Available while the agent is working."
+                  : !sessionChannelId
+                    ? "Open activity for a channel to stop its current turn."
+                    : isWorking
+                      ? "Only locally managed agents can be interrupted from this community."
+                      : "Available while the agent is working."
               }
             >
               <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
@@ -344,9 +436,11 @@ export function AgentSessionThreadPanel({
                 </span>
                 {!canStopCurrentTurn ? (
                   <span className="mt-0.5 block text-xs text-muted-foreground">
-                    {isWorking
-                      ? "Only available for locally managed agents."
-                      : "Available while the agent is working."}
+                    {!sessionChannelId
+                      ? "Open activity for a channel to stop its current turn."
+                      : isWorking
+                        ? "Only available for locally managed agents."
+                        : "Available while the agent is working."}
                   </span>
                 ) : null}
               </span>
@@ -365,19 +459,40 @@ export function AgentSessionThreadPanel({
         backButtonTestId="agent-session-back"
         onBack={onBack}
       >
-        <AuxiliaryPanelHeaderTitleBlock
-          subtitle={lastUpdatedLabel}
-          subtitleTitle={lastUpdatedTitle}
-          title={showRawFeed ? "Raw ACP Activity" : "Activity"}
+        <ProfileAvatar
+          avatarUrl={agentProfile?.avatarUrl ?? null}
+          className="size-9"
+          label={agentLabel}
+          shape="squircle"
+          testId="agent-session-agent-avatar"
         />
-        {/* Scope label: makes channel-targeted vs all-channels state obvious
-            (an all-channels pane can look "wrong" without it). */}
-        <span
-          className="min-w-0 shrink truncate text-xs text-muted-foreground"
-          data-testid="agent-session-scope-label"
-        >
-          {scopeLabel}
-        </span>
+        <div className="min-w-0 flex-1">
+          <h2
+            className="truncate text-sm font-semibold leading-5"
+            data-testid="agent-session-agent-name"
+            title={agentLabel}
+          >
+            {agentLabel}
+          </h2>
+          <div className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+            <p
+              className="min-w-0 flex-1 truncate"
+              data-testid="agent-session-scope-label"
+            >
+              {headerScopeLabel}
+            </p>
+            <span aria-hidden="true" className="shrink-0">
+              ·
+            </span>
+            <span
+              className="shrink-0"
+              data-testid="agent-session-recency-label"
+              title={lastUpdatedTitle}
+            >
+              {lastUpdatedLabel}
+            </span>
+          </div>
+        </div>
       </AuxiliaryPanelHeaderGroup>
       {agentHeaderActions}
     </>
@@ -408,20 +523,22 @@ export function AgentSessionThreadPanel({
         panelPadding
       >
         <div ref={topSentinelRef} aria-hidden className="h-px" />
-        <ManagedAgentSessionPanel
-          agent={agent}
-          channelId={sessionChannelId}
-          className="border-0 bg-transparent px-0 py-2 shadow-none"
-          emptyDescription={
-            sessionChannelId
-              ? `Mention ${agent.name} in the channel to see its work here.`
-              : `Mention ${agent.name} in any channel to see its work here.`
-          }
-          profiles={profiles}
-          rawLayout="exclusive"
-          showHeader={false}
-          showRaw={showRawFeed}
-        />
+        <div ref={contentRef}>
+          <ManagedAgentSessionPanel
+            agent={agent}
+            channelId={sessionChannelId}
+            className="border-0 bg-transparent px-0 py-2 shadow-none"
+            emptyDescription={
+              sessionChannelId
+                ? `Mention ${agent.name} in the channel to see its work here.`
+                : `Mention ${agent.name} in any channel to see its work here.`
+            }
+            profiles={profiles}
+            rawLayout="exclusive"
+            showHeader={false}
+            showRaw={showRawFeed}
+          />
+        </div>
       </AuxiliaryPanelBody>
     </AuxiliaryPanel>
   );

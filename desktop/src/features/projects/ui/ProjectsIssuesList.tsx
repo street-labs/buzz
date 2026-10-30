@@ -1,268 +1,356 @@
-import { CircleCheck, CircleDot, CircleX, MessageSquare } from "lucide-react";
+import { Eye, FolderKanban } from "lucide-react";
+import * as React from "react";
 
 import type {
   Project,
   ProjectIssue,
   ProjectIssueListItem,
+  Repository,
 } from "@/features/projects/hooks";
+import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
+import { selectionItemFromTask } from "@/features/projects/lib/projectSelection";
+import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
 import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import {
+  countGroupedRows,
+  sliceGroupedRows,
+  useIncrementalMount,
+} from "@/shared/hooks/useIncrementalMount";
+import { cn } from "@/shared/lib/cn";
+import { BuzzLoadingState } from "@/shared/ui/BuzzLoadingState";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
+import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
+import { ProjectAuthorIdentity } from "./ProjectAuthorIdentity";
+import { ProjectEntityListRow } from "./ProjectEntityListRow";
+import { ProjectEventTypeIcon } from "./ProjectEventTypeIcon";
+import { PROJECT_GRID_CARD_BODY_CLASS } from "./projectGridCardStyles";
+import { ProjectListRowMenu } from "./ProjectListRowMenu";
+import { ProjectSelectableGroup } from "./ProjectSelectableGroup";
+import { ProjectPanelState } from "./ProjectPanelState";
+import { ProjectsWorkItemsLoadNotice } from "./ProjectsWorkItemsLoadNotice";
+import { groupProjectWorkItemsByProject } from "./projectWorkItemGroups";
 
 type ProjectsIssuesListProps = {
+  /** Render without container chrome — a parent table container provides border and rounding. */
+  embedded?: boolean;
+  emptyMessage?: string;
+  error: unknown;
+  failedSections: ProjectWorkItemSection[];
   isLoading: boolean;
-  onOpen: (project: Project, issue: ProjectIssue) => void;
+  isRetrying: boolean;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    issue: ProjectIssue,
+  ) => void;
+  onRetry: () => void;
   profiles?: UserProfileLookup;
   issues: ProjectIssueListItem[];
   viewMode: "grid" | "list";
 };
 
-function formatRelativeTime(createdAt: number) {
-  const elapsedSeconds = Math.max(
-    1,
-    Math.floor(Date.now() / 1_000 - createdAt),
-  );
-  const units = [
-    { label: "year", seconds: 365 * 24 * 60 * 60 },
-    { label: "month", seconds: 30 * 24 * 60 * 60 },
-    { label: "day", seconds: 24 * 60 * 60 },
-    { label: "hour", seconds: 60 * 60 },
-    { label: "minute", seconds: 60 },
-  ];
-  const unit =
-    units.find((item) => elapsedSeconds >= item.seconds) ??
-    units[units.length - 1];
-  const value = Math.max(1, Math.floor(elapsedSeconds / unit.seconds));
-  return `${value} ${unit.label}${value === 1 ? "" : "s"} ago`;
-}
-
-function issueStatusVisual(status: ProjectIssue["status"]) {
-  if (status === "Done") {
-    return { className: "text-purple-400", icon: CircleCheck };
-  }
-  if (status === "Closed") {
-    return { className: "text-destructive", icon: CircleX };
-  }
-  return { className: "text-green-500", icon: CircleDot };
-}
-
 function nextStepLabel(status: ProjectIssue["status"]) {
-  if (status === "Done" || status === "Closed") return "View issue";
-  if (status === "In Review") return "Review issue";
-  if (status === "Triage") return "Triage issue";
-  return "Open issue";
+  if (status === "Done" || status === "Closed") return "View task";
+  if (status === "In Review") return "Review task";
+  if (status === "Triage") return "Triage task";
+  return "Open task";
 }
 
-function IssueHeader({
-  issue,
-  profiles,
-  project,
-}: {
-  issue: ProjectIssue;
-  profiles?: UserProfileLookup;
-  project: Project;
-}) {
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
-  const authorProfile = profiles?.[normalizePubkey(issue.author)];
-  const status = issueStatusVisual(issue.status);
-
-  return (
-    <>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="relative z-10 inline-flex shrink-0">
-            <UserAvatar
-              accent={authorProfile?.isAgent === true}
-              avatarUrl={authorProfile?.avatarUrl ?? null}
-              displayName={authorLabel}
-              size="md"
-            />
-          </span>
-        </TooltipTrigger>
-        <TooltipContent>{authorLabel}</TooltipContent>
-      </Tooltip>
-      <div className="min-w-0 flex-1 space-y-1">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <p className="truncate text-sm font-semibold text-foreground">
-            {issue.title}
-          </p>
-          <status.icon className={`h-3.5 w-3.5 shrink-0 ${status.className}`} />
-        </div>
-        <p className="truncate text-xs text-muted-foreground">{project.name}</p>
-      </div>
-    </>
-  );
-}
-
-function IssueGridCard({
+const IssueGridCard = React.memo(function IssueGridCard({
   issue,
   onOpen,
-  profiles,
   project,
+  repository,
 }: {
   issue: ProjectIssue;
-  onOpen: (project: Project, issue: ProjectIssue) => void;
-  profiles?: UserProfileLookup;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    issue: ProjectIssue,
+  ) => void;
   project: Project;
+  repository: Repository;
 }) {
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
-
   return (
-    <Card className="group relative flex min-h-40 flex-col overflow-hidden border-border/60 bg-card p-4 shadow-none transition-colors duration-150 hover:bg-muted/20">
+    <Card
+      className="group relative flex min-h-32 flex-col overflow-hidden border-border/60 bg-transparent p-4 shadow-none transition-colors duration-150 hover:bg-muted/20"
+      data-projects-grid-card
+    >
       <button
         className="absolute inset-0"
-        onClick={() => onOpen(project, issue)}
+        onClick={() => onOpen(project, repository, issue)}
         type="button"
       >
-        <span className="sr-only">View {issue.title}</span>
+        <span className="sr-only">View task {issue.title}</span>
       </button>
-      <div className="flex min-h-0 flex-1 flex-col gap-3">
-        <div className="flex min-w-0 items-start gap-3">
-          <IssueHeader issue={issue} profiles={profiles} project={project} />
-          <Button
-            className="relative z-10 h-7 shrink-0 px-2.5"
-            onClick={(event) => {
-              event.stopPropagation();
-              onOpen(project, issue);
-            }}
-            size="xs"
-            type="button"
-            variant="default"
-          >
-            {nextStepLabel(issue.status)}
-          </Button>
-        </div>
-
-        {issue.content ? (
-          <p className="line-clamp-2 text-sm text-foreground/90">
-            {issue.content}
-          </p>
-        ) : null}
-
-        <div className="mt-auto border border-border/60 bg-muted/30 px-2.5 py-2">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-foreground/80">
-            <span className="font-mono text-foreground">
-              #{issue.id.slice(0, 8)}
-            </span>
-            <span className="font-medium text-foreground">{issue.status}</span>
-            <span>opened {formatRelativeTime(issue.createdAt)}</span>
-            <span>by {authorLabel}</span>
-            {issue.comments.length > 0 ? (
-              <span className="flex items-center gap-1">
-                <MessageSquare className="h-3.5 w-3.5" />
-                {issue.comments.length}
-              </span>
-            ) : null}
-          </div>
+      <div className="flex min-h-0 flex-1 flex-col gap-2">
+        <h3
+          className="truncate text-sm font-semibold leading-5 text-foreground"
+          data-testid="projects-grid-card-title"
+        >
+          {issue.title}
+        </h3>
+        <p
+          className={cn(PROJECT_GRID_CARD_BODY_CLASS, "text-muted-foreground")}
+          data-testid="projects-grid-card-body"
+        >
+          {issue.content || "No description provided."}
+        </p>
+        <div
+          className="mt-auto flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+          data-testid="projects-grid-card-indicator"
+        >
+          <ProjectEventTypeIcon className="h-3.5 w-3.5" kind="issue" />
+          <span>{issue.status}</span>
         </div>
       </div>
     </Card>
   );
+});
+
+function issueSelectionItem(
+  project: Project,
+  repository: Repository,
+  issue: ProjectIssue,
+) {
+  return selectionItemFromTask({
+    author: issue.author,
+    channelId: repository.channelId ?? project.projectChannelId,
+    id: issue.id,
+    shareLink: issueShareLink(issue),
+    title: issue.title,
+  });
 }
 
-function IssueListRow({
+// Memoized: these rows render in unbounded lists, and any Projects-view
+// state change used to re-render every row. Props are kept identity-stable
+// by the list (memoized groups/selection arrays, stable onOpen).
+const IssueListRow = React.memo(function IssueListRow({
   issue,
   onOpen,
   profiles,
   project,
+  rangeItems,
+  repository,
 }: {
   issue: ProjectIssue;
-  onOpen: (project: Project, issue: ProjectIssue) => void;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    issue: ProjectIssue,
+  ) => void;
   profiles?: UserProfileLookup;
   project: Project;
+  rangeItems: ReturnType<typeof issueSelectionItem>[];
+  repository: Repository;
 }) {
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
 
   return (
-    <div className="group relative px-4 py-2.5 transition-colors duration-150 hover:bg-muted/20">
-      <button
-        className="absolute inset-0"
-        onClick={() => onOpen(project, issue)}
-        type="button"
-      >
-        <span className="sr-only">View {issue.title}</span>
-      </button>
-      <div className="flex min-w-0 items-start gap-3">
-        <IssueHeader issue={issue} profiles={profiles} project={project} />
-        <div className="relative z-10 flex shrink-0 items-center gap-2">
-          <span className="text-xs text-muted-foreground">
-            {issue.status} · opened {formatRelativeTime(issue.createdAt)} by{" "}
-            {authorLabel}
-          </span>
-          <Button
-            className="h-7 px-2.5"
-            onClick={(event) => {
-              event.stopPropagation();
-              onOpen(project, issue);
-            }}
-            size="xs"
-            type="button"
-            variant="default"
-          >
+    <ProjectEntityListRow
+      affiliation={repository.name}
+      count={issue.comments.length}
+      dateSeconds={issue.updatedAt}
+      dateTestId="projects-row-date"
+      icon={null}
+      onClick={() => onOpen(project, repository, issue)}
+      peopleSlot={
+        <ProjectAuthorIdentity
+          label={authorLabel}
+          labelClassName="sr-only"
+          profiles={profiles}
+          pubkey={issue.author}
+          testId="projects-issue-author"
+        />
+      }
+      selection={{
+        item: issueSelectionItem(project, repository, issue),
+        rangeItems,
+      }}
+      testId={`projects-issue-row-${issue.id}`}
+      title={issue.title}
+      titleAttr={`Open task ${issue.title}`}
+      titleIcon={<ProjectEventTypeIcon className="h-3.5 w-3.5" kind="issue" />}
+      trailing={
+        <ProjectListRowMenu label={`More options for ${issue.title}`}>
+          <DropdownMenuItem onSelect={() => onOpen(project, repository, issue)}>
+            <Eye className="h-4 w-4" />
             {nextStepLabel(issue.status)}
-          </Button>
-        </div>
-      </div>
-    </div>
+          </DropdownMenuItem>
+          <CopyShareLinkMenuItem
+            link={issueShareLink(issue)}
+            label="Copy task link"
+            testId={`projects-issue-copy-link-${issue.id}`}
+          />
+        </ProjectListRowMenu>
+      }
+    />
   );
-}
+});
 
 export function ProjectsIssuesList({
+  embedded,
+  emptyMessage = "No tasks yet.",
+  error,
+  failedSections,
   isLoading,
+  isRetrying,
   issues,
   onOpen,
+  onRetry,
   profiles,
   viewMode,
 }: ProjectsIssuesListProps) {
+  // Grouping and per-group selection arrays are identity-stable across
+  // re-renders so the memoized rows only re-render when their data changes.
+  const allGroups = React.useMemo(
+    () =>
+      groupProjectWorkItemsByProject(issues).map((group) => ({
+        ...group,
+        selectionItems: group.rows.map((row) =>
+          issueSelectionItem(row.project, row.repository, row.issue),
+        ),
+      })),
+    [issues],
+  );
+  // Mount rows progressively: a one-shot mount of hundreds of rows blocked
+  // the main thread for over a second on tab entry.
+  // Each layout's counter grows only while that layout is active: otherwise
+  // a layout switch would find the other counter already grown and mount the
+  // whole collection in one commit.
+  const mountedRowCount = useIncrementalMount(
+    countGroupedRows(allGroups),
+    30,
+    60,
+    viewMode !== "grid",
+  );
+  const mountedGridCount = useIncrementalMount(
+    issues.length,
+    30,
+    60,
+    viewMode === "grid",
+  );
+  const groups = React.useMemo(
+    () => sliceGroupedRows(allGroups, mountedRowCount),
+    [allGroups, mountedRowCount],
+  );
+
   if (isLoading) {
+    return <BuzzLoadingState label="Loading tasks" />;
+  }
+
+  const loadNotice = (
+    <ProjectsWorkItemsLoadNotice
+      error={error}
+      failedSections={failedSections}
+      isRetrying={isRetrying}
+      onRetry={onRetry}
+      subject="issues"
+    />
+  );
+
+  if (error && issues.length === 0) {
     return (
-      <div className="border border-border/60 px-4 py-12 text-center text-sm text-muted-foreground">
-        Loading issues...
-      </div>
+      <ProjectPanelState
+        action={
+          <Button
+            disabled={isRetrying}
+            onClick={onRetry}
+            size="sm"
+            variant="outline"
+          >
+            {isRetrying ? "Retrying..." : "Retry"}
+          </Button>
+        }
+        description={
+          error instanceof Error ? error.message : "The relay request failed."
+        }
+        error
+        panel={false}
+        title="Could not load tasks"
+      />
     );
   }
 
   if (issues.length === 0) {
     return (
-      <div className="border border-dashed border-border/60 px-4 py-12 text-center text-sm text-muted-foreground">
-        No issues yet.
+      <div className="space-y-3">
+        {loadNotice}
+        <ProjectPanelState
+          className={cn(!embedded && "border border-dashed border-border/60")}
+          panel={false}
+          title={emptyMessage}
+        />
       </div>
     );
   }
 
   if (viewMode === "grid") {
     return (
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {issues.map(({ project, issue }) => (
-          <IssueGridCard
-            issue={issue}
-            key={issue.id}
-            onOpen={onOpen}
-            profiles={profiles}
-            project={project}
-          />
-        ))}
+      <div className="space-y-3">
+        {loadNotice}
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {issues
+            .slice(0, mountedGridCount)
+            .map(({ project, issue, repository }) => (
+              <IssueGridCard
+                issue={issue}
+                key={`${repository.id}:${issue.id}`}
+                onOpen={onOpen}
+                project={project}
+                repository={repository}
+              />
+            ))}
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="-mx-4 divide-y divide-border/60 border-y border-border/60 bg-card">
-      {issues.map(({ project, issue }) => (
-        <IssueListRow
-          issue={issue}
-          key={issue.id}
-          onOpen={onOpen}
-          profiles={profiles}
-          project={project}
-        />
-      ))}
+    <div className="space-y-3">
+      {loadNotice}
+      <div data-testid="projects-list-container">
+        {groups.map((group) => {
+          const groupSelectionItems = group.selectionItems;
+          return (
+            <ProjectSelectableGroup
+              count={group.rows.length}
+              groupKey={group.project.id}
+              headerClassName="mx-0 gap-3 px-4"
+              headerTestId="projects-issue-project-group-header"
+              icon={<FolderKanban className="h-4 w-4" />}
+              items={groupSelectionItems}
+              key={group.project.id}
+              label={group.project.name}
+              labelTestId="project-issue-project"
+              testId="projects-issue-project-group"
+            >
+              <ul>
+                {group.rows.map(({ project, issue, repository }) => (
+                  <li
+                    className="[contain-intrinsic-size:auto_3.5rem] [content-visibility:auto]"
+                    key={`${repository.id}:${issue.id}`}
+                  >
+                    <IssueListRow
+                      issue={issue}
+                      onOpen={onOpen}
+                      profiles={profiles}
+                      project={project}
+                      rangeItems={groupSelectionItems}
+                      repository={repository}
+                    />
+                  </li>
+                ))}
+              </ul>
+            </ProjectSelectableGroup>
+          );
+        })}
+      </div>
     </div>
   );
 }

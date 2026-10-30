@@ -1,55 +1,65 @@
 import {
   Check,
-  GitMerge,
-  GitPullRequest,
-  GitPullRequestDraft,
+  ChevronDown,
+  ChevronUp,
+  FileCode2,
+  GitBranch,
+  History,
   MessageSquare,
+  TriangleAlert,
   UserPlus,
-  X,
 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
+import { DiscussedInChannels } from "./DiscussionChannels";
+import { ProjectOriginReference } from "./ProjectOriginReference";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import {
-  type Project,
   type ProjectPullRequest,
+  type Repository as Project,
+  type ProjectPullRequestCommentAnchor,
   useCreateProjectPullRequestCommentMutation,
 } from "@/features/projects/hooks";
+import { projectPullRequestCommentTimelineKind } from "@/features/projects/projectPullRequests.mjs";
+import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
+import { selectionItemFromReview } from "@/features/projects/lib/projectSelection";
+import { pullRequestShareLink } from "@/features/projects/lib/projectShareLinks";
 import {
-  useApproveProjectPullRequestMutation,
-  useRequestProjectPullRequestReviewMutation,
-  useUpdateProjectPullRequestStatusMutation,
-} from "@/features/projects/pullRequestReviews";
+  formatExactTimestamp,
+  relativeTime,
+} from "@/features/projects/lib/projectsViewHelpers";
+import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ChannelMember } from "@/shared/api/types";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
-import { Button } from "@/shared/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-} from "@/shared/ui/dropdown-menu";
-import { Markdown } from "@/shared/ui/markdown";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import {
   ProjectFeedRow,
   ProjectFeedRowCluster,
   ProjectFeedRowMonoCell,
 } from "./ProjectFeedRow";
-import { OverviewRailSection } from "./ProjectOverviewPanel";
-import { ProfileIdentityButton } from "./ProjectProfileIdentity";
+import { CopyCommitHashButton } from "./ProjectCommitCopyButton";
+import { ProjectDetailSection } from "./ProjectDetailSection";
+import type { OpenMergeRecoveryTerminal } from "./MergePullRequestButton";
+import {
+  ProfileAuthorName,
+  ProfileIdentityButton,
+} from "./ProjectProfileIdentity";
+import { ProjectRichContent } from "./ProjectRichContent";
+import { PullRequestMetaHeader } from "./PullRequestMetaRail";
+import { PullRequestReviewCard } from "./PullRequestReviewCard";
+import { ShareLinkButton } from "./ShareLinkButton";
+import { PROJECT_DETAIL_READING_COLUMN_CLASS } from "./projectPanelStyles";
+import {
+  ProjectStatusProgressIcon,
+  type ProjectStatusProgressState,
+} from "./ProjectStatusProgressIcon";
+import { ProjectWorkItemGroup } from "./ProjectWorkItemGroup";
+import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
+import { PullRequestsPanelSurface } from "./PullRequestsPanelSurface";
 
-function compactDate(createdAt: number) {
-  return new Date(createdAt * 1_000).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
-}
+export { PullRequestMetaHeader } from "./PullRequestMetaRail";
 
 function profileForPubkey(pubkey: string, profiles?: UserProfileLookup) {
   return profiles?.[normalizePubkey(pubkey)] ?? null;
@@ -60,31 +70,8 @@ function labelForPubkey(pubkey: string, profiles?: UserProfileLookup) {
   return (
     profile?.displayName?.trim() ||
     profile?.nip05Handle?.trim() ||
-    truncatePubkey(pubkey)
+    truncateNpub(pubkey)
   );
-}
-
-function relativeOpenedAt(createdAt: number) {
-  const elapsedSeconds = Math.max(
-    1,
-    Math.floor(Date.now() / 1_000 - createdAt),
-  );
-  const units = [
-    { label: "year", seconds: 365 * 24 * 60 * 60 },
-    { label: "month", seconds: 30 * 24 * 60 * 60 },
-    { label: "day", seconds: 24 * 60 * 60 },
-    { label: "hour", seconds: 60 * 60 },
-    { label: "minute", seconds: 60 },
-  ];
-  const unit =
-    units.find((item) => elapsedSeconds >= item.seconds) ??
-    units[units.length - 1];
-  const value = Math.max(1, Math.floor(elapsedSeconds / unit.seconds));
-  return `${value} ${unit.label}${value === 1 ? "" : "s"} ago`;
-}
-
-function pluralize(count: number, singular: string, plural = `${singular}s`) {
-  return `${count} ${count === 1 ? singular : plural}`;
 }
 
 function pullRequestStatusClassName(status: ProjectPullRequest["status"]) {
@@ -94,11 +81,20 @@ function pullRequestStatusClassName(status: ProjectPullRequest["status"]) {
   return "text-green-500";
 }
 
-function pullRequestStatusBadgeClassName(status: ProjectPullRequest["status"]) {
-  if (status === "Closed") return "bg-destructive";
-  if (status === "Draft") return "bg-muted-foreground/80";
-  if (status === "Merged") return "bg-purple-600";
-  return "bg-green-600";
+const PULL_REQUEST_STATUS_ORDER: readonly ProjectPullRequest["status"][] = [
+  "Open",
+  "Draft",
+  "Merged",
+  "Closed",
+];
+
+function pullRequestProgressState(
+  status: ProjectPullRequest["status"],
+): ProjectStatusProgressState {
+  if (status === "Draft") return "queued";
+  if (status === "Merged") return "completed";
+  if (status === "Closed") return "canceled";
+  return "review";
 }
 
 function pullRequestMembers(
@@ -127,44 +123,82 @@ function pullRequestMembers(
 }
 
 function AuthorIdentity({
+  avatarSize = "md",
   profiles,
   pubkey,
   role,
+  showLabel = true,
 }: {
+  avatarSize?: "xs" | "sm" | "md";
   profiles?: UserProfileLookup;
   pubkey: string;
   role?: React.ReactNode;
+  showLabel?: boolean;
 }) {
   const profile = profileForPubkey(pubkey, profiles);
   return (
     <ProfileIdentityButton
       align="center"
-      avatarSize="xs"
+      avatarSize={avatarSize}
       avatarUrl={profile?.avatarUrl ?? null}
       isAgent={profile?.isAgent === true}
       label={labelForPubkey(pubkey, profiles)}
       pubkey={pubkey}
       role={role}
+      showLabel={showLabel}
     />
   );
 }
 
-function PullRequestRow({
-  onOpen,
-  profiles,
-  pullRequest,
+/** Commit hash chip that jumps to the commit detail when a handler is given. */
+function CommitHashChip({
+  hash,
+  onOpenCommit,
 }: {
-  onOpen: () => void;
-  profiles?: UserProfileLookup;
-  pullRequest: ProjectPullRequest;
+  hash: string;
+  onOpenCommit?: (commitHash: string) => void;
 }) {
-  const authorProfile = profileForPubkey(pullRequest.author, profiles);
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
-  const StatusIcon =
-    pullRequest.status === "Closed" || pullRequest.status === "Draft"
-      ? X
-      : Check;
-  const statusClassName = pullRequestStatusClassName(pullRequest.status);
+  const short = hash.slice(0, 7);
+  if (!onOpenCommit) {
+    return (
+      <code className="shrink-0 rounded-md bg-background/55 px-2 py-1 text-xs text-muted-foreground">
+        {short}
+      </code>
+    );
+  }
+  return (
+    <button
+      aria-label={`View commit ${short}`}
+      className="shrink-0 rounded-md bg-background/55 px-2 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+      onClick={() => onOpenCommit(hash)}
+      type="button"
+    >
+      {short}
+    </button>
+  );
+}
+
+function PullRequestCommitRow({
+  author,
+  branch,
+  createdAt,
+  hash,
+  message,
+  onOpenCommit,
+  profiles,
+}: {
+  author: string;
+  branch: string | null;
+  createdAt: number;
+  hash: string | null;
+  message: string;
+  onOpenCommit?: (commitHash: string) => void;
+  profiles?: UserProfileLookup;
+}) {
+  const authorProfile = profileForPubkey(author, profiles);
+  const authorLabel = labelForPubkey(author, profiles);
+  const openCommit =
+    hash && onOpenCommit ? () => onOpenCommit(hash) : undefined;
 
   return (
     <ProjectFeedRow
@@ -176,510 +210,259 @@ function PullRequestRow({
             avatarUrl={authorProfile?.avatarUrl ?? null}
             isAgent={authorProfile?.isAgent === true}
             label={authorLabel}
-            pubkey={pullRequest.author}
+            pubkey={author}
             showLabel={false}
           />
-          <span className="truncate font-medium text-foreground/80">
-            {authorLabel}
+          <span className="truncate">
+            <ProfileAuthorName pubkey={author}>{authorLabel}</ProfileAuthorName>{" "}
+            authored
           </span>
-          <span>opened {relativeOpenedAt(pullRequest.createdAt)}</span>
-          <span className="rounded-full border border-border/60 px-1.5 py-0.5 text-2xs">
-            Member
-          </span>
-          <span>·</span>
-          <span>{pullRequest.status}</span>
-        </>
-      }
-      onOpen={onOpen}
-      statusIcon={
-        <StatusIcon className={`h-3.5 w-3.5 shrink-0 ${statusClassName}`} />
-      }
-      testId="project-pull-request-row"
-      title={pullRequest.title}
-      trailing={
-        <>
-          {pullRequest.comments.length > 0 ? (
-            <span className="flex items-center gap-1 text-xs text-muted-foreground">
-              <MessageSquare className="h-3.5 w-3.5" />
-              {pullRequest.comments.length}
+          {branch ? (
+            <span className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border/60 px-1.5 py-0.5 font-mono text-2xs">
+              <GitBranch className="h-3 w-3 shrink-0" />
+              <span className="truncate">{branch}</span>
             </span>
           ) : null}
-          <ProjectFeedRowCluster>
-            <ProjectFeedRowMonoCell
-              label={`#${pullRequest.id.slice(0, 8)}`}
-              onClick={onOpen}
-              title="View pull request"
-            />
-          </ProjectFeedRowCluster>
+        </>
+      }
+      onOpen={openCommit}
+      testId="project-pull-request-commit-row"
+      title={message}
+      trailing={
+        <>
+          {hash ? (
+            <ProjectFeedRowCluster>
+              <ProjectFeedRowMonoCell
+                label={hash.slice(0, 7)}
+                onClick={openCommit}
+                title={`View commit ${hash.slice(0, 7)}`}
+              />
+              <CopyCommitHashButton hash={hash} />
+            </ProjectFeedRowCluster>
+          ) : null}
+          <span
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground sm:block"
+            data-testid="project-pull-request-commit-row-date"
+            title={formatExactTimestamp(createdAt)}
+          >
+            {relativeTime(createdAt)}
+          </span>
         </>
       }
     />
   );
 }
 
-export type PullRequestPanelMode = "conversation" | "commits" | "checks";
-
-/** Candidate reviewers: project owner, contributors, and PR recipients —
- * minus the PR author and anyone already requested. */
-function reviewerCandidates(project: Project, pullRequest: ProjectPullRequest) {
-  const requested = new Set(pullRequest.reviewers);
-  const author = normalizePubkey(pullRequest.author);
-  return [
-    ...new Set(
-      [project.owner, ...project.contributors, ...pullRequest.recipients].map(
-        normalizePubkey,
-      ),
-    ),
-  ].filter((pubkey) => pubkey !== author && !requested.has(pubkey));
+function reviewSelectionItem(
+  project: Project,
+  pullRequest: ProjectPullRequest,
+) {
+  return selectionItemFromReview({
+    author: pullRequest.author,
+    channelId: pullRequest.channelId ?? project.channelId,
+    id: pullRequest.id,
+    shareLink: pullRequestShareLink(pullRequest),
+    title: pullRequest.title,
+  });
 }
 
-function PullRequestReviewersRow({
-  canRequest,
+function PullRequestRow({
+  onOpen,
   profiles,
   project,
   pullRequest,
+  rangeItems,
 }: {
-  canRequest: boolean;
+  onOpen: () => void;
   profiles?: UserProfileLookup;
   project: Project;
   pullRequest: ProjectPullRequest;
+  rangeItems: ReturnType<typeof reviewSelectionItem>[];
 }) {
-  const requestReviewMutation =
-    useRequestProjectPullRequestReviewMutation(project);
-  const candidates = reviewerCandidates(project, pullRequest);
-  const approvedBy = new Set(
-    pullRequest.approvals.map((approval) => normalizePubkey(approval.author)),
-  );
-
-  const handleRequest = React.useCallback(
-    async (pubkey: string) => {
-      try {
-        await requestReviewMutation.mutateAsync({
-          pullRequest,
-          reviewers: [pubkey],
-          reviewerLabel: labelForPubkey(pubkey, profiles),
-        });
-        toast.success("Review requested.");
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to request review.",
-        );
-      }
-    },
-    [profiles, pullRequest, requestReviewMutation],
-  );
-
-  if (pullRequest.reviewers.length === 0 && !canRequest) {
-    return null;
-  }
+  const authorProfile = profileForPubkey(pullRequest.author, profiles);
+  const authorLabel = labelForPubkey(pullRequest.author, profiles);
+  const statusClassName = pullRequestStatusClassName(pullRequest.status);
 
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-1.5 px-1 text-xs text-muted-foreground">
-      <span className="font-medium">Reviewers</span>
-      {pullRequest.reviewers.map((pubkey) => {
-        const profile = profileForPubkey(pubkey, profiles);
-        const label = labelForPubkey(pubkey, profiles);
-        const hasApproved = approvedBy.has(normalizePubkey(pubkey));
-        return (
-          <Tooltip key={pubkey}>
-            <TooltipTrigger asChild>
-              <span className="relative inline-flex">
-                <UserAvatar
-                  accent={profile?.isAgent === true}
-                  avatarUrl={profile?.avatarUrl ?? null}
-                  displayName={label}
-                  size="xs"
-                />
-                {hasApproved ? (
-                  <span className="-right-1 -bottom-1 absolute flex h-3.5 w-3.5 items-center justify-center rounded-full bg-green-600 text-white ring-2 ring-background">
-                    <Check className="h-2.5 w-2.5" />
-                  </span>
-                ) : null}
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>
-              {label}
-              {hasApproved ? " — approved" : " — review requested"}
-            </TooltipContent>
-          </Tooltip>
-        );
-      })}
-      {canRequest && candidates.length > 0 ? (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              className="h-6 gap-1 px-2 text-2xs text-muted-foreground hover:text-foreground"
-              disabled={requestReviewMutation.isPending}
-              size="xs"
+    <ProjectWorkItemRow
+      eventId={pullRequest.id}
+      identifier={`#${pullRequest.id.slice(0, 8)}`}
+      identifierTitle="View review"
+      metadata={
+        pullRequest.branchName ? (
+          <span className="inline-flex min-w-0 items-center gap-1">
+            <GitBranch className="h-3 w-3 shrink-0" />
+            <span className="truncate">{pullRequest.branchName}</span>
+          </span>
+        ) : undefined
+      }
+      onOpen={onOpen}
+      selection={{
+        item: reviewSelectionItem(project, pullRequest),
+        rangeItems,
+      }}
+      statusIcon={
+        <ProjectStatusProgressIcon
+          aria-label={pullRequest.status}
+          className={`h-3.5 w-3.5 shrink-0 ${statusClassName}`}
+          state={pullRequestProgressState(pullRequest.status)}
+        />
+      }
+      testId="project-pull-request-row"
+      title={pullRequest.title}
+      trailing={
+        <>
+          <span className="flex w-8 shrink-0 justify-end">
+            <button
+              aria-label={
+                pullRequest.comments.length > 0
+                  ? `View ${pullRequest.comments.length} comments`
+                  : "View comments"
+              }
+              className={`flex items-center gap-1 rounded-md text-xs hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
+                pullRequest.comments.length > 0
+                  ? "text-muted-foreground/60"
+                  : "text-muted-foreground/45"
+              }`}
+              data-testid="project-pull-request-comments"
+              onClick={onOpen}
               type="button"
-              variant="outline"
             >
-              <UserPlus className="h-3 w-3" />
-              Request
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="min-w-52">
-            <DropdownMenuLabel>Request a review</DropdownMenuLabel>
-            {candidates.map((pubkey) => {
-              const profile = profileForPubkey(pubkey, profiles);
-              const label = labelForPubkey(pubkey, profiles);
-              return (
-                <DropdownMenuItem
-                  key={pubkey}
-                  onSelect={() => {
-                    void handleRequest(pubkey);
-                  }}
-                >
-                  <span className="flex min-w-0 items-center gap-2">
-                    <UserAvatar
-                      accent={profile?.isAgent === true}
-                      avatarUrl={profile?.avatarUrl ?? null}
-                      displayName={label}
-                      size="xs"
-                    />
-                    <span className="truncate">{label}</span>
-                  </span>
-                </DropdownMenuItem>
-              );
-            })}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      ) : null}
-    </div>
+              <MessageSquare className="h-3.5 w-3.5" />
+              {pullRequest.comments.length}
+            </button>
+          </span>
+          <ProfileIdentityButton
+            avatarClassName="shrink-0"
+            avatarSize="xs"
+            avatarUrl={authorProfile?.avatarUrl ?? null}
+            isAgent={authorProfile?.isAgent === true}
+            label={authorLabel}
+            pubkey={pullRequest.author}
+            showLabel={false}
+          />
+          <span
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground/55 sm:block"
+            data-testid="project-pull-request-row-date"
+            title={formatExactTimestamp(pullRequest.createdAt)}
+          >
+            {relativeTime(pullRequest.createdAt)}
+          </span>
+        </>
+      }
+    />
   );
 }
 
-/** GitHub-style review box rendered in the conversation flow, above the
- * comment composer: reviewers on top, review state + actions below. */
-function PullRequestReviewCard({
+/** GitHub-style PR title line, rendered as the top of the review detail
+ * card. Status, branches, and dates sit in the meta header below. */
+export function PullRequestDetailHeader({
+  pullRequest,
+}: {
+  pullRequest: ProjectPullRequest;
+}) {
+  return (
+    <header className="min-w-0 space-y-2 px-6 pb-3 pt-5">
+      <h3 className="line-clamp-2 min-w-0 text-lg font-semibold leading-6 text-foreground">
+        {pullRequest.title}{" "}
+        <span className="font-normal text-muted-foreground">
+          #{pullRequest.id.slice(0, 8)}
+        </span>
+        <ShareLinkButton
+          className="ml-1 inline-flex h-7 w-7 align-text-bottom"
+          label="Copy review link"
+          link={pullRequestShareLink(pullRequest)}
+          testId="project-pull-request-copy-link"
+        />
+      </h3>
+      <p
+        className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs text-muted-foreground"
+        data-testid="project-pull-request-detail-metadata"
+      >
+        <span data-project-metadata-phrase>Review opened</span>
+        <span
+          className="shrink-0 whitespace-nowrap"
+          data-project-metadata-phrase
+          title={formatExactTimestamp(pullRequest.createdAt)}
+        >
+          {relativeTime(pullRequest.createdAt)}
+        </span>
+        <ProjectOriginReference
+          agentName={pullRequest.originAgentName}
+          channelId={pullRequest.channelId}
+        />
+      </p>
+    </header>
+  );
+}
+
+/** Full pull-request conversation, review actions, and comment composer. */
+export function ProjectPullRequestDetail({
+  diffStats,
+  filesChanged,
+  filesCount,
+  forceOpenFiles = false,
+  onOpenInlineComment,
+  onOpenCommit,
+  onOpenTerminal,
   profiles,
   project,
   pullRequest,
 }: {
+  diffStats?: { additions: number; deletions: number } | null;
+  filesChanged?: React.ReactNode;
+  filesCount?: number;
+  forceOpenFiles?: boolean;
+  onOpenInlineComment?: (anchor: ProjectPullRequestCommentAnchor) => void;
+  onOpenCommit?: (commitHash: string) => void;
+  onOpenTerminal?: OpenMergeRecoveryTerminal;
   profiles?: UserProfileLookup;
   project: Project;
   pullRequest: ProjectPullRequest;
 }) {
   const identityQuery = useIdentityQuery();
-  const statusMutation = useUpdateProjectPullRequestStatusMutation(project);
-  const approveMutation = useApproveProjectPullRequestMutation(project);
-
-  const viewerPubkey = identityQuery.data?.pubkey ?? null;
-  const viewer = viewerPubkey ? normalizePubkey(viewerPubkey) : null;
-  const isAuthor = viewer === normalizePubkey(pullRequest.author);
-  const isOwner = viewer === normalizePubkey(project.owner);
-  const canChangeStatus = Boolean(viewer) && (isAuthor || isOwner);
-  const canRequestReview = canChangeStatus;
-  const hasApproved = Boolean(
-    viewer &&
-      pullRequest.approvals.some(
-        (approval) => normalizePubkey(approval.author) === viewer,
-      ),
-  );
-  const canApprove =
-    Boolean(viewer) &&
-    !isAuthor &&
-    !hasApproved &&
-    (pullRequest.status === "Open" || pullRequest.status === "Draft");
-
-  const handleStatusChange = React.useCallback(
-    async (status: "open" | "draft") => {
-      try {
-        await statusMutation.mutateAsync({ pullRequest, status });
-        toast.success(
-          status === "draft"
-            ? "Converted to draft."
-            : "Marked as ready for review.",
-        );
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to update status.",
-        );
-      }
-    },
-    [pullRequest, statusMutation],
-  );
-
-  const handleApprove = React.useCallback(async () => {
-    try {
-      await approveMutation.mutateAsync({ pullRequest });
-      toast.success("Pull request approved.");
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Failed to approve.",
-      );
-    }
-  }, [approveMutation, pullRequest]);
-
-  const approvalCount = pullRequest.approvals.length;
-  const isDraft = pullRequest.status === "Draft";
-  const reviewState = isDraft
-    ? "This pull request is still a work in progress."
-    : approvalCount > 0
-      ? `Approved by ${pluralize(approvalCount, "reviewer")}.`
-      : pullRequest.reviewers.length > 0
-        ? "Review requested — no approvals yet."
-        : "No reviews yet.";
-  const reviewStateDetail = isDraft
-    ? "Draft pull requests cannot be merged."
-    : approvalCount === 0
-      ? "Approvals from reviewers will show up here."
-      : null;
-
-  return (
-    <div className="space-y-2.5">
-      <PullRequestReviewersRow
-        canRequest={canRequestReview}
-        profiles={profiles}
-        project={project}
-        pullRequest={pullRequest}
-      />
-      <div
-        className={`min-w-0 space-y-2.5 px-3 py-2.5 ${
-          isDraft
-            ? "bg-muted/40"
-            : approvalCount > 0
-              ? "bg-green-600/10 dark:bg-green-500/10"
-              : "border-green-600/35 border-l-2 bg-green-600/[0.04] pl-3 dark:border-green-500/35 dark:bg-green-500/[0.06]"
-        }`}
-      >
-        <div className="flex min-w-0 items-start gap-2">
-          {isDraft ? (
-            <GitPullRequestDraft className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-          ) : approvalCount > 0 ? (
-            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-green-600 text-white">
-              <Check className="h-3 w-3" />
-            </span>
-          ) : (
-            <GitPullRequest className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-          )}
-          <div className="min-w-0 flex-1">
-            <p
-              className={`text-sm font-medium ${
-                approvalCount > 0
-                  ? "text-green-700 dark:text-green-400"
-                  : "text-foreground"
-              }`}
-            >
-              {reviewState}
-            </p>
-            {reviewStateDetail ? (
-              <p className="text-xs text-muted-foreground">
-                {reviewStateDetail}
-              </p>
-            ) : null}
-          </div>
-        </div>
-        {hasApproved || canApprove || (canChangeStatus && isDraft) ? (
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            {hasApproved ? (
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-green-600/40 px-2.5 py-1 text-xs font-medium text-green-600 dark:text-green-500">
-                <Check className="h-3.5 w-3.5" />
-                Approved
-              </span>
-            ) : null}
-            {canApprove ? (
-              <Button
-                className="h-8 gap-1.5 bg-green-600 px-3.5 text-white shadow-sm hover:bg-green-700"
-                disabled={approveMutation.isPending}
-                onClick={() => {
-                  void handleApprove();
-                }}
-                size="xs"
-                type="button"
-              >
-                <Check className="h-3.5 w-3.5" />
-                Approve
-              </Button>
-            ) : null}
-            {canChangeStatus && isDraft ? (
-              <Button
-                className="h-7 gap-1.5 px-3"
-                disabled={statusMutation.isPending}
-                onClick={() => {
-                  void handleStatusChange("open");
-                }}
-                size="xs"
-                type="button"
-                variant="secondary"
-              >
-                <GitPullRequest className="h-3.5 w-3.5" />
-                Ready for review
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-      {canChangeStatus && pullRequest.status === "Open" ? (
-        <p className="px-1 text-xs text-muted-foreground">
-          Still in progress?{" "}
-          <button
-            className="font-medium underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
-            disabled={statusMutation.isPending}
-            onClick={() => {
-              void handleStatusChange("draft");
-            }}
-            type="button"
-          >
-            Convert to draft
-          </button>
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-/** GitHub-style PR title line, rendered as the top section of the PR detail
- * card. Status, branches, and dates live in the right-hand meta rail. */
-export function PullRequestDetailHeader({
-  profiles,
-  pullRequest,
-}: {
-  profiles?: UserProfileLookup;
-  pullRequest: ProjectPullRequest;
-}) {
-  const authorProfile = profileForPubkey(pullRequest.author, profiles);
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
-
-  return (
-    <header className="min-w-0 space-y-2 p-4 pb-2">
-      <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-        <GitPullRequest className="h-3.5 w-3.5" />
-        Pull request from {authorLabel}
-      </p>
-      <div className="flex min-w-0 items-center gap-3">
-        <ProfileIdentityButton
-          avatarClassName="shrink-0"
-          avatarSize="md"
-          avatarUrl={authorProfile?.avatarUrl ?? null}
-          isAgent={authorProfile?.isAgent === true}
-          label={authorLabel}
-          pubkey={pullRequest.author}
-          showLabel={false}
-        />
-        <h3 className="line-clamp-2 min-w-0 flex-1 text-base font-semibold text-foreground">
-          {pullRequest.title}{" "}
-          <span className="font-normal text-muted-foreground">
-            #{pullRequest.id.slice(0, 8)}
-          </span>
-        </h3>
-      </div>
-    </header>
-  );
-}
-
-/** Right-hand meta column for the PR detail view: status, author, branches,
- * dates, and review actions — keeps the conversation column focused. */
-export function PullRequestMetaRail({
-  profiles,
-  project,
-  pullRequest,
-}: {
-  profiles?: UserProfileLookup;
-  project: Project;
-  pullRequest: ProjectPullRequest;
-}) {
-  const authorProfile = profileForPubkey(pullRequest.author, profiles);
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
-  const targetBranch = project.defaultBranch || "default branch";
-  const sourceBranch = pullRequest.branchName || "unknown branch";
-  const commitCount = Math.max(1, pullRequest.updateCount + 1);
-
-  return (
-    <aside className="min-w-0 space-y-6 border-t border-border/60 p-4 xl:border-l xl:border-t-0">
-      <OverviewRailSection title="Status">
-        <span
-          className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-white ${pullRequestStatusBadgeClassName(pullRequest.status)}`}
-        >
-          {pullRequest.status === "Merged" ? (
-            <GitMerge className="h-3.5 w-3.5" />
-          ) : (
-            <GitPullRequest className="h-3.5 w-3.5" />
-          )}
-          {pullRequest.status}
-        </span>
-      </OverviewRailSection>
-      <OverviewRailSection title="Author">
-        <ProfileIdentityButton
-          align="center"
-          avatarSize="xs"
-          avatarUrl={authorProfile?.avatarUrl ?? null}
-          isAgent={authorProfile?.isAgent === true}
-          label={authorLabel}
-          pubkey={pullRequest.author}
-        />
-      </OverviewRailSection>
-      <OverviewRailSection title="Branches">
-        <div className="space-y-1.5 text-xs text-muted-foreground">
-          <p>Merges {pluralize(commitCount, "commit")}</p>
-          <p className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <code className="rounded-sm bg-muted px-1.5 py-0.5 text-2xs text-foreground">
-              {sourceBranch}
-            </code>
-            <span aria-hidden>→</span>
-            <code className="rounded-sm bg-muted px-1.5 py-0.5 text-2xs text-foreground">
-              {targetBranch}
-            </code>
-          </p>
-        </div>
-      </OverviewRailSection>
-      <OverviewRailSection title="Activity">
-        <dl className="space-y-1.5 text-xs text-muted-foreground">
-          <div className="flex items-center justify-between gap-3">
-            <dt>Opened</dt>
-            <dd className="font-medium text-foreground">
-              {compactDate(pullRequest.createdAt)}
-            </dd>
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <dt>Updated</dt>
-            <dd className="font-medium text-foreground">
-              {compactDate(pullRequest.updatedAt)}
-            </dd>
-          </div>
-        </dl>
-      </OverviewRailSection>
-      <OverviewRailSection title="Review">
-        <PullRequestReviewCard
-          profiles={profiles}
-          project={project}
-          pullRequest={pullRequest}
-        />
-      </OverviewRailSection>
-    </aside>
-  );
-}
-
-function PullRequestDetail({
-  mode,
-  profiles,
-  project,
-  pullRequest,
-}: {
-  mode: PullRequestPanelMode;
-  profiles?: UserProfileLookup;
-  project: Project;
-  pullRequest: ProjectPullRequest;
-}) {
   const commentMutation = useCreateProjectPullRequestCommentMutation(project);
+  const [
+    expandedReviewHistoryPullRequestIds,
+    setExpandedReviewHistoryPullRequestIds,
+  ] = React.useState<Set<string>>(() => new Set());
+  const [
+    collapsedReviewHistoryPullRequestIds,
+    setCollapsedReviewHistoryPullRequestIds,
+  ] = React.useState<Set<string>>(() => new Set());
+  const [filesOpen, setFilesOpen] = React.useState(forceOpenFiles);
+  const [filesOpenForId, setFilesOpenForId] = React.useState(pullRequest.id);
+  if (filesOpenForId !== pullRequest.id) {
+    setFilesOpenForId(pullRequest.id);
+    setFilesOpen(forceOpenFiles);
+  }
   const members = React.useMemo(
     () => pullRequestMembers(project, pullRequest, profiles),
     [profiles, project, pullRequest],
   );
-  const handleCommentSubmit = React.useCallback(
+  React.useEffect(() => {
+    if (forceOpenFiles) setFilesOpen(true);
+  }, [forceOpenFiles]);
+  const submitComment = React.useCallback(
     async (
       content: string,
       mentionPubkeys: string[],
       mediaTags?: string[][],
+      decision?: "request-changes",
     ) => {
       try {
         await commentMutation.mutateAsync({
           content,
+          decision,
           mediaTags,
           mentionPubkeys,
           pullRequest,
         });
-        toast.success("Comment posted.");
+        toast.success(
+          decision === "request-changes"
+            ? "Changes requested."
+            : "Comment posted.",
+        );
       } catch (error) {
         toast.error(
           error instanceof Error ? error.message : "Failed to post comment.",
@@ -689,242 +472,470 @@ function PullRequestDetail({
     },
     [commentMutation, pullRequest],
   );
+  const handleCommentSubmit = React.useCallback(
+    (content: string, mentionPubkeys: string[], mediaTags?: string[][]) =>
+      submitComment(content, mentionPubkeys, mediaTags),
+    [submitComment],
+  );
+  const handleChangeRequestSubmit = React.useCallback(
+    (content: string, mentionPubkeys: string[], mediaTags?: string[][]) =>
+      submitComment(content, mentionPubkeys, mediaTags, "request-changes"),
+    [submitComment],
+  );
 
-  if (mode === "commits") {
-    return (
-      <div className="divide-y divide-border/50">
-        <section className="space-y-3 p-4">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Commits
-          </h4>
-          <article className="space-y-1">
-            <div className="flex min-w-0 items-center justify-between gap-3">
-              <AuthorIdentity
-                profiles={profiles}
-                pubkey={pullRequest.author}
-                role={compactDate(pullRequest.createdAt)}
-              />
-              {pullRequest.commit ? (
-                <code className="shrink-0 rounded-md bg-background/55 px-2 py-1 text-xs text-muted-foreground">
-                  {pullRequest.commit.slice(0, 7)}
-                </code>
-              ) : null}
-            </div>
-            <p className="text-sm text-muted-foreground">{pullRequest.title}</p>
-          </article>
-          {pullRequest.updates.map((update) => (
-            <article className="space-y-1" key={update.id}>
-              <div className="flex min-w-0 items-center justify-between gap-3">
-                <AuthorIdentity
-                  profiles={profiles}
-                  pubkey={update.author}
-                  role={compactDate(update.createdAt)}
-                />
-                {update.commit ? (
-                  <code className="shrink-0 rounded-md bg-background/55 px-2 py-1 text-xs text-muted-foreground">
-                    {update.commit.slice(0, 7)}
-                  </code>
-                ) : null}
-              </div>
-              {update.content ? (
-                <p className="text-sm text-muted-foreground">
-                  {update.content}
-                </p>
-              ) : null}
-            </article>
-          ))}
-        </section>
-      </div>
+  const commitCount = Math.max(1, pullRequest.updates.length + 1);
+  const reviewHistory = pullRequest.comments
+    .map((item) => ({
+      item,
+      timelineKind: projectPullRequestCommentTimelineKind(item),
+    }))
+    .sort(
+      (left, right) =>
+        left.item.createdAt - right.item.createdAt ||
+        left.item.id.localeCompare(right.item.id),
     );
-  }
-
-  if (mode === "checks") {
-    return (
-      <p className="p-4 text-sm text-muted-foreground">
-        No checks have been reported for this pull request yet.
-      </p>
-    );
-  }
+  const reviewHistoryCollapsed = collapsedReviewHistoryPullRequestIds.has(
+    pullRequest.id,
+  );
+  const reviewHistoryExpanded = expandedReviewHistoryPullRequestIds.has(
+    pullRequest.id,
+  );
+  const earlierReviewHistoryCount = Math.max(0, reviewHistory.length - 3);
+  const visibleReviewHistory =
+    reviewHistoryExpanded || earlierReviewHistoryCount === 0
+      ? reviewHistory
+      : reviewHistory.slice(-3);
+  const displayedReviewHistory = reviewHistoryCollapsed
+    ? []
+    : visibleReviewHistory;
+  const canRequestChanges = canReviewProjectPullRequest(
+    project,
+    pullRequest,
+    identityQuery.data?.pubkey,
+  );
 
   return (
-    <div className="divide-y divide-border/50">
-      {pullRequest.content ? (
-        <header className="p-4">
-          <Markdown
-            className="text-sm"
-            content={pullRequest.content}
-            interactive={false}
-          />
-        </header>
-      ) : null}
-
-      {pullRequest.updates.length > 0 ? (
-        <section className="space-y-3 p-4">
-          <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Updates
-          </h4>
-          {pullRequest.updates.map((update) => (
-            <article className="space-y-1" key={update.id}>
-              <div className="flex min-w-0 items-center justify-between gap-3">
-                <AuthorIdentity
-                  profiles={profiles}
-                  pubkey={update.author}
-                  role={compactDate(update.createdAt)}
-                />
-                {update.commit ? (
-                  <code className="shrink-0 rounded-md bg-background/55 px-2 py-1 text-xs text-muted-foreground">
-                    {update.commit.slice(0, 7)}
-                  </code>
-                ) : null}
-              </div>
-              {update.content ? (
-                <p className="text-sm text-muted-foreground">
-                  {update.content}
-                </p>
-              ) : null}
-            </article>
-          ))}
-        </section>
-      ) : null}
-
-      <section className="space-y-3 p-4">
-        <h4 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          <MessageSquare className="h-3.5 w-3.5" />
-          Discussion
-        </h4>
-        {pullRequest.comments.length > 0 ? (
-          <div className="space-y-3">
-            {pullRequest.comments.map((item) => {
-              // Approvals and review requests render as compact timeline
-              // rows (GitHub-style) rather than full comment cards.
-              if (item.isApproval || item.isReviewRequest) {
-                return (
-                  <div
-                    className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-muted-foreground"
-                    key={item.id}
-                  >
-                    {item.isApproval ? (
-                      <Check className="h-3.5 w-3.5 shrink-0 text-green-600 dark:text-green-500" />
-                    ) : (
-                      <UserPlus className="h-3.5 w-3.5 shrink-0" />
-                    )}
-                    <span className="font-medium text-foreground">
-                      {labelForPubkey(item.author, profiles)}
-                    </span>
-                    <span className="min-w-0 truncate">
-                      {item.isApproval
-                        ? "approved these changes"
-                        : item.content.trim() || "requested a review"}
-                    </span>
-                    <span>· {compactDate(item.createdAt)}</span>
-                  </div>
-                );
-              }
-              return (
-                <article key={item.id}>
-                  <div className="mb-2">
+    <div
+      className={PROJECT_DETAIL_READING_COLUMN_CLASS}
+      data-project-detail-panel
+      data-testid="project-pull-request-detail"
+    >
+      <PullRequestDetailHeader pullRequest={pullRequest} />
+      <PullRequestMetaHeader
+        diffStats={diffStats}
+        profiles={profiles}
+        project={project}
+        pullRequest={pullRequest}
+      />
+      {pullRequest.content || pullRequest.updates.length > 0 ? (
+        <ProjectDetailSection defaultOpen title="Description">
+          {pullRequest.content ? (
+            <ProjectRichContent
+              content={pullRequest.content}
+              tags={pullRequest.tags}
+            />
+          ) : null}
+          {pullRequest.updates.length > 0 ? (
+            <div
+              className={pullRequest.content ? "mt-4 space-y-4" : "space-y-4"}
+            >
+              <h4 className="text-sm font-semibold text-foreground">Updates</h4>
+              {pullRequest.updates.map((update) => (
+                <article className="space-y-1" key={update.id}>
+                  <div className="flex min-w-0 items-center justify-between gap-3">
                     <AuthorIdentity
+                      avatarSize="sm"
                       profiles={profiles}
-                      pubkey={item.author}
-                      role={compactDate(item.createdAt)}
+                      pubkey={update.author}
+                      role={
+                        <span title={formatExactTimestamp(update.createdAt)}>
+                          {relativeTime(update.createdAt)}
+                        </span>
+                      }
                     />
+                    {update.commit ? (
+                      <CommitHashChip
+                        hash={update.commit}
+                        onOpenCommit={onOpenCommit}
+                      />
+                    ) : null}
                   </div>
-                  <Markdown
-                    className="text-sm"
-                    content={item.content}
-                    interactive={false}
-                  />
+                  {update.content ? (
+                    <ProjectRichContent
+                      className="text-sm text-muted-foreground"
+                      content={update.content}
+                      tags={update.tags}
+                    />
+                  ) : null}
                 </article>
+              ))}
+            </div>
+          ) : null}
+        </ProjectDetailSection>
+      ) : null}
+      {filesChanged ? (
+        <ProjectDetailSection
+          count={filesCount}
+          defaultOpen={false}
+          onOpenChange={setFilesOpen}
+          open={filesOpen}
+          testId="project-detail-section-files"
+          title="Files changed"
+        >
+          <div className="-mx-6">{filesChanged}</div>
+        </ProjectDetailSection>
+      ) : null}
+      <ProjectDetailSection
+        count={commitCount}
+        defaultOpen={false}
+        title="Commits"
+      >
+        <div className="-mx-6">
+          <PullRequestCommitRow
+            author={pullRequest.author}
+            branch={pullRequest.branchName}
+            createdAt={pullRequest.createdAt}
+            hash={pullRequest.commit}
+            message={pullRequest.title}
+            onOpenCommit={onOpenCommit}
+            profiles={profiles}
+          />
+          {pullRequest.updates.map((update) => (
+            <PullRequestCommitRow
+              author={update.author}
+              branch={pullRequest.branchName}
+              createdAt={update.createdAt}
+              hash={update.commit}
+              key={update.id}
+              message={update.content.trim() || "Updated review branch"}
+              onOpenCommit={onOpenCommit}
+              profiles={profiles}
+            />
+          ))}
+        </div>
+      </ProjectDetailSection>
+      <ProjectDetailSection defaultOpen={false} title="Checks">
+        <p className="text-sm text-muted-foreground">
+          No checks have been reported for this review yet.
+        </p>
+      </ProjectDetailSection>
+      <ProjectDetailSection defaultOpen title="Activity">
+        <div className="space-y-3">
+          <DiscussedInChannels
+            entityLabel="this review"
+            originChannelId={pullRequest.channelId}
+            originCreatedAt={pullRequest.createdAt}
+            originPubkey={pullRequest.author}
+            query={entityDiscussionQuery(pullRequest.id)}
+            testId="pull-request-discussed-in"
+          />
+          <div className="group/timeline -mx-6 overflow-hidden">
+            {reviewHistory.length > 0 ? (
+              <button
+                aria-expanded={!reviewHistoryCollapsed}
+                className="flex min-h-10 w-full items-center gap-2 px-3 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
+                data-testid="project-pull-request-review-history-toggle"
+                onClick={() => {
+                  setCollapsedReviewHistoryPullRequestIds((current) => {
+                    const next = new Set(current);
+                    if (reviewHistoryCollapsed) {
+                      next.delete(pullRequest.id);
+                    } else {
+                      next.add(pullRequest.id);
+                    }
+                    return next;
+                  });
+                }}
+                type="button"
+              >
+                <span className="relative flex w-5 shrink-0 justify-center self-stretch">
+                  {reviewHistoryCollapsed ? (
+                    <span className="absolute top-2.5 -bottom-11 hidden w-px bg-border/80 group-has-[.pull-request-action-timeline]/timeline:block" />
+                  ) : (
+                    <span className="absolute top-2.5 -bottom-[1.875rem] w-px bg-border/80" />
+                  )}
+                  <span className="relative z-10 flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary ring-1 ring-primary/35">
+                    <History className="h-3 w-3" />
+                  </span>
+                </span>
+                <span className="flex min-h-5 min-w-0 flex-1 items-center text-left">
+                  {reviewHistoryCollapsed
+                    ? `Show ${reviewHistory.length} earlier ${
+                        reviewHistory.length === 1 ? "activity" : "activities"
+                      }`
+                    : "Collapse review history"}
+                </span>
+                {reviewHistoryCollapsed ? (
+                  <ChevronDown className="mt-0.5 h-3.5 w-3.5" />
+                ) : (
+                  <ChevronUp className="mt-0.5 h-3.5 w-3.5" />
+                )}
+              </button>
+            ) : null}
+            {!reviewHistoryCollapsed &&
+            earlierReviewHistoryCount > 0 &&
+            !reviewHistoryExpanded ? (
+              <button
+                className="flex min-h-10 w-full items-center gap-2 px-3 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
+                data-testid="project-pull-request-earlier-activities"
+                onClick={() => {
+                  setExpandedReviewHistoryPullRequestIds((current) => {
+                    const next = new Set(current);
+                    next.add(pullRequest.id);
+                    return next;
+                  });
+                }}
+                type="button"
+              >
+                <span className="relative flex w-5 shrink-0 justify-center self-stretch">
+                  <span className="absolute top-2.5 -bottom-[1.875rem] w-px bg-border/80" />
+                  <span className="relative z-10 flex h-5 w-5 items-center justify-center rounded-full bg-background ring-1 ring-border/70">
+                    <ChevronDown className="h-3 w-3" />
+                  </span>
+                </span>
+                <span className="min-w-0 flex-1 text-left">
+                  Show {earlierReviewHistoryCount} earlier{" "}
+                  {earlierReviewHistoryCount === 1 ? "activity" : "activities"}
+                </span>
+              </button>
+            ) : null}
+            {displayedReviewHistory.map(({ item, timelineKind }, index) => {
+              const isHistoricalDecision =
+                item.reviewDecisionStatus === "historical";
+              const trimmedContent = item.content.trim();
+              const activityContent =
+                timelineKind === null
+                  ? trimmedContent
+                  : timelineKind === "changes-requested" &&
+                      !/^requested changes\.?$/i.test(trimmedContent)
+                    ? trimmedContent
+                    : timelineKind === "approved" &&
+                        !/^approved (these )?changes\.?$/i.test(trimmedContent)
+                      ? trimmedContent
+                      : null;
+              return (
+                <div
+                  className="flex min-h-10 min-w-0 items-start gap-2 px-3 py-2.5 text-sm text-muted-foreground"
+                  data-testid="project-pull-request-timeline-row"
+                  key={item.id}
+                >
+                  <div className="relative flex w-5 shrink-0 justify-center self-stretch">
+                    {index < displayedReviewHistory.length - 1 ? (
+                      <span className="absolute top-2.5 -bottom-[1.875rem] w-px bg-border/80" />
+                    ) : (
+                      <span className="absolute top-2.5 -bottom-11 hidden w-px bg-border/80 group-has-[.pull-request-action-timeline]/timeline:block" />
+                    )}
+                    <span className="relative z-10 flex h-5 w-5 items-center justify-center rounded-full bg-background ring-1 ring-border/70">
+                      {timelineKind === "approved" ? (
+                        <Check
+                          className={`h-3 w-3 ${
+                            isHistoricalDecision
+                              ? "text-muted-foreground"
+                              : "text-green-600 dark:text-green-500"
+                          }`}
+                        />
+                      ) : timelineKind === "changes-requested" ? (
+                        <TriangleAlert
+                          className={`h-3 w-3 ${
+                            isHistoricalDecision
+                              ? "text-muted-foreground"
+                              : "text-amber-600 dark:text-amber-400"
+                          }`}
+                        />
+                      ) : timelineKind === "review-request" ? (
+                        <UserPlus className="h-3 w-3" />
+                      ) : (
+                        <MessageSquare className="h-3 w-3" />
+                      )}
+                    </span>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center">
+                      <span className="min-w-0 truncate">
+                        <ProfileAuthorName pubkey={item.author}>
+                          {labelForPubkey(item.author, profiles)}
+                        </ProfileAuthorName>
+                        {timelineKind ? (
+                          <>
+                            {" "}
+                            {timelineKind === "approved"
+                              ? isHistoricalDecision
+                                ? "approved an earlier commit"
+                                : "approved these changes"
+                              : timelineKind === "changes-requested"
+                                ? isHistoricalDecision
+                                  ? "requested changes on an earlier commit"
+                                  : "requested changes"
+                                : trimmedContent || "requested a review"}
+                          </>
+                        ) : null}
+                      </span>
+                      <span
+                        className="ml-auto w-20 shrink-0 text-right text-xs text-muted-foreground/70"
+                        title={formatExactTimestamp(item.createdAt)}
+                      >
+                        {relativeTime(item.createdAt)}
+                      </span>
+                    </div>
+                    {activityContent ? (
+                      <ProjectRichContent
+                        className="mt-1 text-sm text-foreground/90"
+                        content={activityContent}
+                        tags={item.tags}
+                      />
+                    ) : null}
+                    {item.anchor ? (
+                      <button
+                        aria-label={`Open ${item.anchor.path} ${item.anchor.side} line ${item.anchor.line} in Files changed`}
+                        className="mt-1 inline-flex min-w-0 items-center gap-1 rounded-md bg-muted/65 px-1.5 py-0.5 font-mono text-2xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                        onClick={() => {
+                          if (item.anchor) onOpenInlineComment?.(item.anchor);
+                        }}
+                        type="button"
+                      >
+                        <FileCode2 className="h-3 w-3 shrink-0" />
+                        <span className="truncate">{item.anchor.path}</span>
+                        <span className="shrink-0">
+                          {item.anchor.side === "new" ? "+" : "-"}
+                          {item.anchor.line}
+                        </span>
+                        {item.inlineCommentStatus === "outdated" ? (
+                          <span className="shrink-0 text-destructive">
+                            Outdated
+                          </span>
+                        ) : null}
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
               );
             })}
+            <div className="flex min-h-12 items-start justify-start px-3 py-2.5">
+              <PullRequestReviewCard
+                onOpenTerminal={onOpenTerminal}
+                project={project}
+                pullRequest={pullRequest}
+              />
+            </div>
           </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">No comments yet.</p>
-        )}
+        </div>
+      </ProjectDetailSection>
+      <div
+        className="px-6 pb-6 pt-4"
+        data-testid="project-pull-request-comment-composer"
+      >
         <ForumComposer
           className="border border-border/60 bg-background/45"
           disabled={commentMutation.isPending}
           isSending={commentMutation.isPending}
           members={members}
+          onSecondarySubmit={
+            canRequestChanges ? handleChangeRequestSubmit : undefined
+          }
           onSubmit={handleCommentSubmit}
           placeholder="Add a comment…"
           profiles={profiles}
+          secondarySubmitLabel="Request changes"
         />
-      </section>
+      </div>
     </div>
   );
 }
 
 export function PullRequestsPanel({
+  diffStats,
   error,
+  filesChanged,
+  filesCount,
+  forceOpenFiles,
   isLoading,
-  mode = "conversation",
+  onOpenInlineComment,
+  onOpenCommit,
+  onOpenTerminal,
   onSelectedPullRequestIdChange,
   profiles,
   project,
   pullRequests,
-  selectedPullRequestId,
+  selectedPullRequest,
 }: {
+  diffStats?: { additions: number; deletions: number } | null;
   error: unknown;
+  filesChanged?: React.ReactNode;
+  filesCount?: number;
+  forceOpenFiles?: boolean;
   isLoading: boolean;
-  mode?: PullRequestPanelMode;
+  onOpenInlineComment?: (anchor: ProjectPullRequestCommentAnchor) => void;
+  onOpenCommit?: (commitHash: string) => void;
+  onOpenTerminal?: OpenMergeRecoveryTerminal;
   onSelectedPullRequestIdChange: (id: string | null) => void;
   profiles?: UserProfileLookup;
   project: Project;
   pullRequests: ProjectPullRequest[];
-  selectedPullRequestId: string | null;
+  selectedPullRequest: ProjectPullRequest | null;
 }) {
-  const selectedPullRequest =
-    pullRequests.find((item) => item.id === selectedPullRequestId) ?? null;
-
-  React.useEffect(() => {
-    if (
-      selectedPullRequestId &&
-      !pullRequests.some((item) => item.id === selectedPullRequestId)
-    ) {
-      onSelectedPullRequestIdChange(null);
-    }
-  }, [onSelectedPullRequestIdChange, pullRequests, selectedPullRequestId]);
-
-  if (isLoading) {
-    return (
-      <p className="p-4 text-sm text-muted-foreground">
-        Loading pull requests…
-      </p>
-    );
-  }
-
-  if (pullRequests.length === 0) {
-    return (
-      <p className="p-4 text-sm text-muted-foreground">
-        {error
-          ? "Could not load pull requests for this repository."
-          : "No pull requests yet."}
-      </p>
-    );
-  }
-
-  if (selectedPullRequest) {
-    return (
-      <PullRequestDetail
-        mode={mode}
-        profiles={profiles}
-        project={project}
-        pullRequest={selectedPullRequest}
-      />
-    );
-  }
+  const groups = PULL_REQUEST_STATUS_ORDER.map((status) => ({
+    items: pullRequests.filter((pullRequest) => pullRequest.status === status),
+    status,
+  })).filter((group) => group.items.length > 0);
+  const rangeItems = pullRequests.map((pullRequest) =>
+    reviewSelectionItem(project, pullRequest),
+  );
 
   return (
-    <div className="divide-y divide-border/50">
-      {pullRequests.map((pullRequest) => (
-        <PullRequestRow
-          key={pullRequest.id}
-          onOpen={() => onSelectedPullRequestIdChange(pullRequest.id)}
-          profiles={profiles}
-          pullRequest={pullRequest}
-        />
-      ))}
-    </div>
+    <PullRequestsPanelSurface
+      detail={
+        selectedPullRequest ? (
+          <ProjectPullRequestDetail
+            diffStats={diffStats}
+            filesChanged={filesChanged}
+            filesCount={filesCount}
+            forceOpenFiles={forceOpenFiles}
+            onOpenInlineComment={onOpenInlineComment}
+            onOpenCommit={onOpenCommit}
+            onOpenTerminal={onOpenTerminal}
+            profiles={profiles}
+            project={project}
+            pullRequest={selectedPullRequest}
+          />
+        ) : null
+      }
+      error={error}
+      isLoading={isLoading}
+      list={
+        <div>
+          {groups.map(({ items, status }) => {
+            return (
+              <ProjectWorkItemGroup
+                count={items.length}
+                icon={
+                  <ProjectStatusProgressIcon
+                    className={`h-4 w-4 ${pullRequestStatusClassName(status)}`}
+                    state={pullRequestProgressState(status)}
+                  />
+                }
+                items={items.map((pullRequest) =>
+                  reviewSelectionItem(project, pullRequest),
+                )}
+                key={status}
+                label={status}
+              >
+                {items.map((pullRequest) => (
+                  <PullRequestRow
+                    key={pullRequest.id}
+                    onOpen={() => onSelectedPullRequestIdChange(pullRequest.id)}
+                    profiles={profiles}
+                    project={project}
+                    pullRequest={pullRequest}
+                    rangeItems={rangeItems}
+                  />
+                ))}
+              </ProjectWorkItemGroup>
+            );
+          })}
+        </div>
+      }
+      pullRequests={pullRequests}
+      selectedPullRequest={selectedPullRequest}
+    />
   );
 }

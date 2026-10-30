@@ -12,7 +12,9 @@ node_modules
 dist
 dist-ssr
 playwright-report
+playwright-report.json
 test-results
+playwright-release-smoke-report
 *.local
 playwright-report
 test-results

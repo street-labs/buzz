@@ -2,14 +2,44 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  activePresencePubkeys,
   mergePresenceUpdate,
   parseLivePresenceEvent,
   presenceQueryWantsPubkey,
+  PRESENCE_HEARTBEAT_INTERVAL_MS,
+  PRESENCE_IDLE_TIMEOUT_MS,
+  PRESENCE_TTL_SECONDS,
+  resolveAutomaticPresenceStatus,
 } from "./presence.ts";
 
 const WILL = "8e39cba681211b3782d0e4483e9343719b9b7be66515252da5491f26421896b1";
 const OTHER =
   "44b8e82baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+test("active presence authors are normalized, deduplicated, and sorted", () => {
+  const queries = [
+    { queryKey: ["presence", WILL.toUpperCase(), OTHER], isActive: () => true },
+    { queryKey: ["presence", WILL], isActive: () => true },
+  ];
+  assert.deepEqual(activePresencePubkeys(queries), [OTHER, WILL].sort());
+});
+
+test("inactive and non-presence queries do not retain presence authors", () => {
+  const queries = [
+    { queryKey: ["presence", WILL], isActive: () => false },
+    { queryKey: ["profiles", OTHER], isActive: () => true },
+  ];
+  assert.deepEqual(activePresencePubkeys(queries), []);
+});
+
+test("presence heartbeat is one minute with a three-window TTL", () => {
+  assert.equal(PRESENCE_HEARTBEAT_INTERVAL_MS, 60_000);
+  assert.equal(PRESENCE_TTL_SECONDS, 180);
+  assert.equal(
+    PRESENCE_TTL_SECONDS,
+    3 * (PRESENCE_HEARTBEAT_INTERVAL_MS / 1000),
+  );
+});
 
 test("merge adds an absent pubkey going online (the core bug)", () => {
   const old = {};
@@ -76,4 +106,38 @@ test("live event lowercases the author pubkey", () => {
     content: "away",
   });
   assert.equal(parsed.pubkey, WILL);
+});
+
+test("OS idle below the threshold is online even with stale in-app activity", () => {
+  const now = 1_000_000_000;
+  const staleActivity = now - 60 * 60_000;
+  assert.equal(
+    resolveAutomaticPresenceStatus(30, staleActivity, now),
+    "online",
+  );
+});
+
+test("OS idle at the threshold is away even with fresh in-app activity", () => {
+  const now = 1_000_000_000;
+  assert.equal(resolveAutomaticPresenceStatus(600, now, now), "away");
+});
+
+test("without OS idle, fresh in-app activity is online", () => {
+  const now = 1_000_000_000;
+  assert.equal(
+    resolveAutomaticPresenceStatus(null, now - 1_000, now),
+    "online",
+  );
+});
+
+test("without OS idle, in-app inactivity past the threshold is away", () => {
+  const now = 1_000_000_000;
+  assert.equal(
+    resolveAutomaticPresenceStatus(null, now - PRESENCE_IDLE_TIMEOUT_MS, now),
+    "away",
+  );
+});
+
+test("OS idle of zero is online", () => {
+  assert.equal(resolveAutomaticPresenceStatus(0, 0, 1_000_000_000), "online");
 });

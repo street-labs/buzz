@@ -1,81 +1,68 @@
-import { BookOpen } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 
-import type { ProjectPullRequest } from "@/features/projects/hooks";
+import { cn } from "@/shared/lib/cn";
 import { TabsList, TabsTrigger } from "@/shared/ui/tabs";
 
-const PROJECT_TAB_TRIGGER_CLASS =
-  "h-8 gap-1.5 px-3 text-foreground hover:bg-accent hover:text-accent-foreground data-[state=active]:bg-secondary data-[state=active]:text-secondary-foreground data-[state=active]:shadow-xs";
+export const PROJECT_TAB_TRIGGER_CLASS =
+  "h-7 shrink-0 rounded-full bg-muted/30 px-3 text-xs font-medium leading-5 tracking-tight text-muted-foreground shadow-none transition-colors hover:bg-muted/55 hover:text-foreground data-[state=active]:bg-muted data-[state=active]:text-foreground data-[state=active]:shadow-none";
 
-export function ProjectTabsList({ prsActive }: { prsActive?: boolean }) {
-  return (
-    <TabsList className="h-9 w-fit justify-start gap-0.5 bg-transparent p-0">
-      <TabsTrigger
-        aria-label="Overview"
-        className={PROJECT_TAB_TRIGGER_CLASS}
-        title="Overview"
-        value="overview"
-      >
-        <BookOpen className="h-3.5 w-3.5" />
-      </TabsTrigger>
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="files">
-        Code
-      </TabsTrigger>
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="activity">
-        Commits
-      </TabsTrigger>
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="issues">
-        Issues
-      </TabsTrigger>
-      <TabsTrigger
-        className={`${PROJECT_TAB_TRIGGER_CLASS}${
-          prsActive ? " bg-secondary text-secondary-foreground shadow-xs" : ""
-        }`}
-        value="prs"
-      >
-        PRs
-      </TabsTrigger>
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="contributors">
-        Contributors
-      </TabsTrigger>
-    </TabsList>
-  );
+export const PROJECT_TAB_SELECTED_CLASS = "bg-muted text-foreground";
+const PROJECT_TAB_ICON_BUTTON_CLASS =
+  "h-7 w-7 shrink-0 rounded-full bg-muted/30 p-1.5 text-muted-foreground shadow-none transition-colors hover:bg-muted/55 hover:text-foreground";
+
+function ProjectTabLabel({ children }: { children: string }) {
+  return <span>{children}</span>;
 }
 
-const PR_TAB_TRIGGER_CLASS =
-  "h-9 gap-1.5 rounded-none border-b-2 border-transparent px-0 text-muted-foreground hover:text-foreground data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
-
-export function PullRequestTabsList({
-  filesCount,
-  pullRequest,
+export function ProjectTabsList({
+  onBack,
+  prsActive,
 }: {
-  filesCount: number;
-  pullRequest: ProjectPullRequest;
+  onBack: () => void;
+  prsActive?: boolean;
 }) {
-  const commitCount = Math.max(1, pullRequest.updateCount + 1);
   return (
-    <TabsList className="h-9 w-fit justify-start gap-6 bg-transparent p-0">
-      <TabsTrigger className={PR_TAB_TRIGGER_CLASS} value="pr-conversation">
-        Conversation
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">
-          {pullRequest.comments.length}
-        </span>
-      </TabsTrigger>
-      <TabsTrigger className={PR_TAB_TRIGGER_CLASS} value="pr-commits">
-        Commits
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">
-          {commitCount}
-        </span>
-      </TabsTrigger>
-      <TabsTrigger className={PR_TAB_TRIGGER_CLASS} value="pr-checks">
-        Checks
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">0</span>
-      </TabsTrigger>
-      <TabsTrigger className={PR_TAB_TRIGGER_CLASS} value="pr-files">
-        Files changed
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-2xs">
-          {filesCount}
-        </span>
-      </TabsTrigger>
-    </TabsList>
+    <div className="flex h-full min-w-0 max-w-full flex-none items-center gap-1.5 overflow-x-auto scrollbar-none">
+      <button
+        aria-label="Back"
+        className={PROJECT_TAB_ICON_BUTTON_CLASS}
+        data-testid="project-workspace-back"
+        onClick={onBack}
+        title="Back"
+        type="button"
+      >
+        <ArrowLeft className="h-full w-full" strokeWidth={2} />
+      </button>
+      <TabsList className="h-full min-w-0 max-w-full flex-none justify-start gap-1.5 overflow-x-auto bg-transparent p-0 scrollbar-none">
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="overview">
+          <ProjectTabLabel>Overview</ProjectTabLabel>
+        </TabsTrigger>
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="files">
+          <ProjectTabLabel>Files</ProjectTabLabel>
+        </TabsTrigger>
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="activity">
+          <ProjectTabLabel>Commits</ProjectTabLabel>
+        </TabsTrigger>
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="issues">
+          <ProjectTabLabel>Tasks</ProjectTabLabel>
+        </TabsTrigger>
+        <TabsTrigger
+          aria-current={prsActive ? "page" : undefined}
+          className={cn(
+            PROJECT_TAB_TRIGGER_CLASS,
+            prsActive && PROJECT_TAB_SELECTED_CLASS,
+          )}
+          value="prs"
+        >
+          <ProjectTabLabel>Review</ProjectTabLabel>
+        </TabsTrigger>
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="channels">
+          <ProjectTabLabel>Channels</ProjectTabLabel>
+        </TabsTrigger>
+        <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="contributors">
+          <ProjectTabLabel>Contributors</ProjectTabLabel>
+        </TabsTrigger>
+      </TabsList>
+    </div>
   );
 }

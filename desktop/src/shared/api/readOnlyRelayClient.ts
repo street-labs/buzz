@@ -5,13 +5,19 @@ import type { RelayEvent } from "@/shared/api/types";
 import {
   getTextPayload,
   sortEvents,
+  toRelayFrames,
   type RelaySubscriptionFilter,
 } from "@/shared/api/relayClientShared";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
-
-const AUTH_TIMEOUT_MS = 8_000;
-const HISTORY_TIMEOUT_MS = 8_000;
-const PUBLISH_TIMEOUT_MS = 8_000;
+import {
+  activateRateLimitIfSignalled,
+  waitForRateLimit,
+} from "@/shared/api/relayRateLimitGate";
+import {
+  AUTH_TIMEOUT_MS,
+  HISTORY_TIMEOUT_MS,
+  PUBLISH_TIMEOUT_MS,
+} from "@/shared/api/relayClientTimings";
 
 type PendingHistory = {
   events: RelayEvent[];
@@ -27,9 +33,9 @@ type PendingPublish = {
 };
 
 /**
- * Minimal relay session for inactive-workspace observation (and the rail's
+ * Minimal relay session for inactive-community observation (and the rail's
  * cross-relay "mark all as read" publish). It never reads or mutates the
- * active workspace backend relay URL; callers pass an explicit URL and should
+ * active community backend relay URL; callers pass an explicit URL and should
  * disconnect as soon as their polling batch finishes.
  */
 export class ReadOnlyRelayClient {
@@ -105,7 +111,10 @@ export class ReadOnlyRelayClient {
 
   async publishEvent(event: RelayEvent): Promise<void> {
     await this.connect();
-    if (this.wsId === null) {
+    const generation = this.generation;
+    await waitForRateLimit();
+
+    if (generation !== this.generation || this.wsId === null) {
       throw new Error("Read-only relay socket is not connected.");
     }
 
@@ -131,8 +140,10 @@ export class ReadOnlyRelayClient {
 
   private async openConnection(): Promise<void> {
     const generation = ++this.generation;
-    this.onMessageChannel = new Channel<unknown>((message) => {
-      void this.handleWsMessage(message, generation);
+    this.onMessageChannel = new Channel<unknown>((delivery) => {
+      for (const message of toRelayFrames(delivery)) {
+        void this.handleWsMessage(message, generation);
+      }
     });
 
     this.wsId = await invoke<number>("plugin:websocket|connect", {
@@ -277,6 +288,7 @@ export class ReadOnlyRelayClient {
       if (success) {
         publish.resolve();
       } else {
+        activateRateLimitIfSignalled(message);
         publish.reject(
           new Error(message || "Observer relay rejected the event."),
         );

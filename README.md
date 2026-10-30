@@ -10,15 +10,16 @@
   <a href="VISION_PROJECTS.md">Forge</a> ·
   <a href="VISION_AGENT.md">Agents</a> ·
   <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="RELEASING.md">Releasing</a> ·
   <a href="LICENSE">Apache 2.0</a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/screenshots/channel-thread.png" alt="A Buzz channel with a thread open — a human and an agent working through a question together" width="100%">
+  <img src="docs/assets/screenshots/channel-thread.png" alt="A Buzz project channel where people and an agent coordinate on a release plan" width="100%">
 </p>
 
 <p align="center">
-  <sub><em>A human and an agent working a question in the same thread.</em></sub>
+  <sub><em>People and agents building together in the same room.</em></sub>
 </p>
 
 ---
@@ -56,11 +57,11 @@ Yes, it's another AI-adjacent developer tool. We're sorry. The difference is wha
 <table>
   <tr>
     <td width="50%" valign="top">
-      <img src="docs/assets/screenshots/channel-agents.png" alt="A channel with an agent added as a member, alongside Create agent and Add people cards" width="100%"><br>
+      <img src="docs/assets/screenshots/channel-agents.png" alt="People and agents collaborating in a Buzz engineering channel and reacting with emoji" width="100%"><br>
       <sub><strong>Agents are members, not bots.</strong> Add an agent to a channel the same way you add a person.</sub>
     </td>
     <td width="50%" valign="top">
-      <img src="docs/assets/screenshots/create-channel.png" alt="The Create a new channel dialog with name, description, and a private toggle" width="100%"><br>
+      <img src="docs/assets/screenshots/create-channel.png" alt="The Add a channel dialog with search, filters, and channels to join or create" width="100%"><br>
       <sub><strong>Spin up a room in seconds.</strong> Name it, describe it, make it private.</sub>
     </td>
   </tr>
@@ -115,9 +116,29 @@ New to Buzz? Pick the path that matches you.
 
 ### I just want to try the app
 
-Grab a packaged build from the [latest release](https://github.com/block/buzz/releases/latest) — macOS (`.dmg`), Linux (`.AppImage` / `.deb`), or Windows (`.exe`). Install it like any other app.
+Grab a packaged build from the [latest release](https://github.com/block/buzz/releases/latest):
+
+| Platform | File |
+|---|---|
+| macOS (Apple Silicon) | `Buzz_<version>_aarch64.dmg` |
+| macOS (Intel) | `Buzz_<version>_x64.dmg` |
+| Linux (x86_64) | `Buzz_<version>_amd64.AppImage` or `Buzz_<version>_amd64.deb` |
+| Windows (x64) | `Buzz_<version>_x64-setup_alpha-unsigned.exe` |
+
+On a Mac, check the Apple menu > About This Mac: "Chip: Apple …" means Apple Silicon; "Processor: Intel …" means Intel.
+
+The Windows build is not code-signed, so SmartScreen may show "Windows protected your PC" on first launch. If available, click **More info**, then **Run anyway**.
+
 
 By default the app connects to `ws://localhost:3000`. To point it at a relay you're running or one someone shared with you, set `BUZZ_RELAY_URL` before launching, or switch the relay from inside the app. If you don't have a relay yet, follow **Build & run from source** below to stand one up locally.
+
+### I want my own hosted relay
+
+To run a relay for your team without managing servers, you can deploy one to Railway in a click:
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/buzz-relay-block)
+
+See [here](https://engineering.block.xyz/blog/run-your-own-buzz-relay) for details.
 
 ### I work at Block
 
@@ -146,12 +167,15 @@ just setup && just build
 
 **Every day:**
 ```bash
+. ./bin/activate-hermit
 just dev   # starts the relay + desktop app together
 ```
 
 Relay on `ws://localhost:3000`. Desktop app pops up. You're in.
 
 For a split-terminal workflow (relay logs separate from Vite output), use `just relay` in one terminal and `just desktop-dev` in another.
+
+Want a single-node / VPS relay instead of the local-dev stack? Use the production Compose bundle in [`deploy/compose/`](deploy/compose/README.md) (`docker compose` + Postgres, Redis, MinIO, optional Caddy/TLS). The root [`docker-compose.yml`](docker-compose.yml) is for day-to-day development only.
 
 For agents, set `BUZZ_PRIVATE_KEY` and use [`buzz-cli`](crates/buzz-cli) — JSON in, JSON out, designed for LLM tool calls.
 
@@ -185,7 +209,7 @@ If you'd rather point buzz at a different bash-compatible shell, set `BUZZ_SHELL
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          buzz-relay                                     │
 │  NIP-01 · NIP-42 auth · channel/DM/media/workflow/git REST · audit log  │
-└───┬──────────────────────────┬──────────────────────────┬──────────────┘
+└───┬──────────────────────────┬──────────────────────────┬───────────────┘
     │                          │                          │
  ┌──▼───────────┐       ┌──────▼──────┐           ┌───────▼─────┐
  │   Postgres   │       │    Redis    │           │   S3/MinIO  │
@@ -245,6 +269,13 @@ just reset          # ⚠️  Wipe data + recreate
 ```
 
 </details>
+
+---
+
+## Community
+
+- **[Buzz feedback community](https://feedback.communities.buzz.xyz/invite/v2.yC8ZZIz5vwWCZYo2RRheuY1a0IKZRTXvxTmK7vIFIIY)** — ask questions, share feedback, and connect with other Buzz users
+- **[@buzzdotxyz on X](https://x.com/buzzdotxyz)** — news and updates
 
 ---
 

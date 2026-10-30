@@ -15,6 +15,8 @@
  *      so the caller can throw rather than silently misdeliver.
  *   4. resolveEffectiveChannel falls back to the closed-over channel when no
  *      capturedChannelId was supplied (legacy-caller path).
+ *   5. resolveSendChannel uses a relay-returned channel object even when a
+ *      stale shared channel list does not contain the captured id.
  */
 
 import assert from "node:assert/strict";
@@ -22,7 +24,9 @@ import test from "node:test";
 
 import {
   createOptimisticMessage,
+  resolveCachedReplyRootId,
   resolveEffectiveChannel,
+  resolveSendChannel,
   resolveThreadReplyTarget,
 } from "../hooks.ts";
 
@@ -204,6 +208,37 @@ test("resolveEffectiveChannel_emptyCache_capturedIdPresent_returnsNull", () => {
 });
 
 // ---------------------------------------------------------------------------
+// resolveSendChannel — direct channel capture for read-after-write safety
+// ---------------------------------------------------------------------------
+
+test("resolveSendChannel_staleCacheMissingOpenedDm_returnsCapturedDm", () => {
+  const openedDm = { ...makeChannel("new-dm"), channelType: "dm" };
+  const unrelatedChannel = makeChannel("channel-B");
+
+  const result = resolveSendChannel(
+    openedDm,
+    openedDm.id,
+    [unrelatedChannel],
+    unrelatedChannel,
+  );
+
+  assert.strictEqual(result, openedDm);
+});
+
+test("resolveSendChannel_withoutCapturedObject_preservesIdSafety", () => {
+  const unrelatedChannel = makeChannel("channel-B");
+
+  const result = resolveSendChannel(
+    undefined,
+    "missing-channel",
+    [unrelatedChannel],
+    unrelatedChannel,
+  );
+
+  assert.strictEqual(result, null);
+});
+
+// ---------------------------------------------------------------------------
 // resolveThreadReplyTarget — flush-time resolution for handleSendThreadReply
 //
 // These tests exercise the production resolveThreadReplyTarget function.
@@ -287,4 +322,24 @@ test("resolveThreadReplyTarget_nullContext_noLiveRefs_returnsNull", () => {
   const result = resolveThreadReplyTarget(null, null, null);
 
   assert.strictEqual(result, null);
+});
+
+test("resolveCachedReplyRootId sends only roots proven by a cached parent", () => {
+  const rootId = "1".repeat(64);
+  const parentId = "2".repeat(64);
+  const parent = {
+    id: parentId,
+    pubkey: IDENTITY.pubkey,
+    kind: 9,
+    created_at: 1,
+    content: "parent",
+    tags: [
+      ["e", rootId, "", "root"],
+      ["e", rootId, "", "reply"],
+    ],
+    sig: "",
+  };
+
+  assert.equal(resolveCachedReplyRootId(parentId, [[], [parent]]), rootId);
+  assert.equal(resolveCachedReplyRootId(parentId, [[], []]), null);
 });

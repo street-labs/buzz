@@ -1,7 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/mentions/mention_candidates.dart';
-import 'package:buzz/features/profile/user_profile.dart';
+import 'package:buzz/shared/profile/user_profile.dart';
+import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 
 final userPubkey = 'a' * 64;
 final memberPubkey = 'b' * 64;
@@ -18,6 +19,21 @@ ChannelMember member(String pubkey, {String role = 'member'}) {
 }
 
 void main() {
+  test('role-only agent mentions fall back to a compact npub label', () {
+    const pubkey =
+        'deadbeef00000000000000000000000000000000000000000000000000000000';
+
+    expect(
+      mentionNamesWithDirectoryLabels(
+        mentionPubkeys: const [pubkey],
+        profileMentionNames: const {},
+        directoryDisplayNames: const {},
+        agentMentionPubkeys: const {pubkey},
+      ),
+      const {pubkey: 'npub1m6k\u20263kf3'},
+    );
+  });
+
   group('agentIsSharedWithUser', () {
     test('anyone-mode agent is shared when a channel overlaps', () {
       final agent = AgentDirectoryEntry(
@@ -46,14 +62,14 @@ void main() {
       expect(formatOwnerLabel(userPubkey, userPubkey, const {}), 'you');
     });
 
-    test('prefers display name, then handle, then pubkey prefix', () {
+    test('prefers display name, then handle, then compact npub', () {
       final profiles = {
         ownerPubkey: UserProfile(pubkey: ownerPubkey, displayName: 'Wes'),
       };
       expect(formatOwnerLabel(ownerPubkey, userPubkey, profiles), 'Wes');
       expect(
         formatOwnerLabel(ownerPubkey, userPubkey, const {}),
-        '${'d' * 8}\u2026',
+        'npub1mhw\u2026dmpv',
       );
     });
 
@@ -127,6 +143,143 @@ void main() {
       expect(candidates.single.pubkey, agentPubkey);
       expect(candidates.single.isMember, isTrue);
       expect(candidates.single.isAgent, isTrue);
+    });
+
+    test('search results add non-member humans, ungated', () {
+      final humanPubkey = '1' * 64;
+      final candidates = buildMentionCandidates(
+        members: [member(memberPubkey)],
+        relayAgents: const [],
+        sharedChannelIds: const {},
+        userCache: const {},
+        ownerByAgentPubkey: const {},
+        searchResults: [
+          UserProfile(pubkey: humanPubkey, displayName: 'Wes Outside'),
+        ],
+        currentPubkey: userPubkey,
+      );
+
+      expect(candidates.map((c) => c.pubkey), [memberPubkey, humanPubkey]);
+      final human = candidates.last;
+      expect(human.isAgent, isFalse);
+      expect(human.isMember, isFalse);
+      expect(human.displayName, 'Wes Outside');
+    });
+
+    test('search results show agents owned by the current user', () {
+      final ownedAgent = '2' * 64;
+      final candidates = buildMentionCandidates(
+        members: const [],
+        relayAgents: const [],
+        sharedChannelIds: const {},
+        userCache: const {},
+        ownerByAgentPubkey: const {},
+        searchResults: [
+          UserProfile(
+            pubkey: ownedAgent,
+            displayName: 'raccoon',
+            ownerPubkey: userPubkey,
+          ),
+        ],
+        currentPubkey: userPubkey,
+      );
+
+      expect(candidates, hasLength(1));
+      expect(candidates.single.isAgent, isTrue);
+      expect(candidates.single.ownerPubkey, userPubkey);
+    });
+
+    test('search results hide non-shared agents owned by someone else', () {
+      final foreignAgent = '3' * 64;
+      final candidates = buildMentionCandidates(
+        members: const [],
+        relayAgents: const [],
+        sharedChannelIds: const {},
+        userCache: const {},
+        ownerByAgentPubkey: const {},
+        searchResults: [
+          UserProfile(
+            pubkey: foreignAgent,
+            displayName: 'stranger-bot',
+            ownerPubkey: ownerPubkey,
+          ),
+        ],
+        currentPubkey: userPubkey,
+      );
+
+      expect(candidates, isEmpty);
+    });
+
+    test('search results show non-owned agents shared via the directory', () {
+      final candidates = buildMentionCandidates(
+        members: const [],
+        relayAgents: [
+          AgentDirectoryEntry(
+            pubkey: agentPubkey,
+            respondTo: 'anyone',
+            channelIds: const ['chan-1'],
+          ),
+        ],
+        sharedChannelIds: {'chan-1'},
+        userCache: const {},
+        ownerByAgentPubkey: const {},
+        searchResults: [
+          UserProfile(
+            pubkey: agentPubkey,
+            displayName: 'Helper',
+            ownerPubkey: ownerPubkey,
+          ),
+        ],
+        currentPubkey: userPubkey,
+      );
+
+      // Already surfaced by the directory pass; the search pass must not
+      // duplicate it.
+      expect(candidates, hasLength(1));
+      expect(candidates.single.pubkey, agentPubkey);
+      expect(candidates.single.isAgent, isTrue);
+    });
+
+    test('directory-listed agents in search results are agents even without '
+        'a verified owner', () {
+      final candidates = buildMentionCandidates(
+        members: const [],
+        relayAgents: [
+          AgentDirectoryEntry(
+            pubkey: agentPubkey,
+            respondTo: 'anyone',
+            channelIds: const ['chan-9'],
+          ),
+        ],
+        // Not shared with the user → directory pass skips it; the search
+        // pass must still classify it as an agent and hide it.
+        sharedChannelIds: const {},
+        userCache: const {},
+        ownerByAgentPubkey: const {},
+        searchResults: [
+          UserProfile(pubkey: agentPubkey, displayName: 'Helper'),
+        ],
+        currentPubkey: userPubkey,
+      );
+
+      expect(candidates, isEmpty);
+    });
+
+    test('search results never duplicate channel members', () {
+      final candidates = buildMentionCandidates(
+        members: [member(memberPubkey)],
+        relayAgents: const [],
+        sharedChannelIds: const {},
+        userCache: const {},
+        ownerByAgentPubkey: const {},
+        searchResults: [
+          UserProfile(pubkey: memberPubkey, displayName: 'Member Dup'),
+        ],
+        currentPubkey: userPubkey,
+      );
+
+      expect(candidates, hasLength(1));
+      expect(candidates.single.isMember, isTrue);
     });
   });
 }

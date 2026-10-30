@@ -6,6 +6,10 @@
  */
 
 import type { ThemeRegistrationRaw } from "shiki";
+import {
+  type TerminalPalette,
+  extractTerminalPalette,
+} from "./terminal-palette";
 
 /**
  * Buzz theme name. Buzz is a first-party light theme that reuses GitHub
@@ -123,16 +127,6 @@ export const SYNTAX_THEMES = [
 ] as const;
 
 export type SyntaxThemeName = (typeof SYNTAX_THEMES)[number];
-
-const ONBOARDING_THEME_FALLBACK: SyntaxThemeName = "github-light-default";
-const ONBOARDING_THEME_PREFERENCES = [
-  "neutral",
-  ONBOARDING_THEME_FALLBACK,
-] as const;
-
-export const ONBOARDING_DEFAULT_THEME_NAME = (ONBOARDING_THEME_PREFERENCES.find(
-  (name) => (SYNTAX_THEMES as readonly string[]).includes(name),
-) ?? ONBOARDING_THEME_FALLBACK) as SyntaxThemeName;
 
 // Known light themes — used by the theme picker to show sun/moon icons
 // for themes that haven't been loaded yet.
@@ -390,6 +384,7 @@ export interface ThemeInfo {
   added: string | null;
   deleted: string | null;
   modified: string | null;
+  terminalPalette: TerminalPalette;
 }
 
 export function extractThemeInfo(
@@ -412,6 +407,7 @@ export function extractThemeInfo(
       fg,
     ),
     ...gitColors,
+    terminalPalette: extractTerminalPalette(theme),
   };
 }
 

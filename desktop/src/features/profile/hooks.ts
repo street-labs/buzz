@@ -5,7 +5,6 @@ import type {
 } from "@tanstack/react-query";
 import * as React from "react";
 import {
-  keepPreviousData,
   useInfiniteQuery,
   useMutation,
   useQuery,
@@ -41,7 +40,12 @@ import {
   shouldFetchAvatar,
   resolveAvatarDataUrl,
 } from "@/features/profile/lib/selfProfileStorage";
-import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
+import {
+  resolveUserLabelPlaceholderData,
+  writeCachedUserLabels,
+} from "@/features/profile/lib/userLabelStorage";
+import { useCommunities } from "@/features/communities/useCommunities";
+import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
 
 export const profileQueryKey = ["profile"] as const;
 export const contactListQueryKey = (pubkey: string) =>
@@ -73,6 +77,7 @@ async function persistSelfProfile(
     version: 1,
     displayName: profile.displayName,
     avatarUrl: profile.avatarUrl,
+    about: profile.about,
     avatarDataUrl,
     updatedAt: Date.now(),
     // Only persist the presence bit when true — no-event fallbacks
@@ -83,10 +88,10 @@ async function persistSelfProfile(
 }
 
 export function useProfileQuery(enabled = true) {
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
   const queryClient = useQueryClient();
-  const relayUrl = activeWorkspace?.relayUrl ?? "";
+  const relayUrl = activeCommunity?.relayUrl ?? "";
   const pubkey = identityQuery.data?.pubkey ?? "";
 
   // Parse localStorage once per relayUrl/pubkey pair — not on every render.
@@ -106,7 +111,7 @@ export function useProfileQuery(enabled = true) {
             pubkey,
             displayName: cached.displayName,
             avatarUrl: cached.avatarUrl,
-            about: null,
+            about: cached.about,
             nip05Handle: null,
             ownerPubkey: null,
             // Only true when the cache entry was explicitly written with a
@@ -119,7 +124,7 @@ export function useProfileQuery(enabled = true) {
   );
 
   // `initialData` is only honored at query construction, which happens before
-  // identity/workspace resolve on a fresh QueryClient — seed the cache
+  // identity/community resolve on a fresh QueryClient — seed the cache
   // imperatively once they arrive, without ever stomping a real fetch result.
   React.useEffect(() => {
     if (!initialData || !cached) return;
@@ -157,9 +162,9 @@ export function useProfileQuery(enabled = true) {
  * SELF_PROFILE_CACHE_EVENT after writes so this hook re-reads without polling.
  */
 export function useSelfProfileCache(): SelfProfileCache | null {
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
-  const relayUrl = activeWorkspace?.relayUrl ?? "";
+  const relayUrl = activeCommunity?.relayUrl ?? "";
   const pubkey = identityQuery.data?.pubkey ?? "";
 
   const [cache, setCache] = React.useState<SelfProfileCache | null>(() =>
@@ -279,21 +284,33 @@ export function useUserProfileQuery(pubkey?: string) {
 
 // Per-pubkey resolution cache backing `useUsersBatchQuery`'s delta fetch.
 // `summary: null` records a relay-confirmed miss so unknown pubkeys aren't
-// re-requested every page. Entries older than the hook's 60s staleTime are
-// treated as unresolved and refetched.
-type UsersBatchEntry = {
+// re-requested every page. Entries older than the hook's 10-minute staleTime
+// are treated as unresolved and refetched.
+export type UsersBatchEntry = {
   summary: UserProfileSummary | null;
   fetchedAt: number;
 };
 
-const usersBatchEntryKey = (pubkey: string) => ["users-batch-entry", pubkey];
+export const usersBatchEntryKey = (pubkey: string) => [
+  "users-batch-entry",
+  pubkey,
+];
+
+/**
+ * How long a per-pubkey entry answers without a refetch. Exported so readers
+ * outside this hook (the clipboard's paste-side identity check) apply the same
+ * freshness rule rather than trusting an entry this hook already considers
+ * stale.
+ */
+export const USERS_BATCH_ENTRY_FRESH_MS = 10 * 60_000;
 
 /**
  * Drop the per-pubkey delta-fetch entries so the next `useUsersBatchQuery`
  * run re-fetches these profiles from the relay. Must be called anywhere a
  * specific profile (or a containing `users-batch` query) is invalidated —
  * otherwise the re-run resolves from the still-fresh-looking entry and
- * renders the stale name/avatar for up to the entry's 60s freshness window.
+ * renders the stale name/avatar for up to the entry's 10-minute freshness
+ * window.
  * Synchronous, so callers can evict before awaiting aggregate invalidations.
  */
 export function evictUsersBatchEntries(
@@ -315,6 +332,8 @@ export function useUsersBatchQuery(
   },
 ) {
   const queryClient = useQueryClient();
+  const { activeCommunity } = useCommunities();
+  const relayUrl = activeCommunity?.relayUrl ?? "";
   const normalizedPubkeys = [
     ...new Set(pubkeys.map((pubkey) => pubkey.toLowerCase())),
   ]
@@ -341,7 +360,7 @@ export function useUsersBatchQuery(
         const entry = queryClient.getQueryData<UsersBatchEntry>(
           usersBatchEntryKey(pubkey),
         );
-        if (entry && now - entry.fetchedAt < 60_000) {
+        if (entry && now - entry.fetchedAt < USERS_BATCH_ENTRY_FRESH_MS) {
           if (entry.summary) profiles[pubkey] = entry.summary;
           else missing.push(pubkey);
         } else {
@@ -350,6 +369,9 @@ export function useUsersBatchQuery(
       }
       if (toFetch.length > 0) {
         const fresh = await getUsersBatch(toFetch);
+        if (relayUrl) {
+          writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);
+        }
         for (const pubkey of toFetch) {
           const summary = fresh.profiles[pubkey] ?? null;
           queryClient.setQueryData<UsersBatchEntry>(
@@ -365,14 +387,35 @@ export function useUsersBatchQuery(
     // Loading older messages grows the pubkey set, which changes this query's
     // key entirely. Without this, already-resolved authors would flash back
     // to their raw pubkey while the larger batch refetches.
-    placeholderData: keepPreviousData,
-    staleTime: 60_000,
+    placeholderData: (previousData) =>
+      resolveUserLabelPlaceholderData(
+        previousData,
+        relayUrl,
+        normalizedPubkeys,
+      ),
+    staleTime: USERS_BATCH_ENTRY_FRESH_MS,
     gcTime: 5 * 60 * 1_000,
+    // Override the global defaults: a cold channel needs profiles to render
+    // correctly, so a single failed attempt must not leave raw npubs/broken
+    // mention chips until the user manually kicks the channel. Three attempts
+    // with exponential backoff cover the common transient-relay case.
+    //
+    // After the retry budget exhausts, a window-focus event recovers the
+    // query — but only when it is already in an error state. Gating on
+    // query.state.status === "error" prevents unnecessary refetches for
+    // successful batches on every focus event, which broke the profile-hover
+    // E2E smoke test when unconditional focus-refetch was set.
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1_000 * 2 ** attempt, 30_000),
+    refetchOnWindowFocus: (query) => query.state.status === "error",
   });
 
   // Seed individual "user-profile" cache entries so avatar clicks are instant
   // cache hits instead of fresh network requests.
   React.useEffect(() => {
+    // Persisted labels are intentionally presentation-only. Wait for a relay
+    // result before seeding profile-detail caches that also carry ownership.
+    if (query.dataUpdatedAt === 0) return;
     const profiles = query.data?.profiles;
     if (!profiles) return;
     for (const [pubkey, summary] of Object.entries(profiles)) {
@@ -389,7 +432,7 @@ export function useUsersBatchQuery(
           },
       );
     }
-  }, [query.data, queryClient]);
+  }, [query.data, query.dataUpdatedAt, queryClient]);
 
   return query;
 }
@@ -485,7 +528,7 @@ export function useUserSearchFetchMoreOnScroll(
 
 export function useUpdateProfileMutation() {
   const queryClient = useQueryClient();
-  const { activeWorkspace } = useWorkspaces();
+  const { activeCommunity } = useCommunities();
   const identityQuery = useIdentityQuery();
 
   return useMutation({
@@ -504,12 +547,18 @@ export function useUpdateProfileMutation() {
       // Cancel again: a refetch may have started while mutationFn awaited.
       await queryClient.cancelQueries({ queryKey: profileQueryKey });
       queryClient.setQueryData(profileQueryKey, profile);
-      const relayUrl = activeWorkspace?.relayUrl ?? "";
+      const relayUrl = activeCommunity?.relayUrl ?? "";
       const pubkey = identityQuery.data?.pubkey ?? profile.pubkey;
       if (relayUrl && pubkey) {
         void persistSelfProfile(relayUrl, pubkey, profile);
       }
       if (pubkey) {
+        await updateCachedChannelMemberDisplayName(
+          queryClient,
+          pubkey,
+          profile.displayName,
+        );
+
         // Own author labels/avatars render through the users-batch delta
         // cache too — evict so the next batch run picks up the new profile
         // instead of the fresh-looking stale entry, then poke the aggregates.

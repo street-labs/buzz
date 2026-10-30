@@ -25,8 +25,8 @@ import {
   SettingsOptionRow,
 } from "@/features/settings/ui/SettingsOptionGroup";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
-import { setExplicitObserverArchiveChoice } from "../observerArchivePreference";
 import { setExplicitAgentMetricArchiveChoice } from "../agentMetricArchivePreference";
+import { setExplicitObserverArchiveChoice } from "../observerArchivePreference";
 
 import {
   buildSubscriptionRequest,
@@ -75,10 +75,10 @@ function ObserverArchiveSection({
   toggling,
   onToggle,
 }: ObserverSectionProps) {
+  const toggleDisabled = toggling;
   return (
-    <div className="space-y-3" data-testid="local-archive-observer-section">
-      <h3 className="text-sm font-medium">Agent observer feed</h3>
-      <SettingsOptionGroup>
+    <div data-testid="local-archive-observer-section">
+      <SettingsOptionGroup title="Agent observer feed">
         <SettingsOptionRow>
           <div className="min-w-0 flex-1">
             <label
@@ -87,16 +87,17 @@ function ObserverArchiveSection({
             >
               Archive my agents' observer frames
             </label>
-            <p className="text-sm font-normal text-muted-foreground">
-              Saves kind {KIND_AGENT_OBSERVER_FRAME} observer frames addressed
-              to your pubkey. These are ephemeral — not stored by the relay — so
-              local archiving is the only way to retain them.
+            <p
+              className="text-sm font-normal text-muted-foreground/70"
+              data-settings-subcopy
+            >
+              {`Saves kind ${KIND_AGENT_OBSERVER_FRAME} observer frames addressed to your pubkey. These are ephemeral — not stored by the relay — so local archiving is the only way to retain them.`}
             </p>
           </div>
           <Switch
             checked={enabled}
             data-testid="local-archive-observer-toggle"
-            disabled={toggling}
+            disabled={toggleDisabled}
             id="local-archive-observer-toggle"
             onCheckedChange={onToggle}
           />
@@ -120,9 +121,8 @@ function AgentMetricArchiveSection({
   onToggle,
 }: AgentMetricSectionProps) {
   return (
-    <div className="space-y-3" data-testid="local-archive-agent-metric-section">
-      <h3 className="text-sm font-medium">Agent turn metrics</h3>
-      <SettingsOptionGroup>
+    <div data-testid="local-archive-agent-metric-section">
+      <SettingsOptionGroup title="Agent turn metrics">
         <SettingsOptionRow>
           <div className="min-w-0 flex-1">
             <label
@@ -131,7 +131,10 @@ function AgentMetricArchiveSection({
             >
               Archive my agents' turn metrics
             </label>
-            <p className="text-sm font-normal text-muted-foreground">
+            <p
+              className="text-sm font-normal text-muted-foreground/70"
+              data-settings-subcopy
+            >
               Saves kind {KIND_AGENT_TURN_METRIC} turn-metric events addressed
               to your pubkey. Stored as plaintext in your local archive so
               token-usage calculators can read them directly.
@@ -237,7 +240,10 @@ function CustomKindsInput({ value, onChange }: CustomKindsInputProps) {
         type="text"
         value={value}
       />
-      <p className="mt-1 text-xs text-muted-foreground">
+      <p
+        className="mt-1 text-xs text-muted-foreground/70"
+        data-settings-subcopy
+      >
         Space- or comma-separated non-negative integers. Kinds already in the
         checklist above are ignored.
       </p>
@@ -263,11 +269,17 @@ function CustomKindsInput({ value, onChange }: CustomKindsInputProps) {
 
 type AddFormProps = {
   channels: Array<{ id: string; name: string }>;
+  title?: React.ReactNode;
   onSaved: () => void;
   onCancel: () => void;
 };
 
-function AddSubscriptionForm({ channels, onSaved, onCancel }: AddFormProps) {
+function AddSubscriptionForm({
+  channels,
+  title,
+  onSaved,
+  onCancel,
+}: AddFormProps) {
   const [selectedChannelId, setSelectedChannelId] = React.useState("");
   const [checkedKinds, setCheckedKinds] = React.useState<Set<number>>(
     new Set(),
@@ -313,7 +325,7 @@ function AddSubscriptionForm({ channels, onSaved, onCancel }: AddFormProps) {
   };
 
   return (
-    <SettingsOptionGroup>
+    <SettingsOptionGroup title={title}>
       <div className="space-y-5 px-4 py-4">
         {/* Channel picker */}
         <div>
@@ -512,7 +524,7 @@ export function LocalArchiveSettingsCard() {
   return (
     <section className="min-w-0" data-testid="settings-local-archive">
       <SettingsSectionHeader
-        title="Local Archive"
+        title="Local archive"
         description="Save copies of relay messages to a local SQLite database in your Buzz nest. Events are re-verified against the relay at archive time."
       />
 
@@ -532,25 +544,23 @@ export function LocalArchiveSettingsCard() {
         />
 
         {/* Channel subscriptions */}
-        <div className="space-y-3" data-testid="local-archive-subscriptions">
-          <h3 className="text-sm font-medium">
-            Channel subscriptions
-            {channelSubs.length > 0 ? ` (${channelSubs.length})` : ""}
-          </h3>
+        <div data-testid="local-archive-subscriptions">
           {isLoading ? (
-            <SettingsOptionGroup>
+            <SettingsOptionGroup title="Channel subscriptions">
               <div className="px-4 py-3 text-sm font-normal text-muted-foreground">
                 Loading…
               </div>
             </SettingsOptionGroup>
           ) : channelSubs.length === 0 ? (
-            <SettingsOptionGroup>
+            <SettingsOptionGroup title="Channel subscriptions">
               <div className="px-4 py-3 text-sm font-normal text-muted-foreground">
                 No channel subscriptions yet. Add one below.
               </div>
             </SettingsOptionGroup>
           ) : (
-            <SettingsOptionGroup>
+            <SettingsOptionGroup
+              title={`Channel subscriptions (${channelSubs.length})`}
+            >
               {channelSubs.map((sub) => {
                 const key = `${sub.scopeType}:${sub.scopeValue}`;
                 return (
@@ -564,7 +574,10 @@ export function LocalArchiveSettingsCard() {
                       <p className="truncate text-sm font-medium">
                         {scopeLabel(sub, channelNameById)}
                       </p>
-                      <p className="text-xs text-muted-foreground">
+                      <p
+                        className="text-xs text-muted-foreground/70"
+                        data-settings-subcopy
+                      >
                         {sub.scopeType} · kinds: {kindSummary(sub.kinds)}
                       </p>
                     </div>
@@ -587,8 +600,7 @@ export function LocalArchiveSettingsCard() {
         </div>
 
         {/* Add channel subscription */}
-        <div className="space-y-3" data-testid="local-archive-add">
-          <h3 className="text-sm font-medium">Add channel subscription</h3>
+        <div data-testid="local-archive-add">
           {isAddingOpen ? (
             <AddSubscriptionForm
               channels={joinedChannels}
@@ -597,13 +609,17 @@ export function LocalArchiveSettingsCard() {
                 setIsAddingOpen(false);
                 void reload();
               }}
+              title="Add channel subscription"
             />
           ) : (
-            <SettingsOptionGroup>
+            <SettingsOptionGroup title="Add channel subscription">
               <SettingsOptionRow>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium">Subscribe to a channel</p>
-                  <p className="text-xs text-muted-foreground">
+                  <p
+                    className="text-xs text-muted-foreground/70"
+                    data-settings-subcopy
+                  >
                     Choose a channel and select which event types to archive.
                   </p>
                 </div>

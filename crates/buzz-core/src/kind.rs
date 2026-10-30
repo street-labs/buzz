@@ -79,6 +79,9 @@ pub const KIND_AUTH: u32 = 22242;
 pub const KIND_BLOSSOM_AUTH: u32 = 24242;
 /// Buzz custom one-time identity binding proof (ephemeral, not stored).
 pub const KIND_NOSTR_IDENTITY_BINDING: u32 = 24243;
+/// Operator-listener registration proof: a target pubkey consents to mention
+/// delivery to the listener in its `p` tag (HTTP body only, not stored).
+pub const KIND_OPERATOR_LISTENER_REGISTRATION: u32 = 24245;
 /// NIP-98: HTTP auth event (used in nip98.rs, not stored).
 pub const KIND_HTTP_AUTH: u32 = 27235;
 
@@ -101,6 +104,22 @@ pub const KIND_AGENT_ENGRAM: u32 = 30174;
 /// author-only (see [`AUTHOR_ONLY_KINDS`]). See `docs/nips/NIP-ER.md`.
 pub const KIND_EVENT_REMINDER: u32 = 30300;
 
+/// NIP-PL: encrypted push lease (parameterized replaceable, author-only).
+///
+/// The source event contains endpoint-bearing NIP-44 ciphertext and is readable
+/// only by its authenticated author. Effective delivery state lives in the
+/// dedicated push lease tables.
+pub const KIND_PUSH_LEASE: u32 = 30350;
+
+/// NIP-PMA: owner-encrypted private managed-agent aggregate.
+///
+/// Addressed by `(owner pubkey, kind, agent pubkey)`. The signed outer tags
+/// expose only the agent coordinate, CAS generation/predecessor, and active/deleted
+/// state required for relay enforcement. Content is NIP-44 v2 encrypted from
+/// the owner's key to itself and contains the runnable identity/configuration
+/// plus exact public projection bindings. See `docs/nips/NIP-PMA.md`.
+pub const KIND_PRIVATE_MANAGED_AGENT: u32 = 30179;
+
 /// Kinds whose stored events are readable only by their author.
 ///
 /// The relay must never reveal the existence, count, tags, content, schedule,
@@ -108,18 +127,62 @@ pub const KIND_EVENT_REMINDER: u32 = 30300;
 /// Shared across the ingest write path (NIP-ER `not_before` validation) and the
 /// read path (REQ/COUNT/subscription author-only filtering).
 ///
-/// Currently O(1) with a single entry. If this grows past ~4 kinds, convert to
-/// a compile-time bitset or sorted array with binary search for hot-path use.
-pub const AUTHOR_ONLY_KINDS: &[u32] = &[KIND_EVENT_REMINDER];
+/// Currently a tiny linear set. If this grows past ~4 kinds, convert to a
+/// compile-time bitset or sorted array with binary search for hot-path use.
+pub const AUTHOR_ONLY_KINDS: &[u32] = &[
+    KIND_EVENT_REMINDER,
+    KIND_PUSH_LEASE,
+    KIND_PRIVATE_MANAGED_AGENT,
+];
+
+/// Returns `true` if the event is readable only by its author: an
+/// [`AUTHOR_ONLY_KINDS`] event, or a NIP-09 deletion whose `k` tag names one.
+///
+/// A deletion request reveals its targets' ids and deletion timing, so it
+/// inherits the target's privacy. It is classified by its own `k` tag, not by
+/// a target lookup, so it stays private after the target is gone; ingest
+/// rejects a deletion of a stored author-only event without that tag.
+pub fn is_author_only_event_kind(event: &nostr::Event) -> bool {
+    let kind = event_kind_u32(event);
+    if AUTHOR_ONLY_KINDS.contains(&kind) {
+        return true;
+    }
+    kind == KIND_DELETION && k_tag_kinds(event).any(|k| AUTHOR_ONLY_KINDS.contains(&k))
+}
+
+/// Kinds named by an event's well-formed `["k", "<kind>"]` tags.
+///
+/// Only canonical decimal values count (`"30300"`, not `"030300"` or
+/// `"+30300"`), so this agrees with SQL that matches the tag value as text.
+pub fn k_tag_kinds(event: &nostr::Event) -> impl Iterator<Item = u32> + '_ {
+    event.tags.iter().filter_map(|tag| match tag.as_slice() {
+        [name, value, ..] if name == "k" => value
+            .parse::<u32>()
+            .ok()
+            .filter(|kind| kind.to_string() == *value),
+        _ => None,
+    })
+}
 
 /// Kinds that require a result-level read gate beyond the filter-layer
 /// `#p` check: even a reader who knows an event id MUST match the event's
 /// `#p` tag to receive the event. This closes the kindless `{ids:[…]}` read
 /// path for events whose existence must not be leaked.
 ///
-/// Used by `filter_can_match_result_gated_kinds` to force the per-event
-/// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+/// Membership notices (44100/44101) are here because the relay signs them, so
+/// their id is not author-bound, and they name the target, the channel and
+/// the actor. A system channel's notice must not reach anyone but its target.
+///
+/// This is the one list every delivery surface reads: the filter-level `ids`
+/// exemption, `reader_authorized_for_event` (WS/HTTP history, push), live
+/// fan-out (same pod and Redis), and the COUNT fallback
+/// (`filter_can_match_result_gated_kinds`).
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_AGENT_TURN_METRIC,
+    KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.
@@ -154,8 +217,103 @@ pub const P_GATED_KINDS: &[u32] = &[
 /// `(pubkey, kind, d_tag)` where `d_tag` is the plaintext persona slug.
 /// Content is a JSON body containing persona fields (system_prompt,
 /// display_name, avatar_url, runtime, model, provider, name_pool).
-/// Designed for discoverability and sharing — d-tag is not blinded.
+///
+/// # Access control: author-only-unless-shared
+///
+/// Kind 30175 uses **shared-tag-gated** read semantics to protect system
+/// prompts and `respond_to_allowlist` pubkeys from being visible to all
+/// community members as a side-effect of device sync:
+///
+/// - Events WITHOUT a `["shared", "true"]` tag are readable only by their
+///   author. Foreign REQ/COUNT/fan-out/ids-lookup requests silently omit them.
+/// - Events WITH exactly `["shared", "true"]` are readable community-wide,
+///   enabling the opt-in agent catalog (`{kinds:[30175]}` all-authors).
+///
+/// Device sync already queries `authors:[self]`, so this gate never affects
+/// self-reads. The `shared` tag is a tag (not a content field) so toggling
+/// sharing does not change content bytes or the drift/`source_version` hash
+/// (`persona_content_hash`) used by persona sync.
+///
+/// Ingest rejects malformed `shared` tags (any value other than `"true"`,
+/// or more than one `shared` tag) so no ambiguous heads can exist.
 pub const KIND_PERSONA: u32 = 30175;
+
+/// Kinds that use the author-only-unless-shared read model.
+///
+/// Events of these kinds may only be delivered to foreign readers when the
+/// event carries exactly `["shared", "true"]`. Every relay read chokepoint
+/// consults this set: REQ historical delivery, live fan-out, COUNT fallback,
+/// the `ids`-lookup result gate, both HTTP surfaces, and the pre-`LIMIT` SQL
+/// visibility pushdown in `buzz-db`.
+///
+/// Membership is a privacy decision, not a convenience: adding a kind here
+/// makes its events invisible to foreign readers until their author opts in,
+/// and the opt-in must be a `shared` TAG (not a content field) so that
+/// toggling it leaves content bytes — and any content hash derived from them —
+/// unchanged.
+///
+/// `KIND_TEAM` (30176) is deliberately NOT a member. Its writers never emit
+/// `shared`, so catalog opt-in semantics do not describe it; it needs
+/// owner-private read semantics instead, which is a separate change.
+pub const SHARED_GATED_KINDS: &[u32] = &[KIND_PERSONA, KIND_TEAM_CATALOG];
+
+/// Returns `true` if `kind` uses the author-only-unless-shared read model
+/// (see [`SHARED_GATED_KINDS`]).
+pub fn is_shared_gated_kind(kind: u32) -> bool {
+    SHARED_GATED_KINDS.contains(&kind)
+}
+
+/// Returns `true` if the event is a shared-gated kind AND the requester is NOT
+/// the author AND the event does NOT carry `["shared", "true"]`. All three
+/// conditions must hold to withhold the event.
+///
+/// This is the per-event gate used by REQ historical delivery, live fan-out,
+/// and COUNT fallback paths. It is intentionally independent of
+/// `is_author_only_event` — shared-gated events with `["shared", "true"]` MUST
+/// reach foreign readers; stripping them at the author-only layer would break
+/// the catalog query.
+pub fn is_unshared_gated_event(event: &nostr::Event, requester_pubkey_bytes: &[u8]) -> bool {
+    let kind = event.kind.as_u16() as u32;
+    if !is_shared_gated_kind(kind) {
+        return false;
+    }
+    // Author reads are always allowed.
+    if event.pubkey.to_bytes() == requester_pubkey_bytes {
+        return false;
+    }
+    // Foreign reader: allowed only if the event is explicitly shared.
+    !event_is_shared(event)
+}
+
+/// Returns `true` if the event carries exactly one `["shared", "true"]` tag.
+///
+/// Kind-agnostic: this is purely the tag-shape predicate. The kind check lives
+/// in [`is_shared_gated_kind`], so callers that need "is this event shared"
+/// for a kind they already know (e.g. a client deciding whether its own
+/// retained head is published) can use this directly.
+///
+/// Requires the tag to have exactly two elements so that a three-element shape
+/// like `["shared","true","extra"]` is NOT treated as shared. Ingest enforces
+/// the same exact shape, so a well-stored event either has no `shared` tag
+/// (author-only) or exactly one with precisely two elements and value `"true"`
+/// (community-readable). This helper fails closed on any non-exact shape
+/// independently of ingest guarantees.
+pub fn event_is_shared(event: &nostr::Event) -> bool {
+    let mut count = 0usize;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() == 2 && parts[0].as_str() == "shared" {
+            if parts[1].as_str() != "true" {
+                return false;
+            }
+            count += 1;
+        } else if !parts.is_empty() && parts[0].as_str() == "shared" {
+            // Non-exact shape (wrong length) — fail closed: not shared.
+            return false;
+        }
+    }
+    count == 1
+}
 
 /// NIP-AP: Agent Team (parameterized replaceable, owner-authored).
 ///
@@ -175,6 +333,34 @@ pub const KIND_TEAM: u32 = 30176;
 /// since these events are world-readable on the relay.
 pub const KIND_MANAGED_AGENT: u32 = 30177;
 
+/// NIP-AP: Team Catalog projection (parameterized replaceable, owner-authored).
+///
+/// The shareable projection of a team, addressed by `(pubkey, kind, d_tag)`
+/// where `d_tag` is the team's stable id. Content is a versioned JSON body
+/// carrying sanitized team fields plus ordered, EMBEDDED member definition
+/// projections.
+///
+/// # Why this is not a `shared` tag on [`KIND_TEAM`]
+///
+/// A team's members live in kind 30175 events that are author-only unless
+/// individually shared, so a foreign reader of a shared team could never
+/// hydrate its members. This kind therefore embeds the member projections
+/// rather than referencing them: the share is atomic, it covers built-in
+/// members that have no 30175 head at all, it is immune to local-id/d-tag
+/// divergence, and an unshared 30175 stays private. Kind 30176's wire body is
+/// untouched, so device sync keeps its contract.
+///
+/// # Access control
+///
+/// Member of [`SHARED_GATED_KINDS`]: author-only unless the event carries
+/// exactly `["shared", "true"]`. Ingest additionally requires exactly one
+/// non-empty, bounded `d` tag — generic NIP-33 storage maps a missing `d` to
+/// the empty coordinate, which would collapse every team into one slot.
+///
+/// Content carries only sanitized fields: no env vars, no `respond_to`
+/// allowlist pubkeys, no source or local ids, no filesystem paths, no secrets.
+pub const KIND_TEAM_CATALOG: u32 = 30178;
+
 // NIP-56 reporting
 /// NIP-56: Report an event, pubkey, or blob to relay moderators (kind:1984).
 ///
@@ -182,6 +368,10 @@ pub const KIND_MANAGED_AGENT: u32 = 30177;
 /// queue, and never fanned out publicly. Reports are signals, not triggers:
 /// the relay never auto-actions on them (NIP-56).
 pub const KIND_REPORT: u32 = 1984;
+
+/// Buzz product feedback submission. Accepted at ingest, sidecarred to the
+/// deployment feedback table, and never stored or fanned out as an event.
+pub const KIND_PRODUCT_FEEDBACK: u32 = 42000;
 
 // NIP-29 group admin events
 /// NIP-29: Add a user to a group.
@@ -290,15 +480,11 @@ pub const KIND_THREAD_SUMMARY: u32 = 39005;
 /// content = `{has_more, next_cursor}`. The only authority on exhaustion —
 /// clients must not infer `has_more` from row counts.
 pub const KIND_WINDOW_BOUNDS: u32 = 39006;
+/// NIP-CW thread-mode query-time bounds, bound to a normalized newest-first thread request.
+pub const KIND_THREAD_WINDOW_BOUNDS: u32 = 39007;
 
 /// Workflow definition (parameterized replaceable, d=workflow_uuid).
 pub const KIND_WORKFLOW_DEF: u32 = 30620;
-
-/// Mesh-LLM relay status (relay-signed, parameterized replaceable, d=buzz-relay-mesh).
-///
-/// Published only by the relay. Carries a sanitized, member-readable projection
-/// of mesh status, including EndpointAddr dial pointers for serving nodes.
-pub const KIND_MESH_LLM_RELAY_STATUS: u32 = 30621;
 
 /// NIP-DV: per-viewer DM visibility snapshot (relay-signed, parameterized
 /// replaceable, d=viewer_pubkey). Carries one `h` tag per DM the viewer has
@@ -324,28 +510,14 @@ pub const KIND_PRESENCE_UPDATE: u32 = 20001;
 pub const KIND_PAIRING: u32 = 24134;
 /// Ephemeral: typing indicator for a channel.
 pub const KIND_TYPING_INDICATOR: u32 = 20002;
+/// Ephemeral: an owner's presence for its agents. Content is the status, each
+/// `p` tag names one agent the signer owns. Never the signer's own presence.
+pub const KIND_AGENT_PRESENCE: u32 = 20003;
 /// Ephemeral: owner-scoped encrypted agent observer telemetry and control frame.
 pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
 /// huddle channel with an `h` tag; never stored in the timeline.
 pub const KIND_HUDDLE_REACTION: u32 = 24810;
-/// Ephemeral: mesh status report (desktop → relay). A relay member reports its
-/// current mesh serve availability + EndpointAddr(s) so the relay can project a
-/// sanitized, relay-signed kind:30621 discovery note keyed per reporter. Tagged
-/// `["p", <self>]` optional; never stored — the durable record is the relay's
-/// 30621, not this transient input.
-pub const KIND_MESH_STATUS_REPORT: u32 = 24620;
-/// Ephemeral: mesh connect request (desktop → relay). A relay member asks the
-/// relay to coordinate a direct iroh hole-punch to a peer it discovered via
-/// kind:30621. Tagged `["p", <target_pubkey>]`. Never stored; the relay
-/// validates membership of both ends, then emits paired KIND_MESH_CALL_ME_NOW.
-pub const KIND_MESH_CONNECT_REQUEST: u32 = 24621;
-/// Ephemeral: mesh call-me-now signal (relay → desktop, relay-signed). The live
-/// dial trigger for a direct iroh hole-punch — carries the peer's EndpointAddr
-/// so both ends dial near-simultaneously. Tagged `["p", <recipient_pubkey>]`.
-/// Never stored; seconds expiry.
-pub const KIND_MESH_CALL_ME_NOW: u32 = 24622;
-
 // Stream messaging
 /// NIP-29 group chat message kind. V1 used kind:10001 (replaceable range — wrong), then 40001.
 ///
@@ -424,6 +596,10 @@ pub const KIND_AGENT_TURN_METRIC: u32 = 44200;
 // V1 used addressable range (30001–30003) — wrong.
 /// A forum post (thread root).
 pub const KIND_FORUM_POST: u32 = 45001;
+/// NIP-AR complete artifact revision.
+pub const KIND_ARTIFACT: u32 = 45010;
+/// Relay-authenticated artifact removal.
+pub const KIND_ARTIFACT_REMOVAL: u32 = 45011;
 /// A vote on a forum post.
 pub const KIND_FORUM_VOTE: u32 = 45002;
 /// A comment reply on a forum post.
@@ -470,6 +646,8 @@ pub const KIND_HUDDLE_PARTICIPANT_JOINED: u32 = 48101;
 pub const KIND_HUDDLE_PARTICIPANT_LEFT: u32 = 48102;
 /// A huddle ended.
 pub const KIND_HUDDLE_ENDED: u32 = 48103;
+/// Relay-synthesized authoritative liveness for an active huddle session.
+pub const KIND_HUDDLE_LIVENESS: u32 = 48104;
 /// Huddle channel guidelines/rules document.
 pub const KIND_HUDDLE_GUIDELINES: u32 = 48106;
 
@@ -498,6 +676,15 @@ pub const KIND_GIT_STATUS_CLOSED: u32 = 1632;
 /// NIP-34: Status — Draft.
 pub const KIND_GIT_STATUS_DRAFT: u32 = 1633;
 
+/// NIP-MP: Multi-repo project — a named grouping of `kind:30617` repository
+/// announcements (parameterized replaceable, d=project slug).
+///
+/// Members are `a` tags holding `30617:<owner-hex>:<repo-d>` coordinates, so one
+/// project may span repositories owned by different pubkeys. The signer gains no
+/// authority over any member: push policy reads the repository's own
+/// announcement, never a project. See `docs/nips/NIP-MP.md`.
+pub const KIND_PROJECT: u32 = 30621;
+
 /// All registered kind constants — used for duplicate detection and iteration.
 pub const ALL_KINDS: &[u32] = &[
     KIND_PROFILE,
@@ -522,7 +709,10 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PERSONA,
     KIND_TEAM,
     KIND_MANAGED_AGENT,
+    KIND_TEAM_CATALOG,
+    KIND_PRIVATE_MANAGED_AGENT,
     KIND_REPORT,
+    KIND_PRODUCT_FEEDBACK,
     KIND_NIP29_PUT_USER,
     KIND_NIP29_REMOVE_USER,
     KIND_NIP29_EDIT_METADATA,
@@ -556,13 +746,13 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_NIP29_GROUP_ROLES,
     KIND_THREAD_SUMMARY,
     KIND_WINDOW_BOUNDS,
+    KIND_THREAD_WINDOW_BOUNDS,
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
+    KIND_AGENT_PRESENCE,
     KIND_HUDDLE_REACTION,
-    KIND_MESH_STATUS_REPORT,
-    KIND_MESH_CONNECT_REQUEST,
-    KIND_MESH_CALL_ME_NOW,
     KIND_BLOSSOM_AUTH,
+    KIND_OPERATOR_LISTENER_REGISTRATION,
     KIND_PAIRING,
     KIND_AGENT_OBSERVER_FRAME,
     KIND_HTTP_AUTH,
@@ -578,7 +768,6 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,
     KIND_PRESENCE_SNAPSHOT,
-    KIND_MESH_LLM_RELAY_STATUS,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -598,6 +787,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_USER_STATUS,
     KIND_READ_STATE,
     KIND_FORUM_POST,
+    KIND_ARTIFACT,
+    KIND_ARTIFACT_REMOVAL,
     KIND_FORUM_VOTE,
     KIND_FORUM_COMMENT,
     KIND_WORKFLOW_TRIGGER,
@@ -618,6 +809,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT,
     KIND_HUDDLE_ENDED,
+    KIND_HUDDLE_LIVENESS,
     KIND_HUDDLE_GUIDELINES,
     KIND_MEDIA_UPLOAD,
     KIND_GIT_REPO_ANNOUNCEMENT,
@@ -630,6 +822,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_GIT_STATUS_MERGED,
     KIND_GIT_STATUS_CLOSED,
     KIND_GIT_STATUS_DRAFT,
+    KIND_PROJECT,
 ];
 
 /// Returns `true` if `kind` is in the ephemeral range (20000–29999).
@@ -692,17 +885,19 @@ pub const fn is_command_kind(kind: u32) -> bool {
     )
 }
 
-/// Returns `true` if `kind` is a relay-only sidecar kind.
+/// Returns `true` if `kind` may only be authored by the relay.
 /// Client submission of these kinds must be rejected.
 pub const fn is_relay_only_kind(kind: u32) -> bool {
     matches!(
         kind,
-        KIND_CHANNEL_SUMMARY
+        KIND_ARTIFACT_REMOVAL
+            | KIND_NIP43_MEMBERSHIP_LIST
+            | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
-            | KIND_MESH_LLM_RELAY_STATUS
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            | KIND_THREAD_WINDOW_BOUNDS
     )
 }
 
@@ -723,10 +918,12 @@ const _: () = assert!(is_replaceable(KIND_AGENT_PROFILE)); // 10100 ∈ 10000–
 const _: () = assert!(is_parameterized_replaceable(KIND_PERSONA)); // 30175 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_TEAM)); // 30176 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_MANAGED_AGENT)); // 30177 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_TEAM_CATALOG)); // 30178 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_PRIVATE_MANAGED_AGENT)); // 30179 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
-const _: () = assert!(is_parameterized_replaceable(KIND_MESH_LLM_RELAY_STATUS)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
 
@@ -773,6 +970,18 @@ mod tests {
     }
 
     #[test]
+    fn nip43_membership_snapshot_is_relay_only() {
+        assert!(is_relay_only_kind(KIND_NIP43_MEMBERSHIP_LIST));
+        assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
+    }
+
+    #[test]
+    fn thread_window_bounds_is_relay_only() {
+        assert_eq!(KIND_THREAD_WINDOW_BOUNDS, 39007);
+        assert!(is_relay_only_kind(KIND_THREAD_WINDOW_BOUNDS));
+    }
+
+    #[test]
     fn parameterized_replaceable_range() {
         assert!(!is_parameterized_replaceable(29999));
         assert!(is_parameterized_replaceable(30000));
@@ -790,5 +999,190 @@ mod tests {
                 "kind {kind} is both replaceable and parameterized replaceable"
             );
         }
+    }
+
+    // ── event_is_shared / is_unshared_gated_event ────────────────────────
+
+    fn make_event_of_kind(kind: u32, tags: &[&[&str]]) -> nostr::Event {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let keys = Keys::generate();
+        let tag_vec: Vec<Tag> = tags
+            .iter()
+            .map(|parts| Tag::parse(parts.iter().copied()).unwrap())
+            .collect();
+        EventBuilder::new(Kind::Custom(kind as u16), "")
+            .tags(tag_vec)
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn deletion_privacy_follows_its_k_tag() {
+        for &kind in AUTHOR_ONLY_KINDS {
+            let k = kind.to_string();
+            assert!(is_author_only_event_kind(&make_event_of_kind(kind, &[])));
+            assert!(is_author_only_event_kind(&make_event_of_kind(
+                KIND_DELETION,
+                &[&["e", &"ab".repeat(32)], &["k", &k]]
+            )));
+            assert!(is_author_only_event_kind(&make_event_of_kind(
+                KIND_DELETION,
+                &[&["k", "1"], &["k", &k]]
+            )));
+        }
+        for tags in [
+            &[][..],
+            &[&["k", "1"][..]][..],
+            &[&["k", "not-a-kind"][..]][..],
+            // Non-canonical spellings are not markers; SQL matches text.
+            &[&["k", "030300"][..]][..],
+            &[&["k", "+30300"][..]][..],
+            &[&["k", " 30300"][..]][..],
+        ] {
+            assert!(!is_author_only_event_kind(&make_event_of_kind(
+                KIND_DELETION,
+                tags
+            )));
+        }
+        // A `k` tag classifies only deletions.
+        assert!(!is_author_only_event_kind(&make_event_of_kind(
+            1,
+            &[&["k", &KIND_EVENT_REMINDER.to_string()]]
+        )));
+    }
+
+    fn make_persona_event(tags: &[&[&str]]) -> nostr::Event {
+        make_event_of_kind(KIND_PERSONA, tags)
+    }
+
+    #[test]
+    fn event_is_shared_true_tag() {
+        let ev = make_persona_event(&[&["d", "my-agent"], &["shared", "true"]]);
+        assert!(event_is_shared(&ev));
+    }
+
+    #[test]
+    fn event_is_shared_no_tag() {
+        let ev = make_persona_event(&[&["d", "my-agent"]]);
+        assert!(!event_is_shared(&ev));
+    }
+
+    #[test]
+    fn event_is_shared_wrong_value() {
+        let ev = make_persona_event(&[&["d", "my-agent"], &["shared", "false"]]);
+        assert!(!event_is_shared(&ev));
+    }
+
+    #[test]
+    fn event_is_shared_duplicate_shared_tags() {
+        // Two ["shared","true"] tags → ambiguous; not considered shared.
+        let ev =
+            make_persona_event(&[&["d", "my-agent"], &["shared", "true"], &["shared", "true"]]);
+        assert!(!event_is_shared(&ev));
+    }
+
+    #[test]
+    fn event_is_shared_three_element_tag_not_shared() {
+        // ["shared","true","extra"] — three elements — must NOT be treated as shared.
+        // The helper fails closed on any non-exact shape independently of ingest guarantees.
+        let ev = make_persona_event(&[&["d", "my-agent"], &["shared", "true", "extra"]]);
+        assert!(!event_is_shared(&ev));
+    }
+
+    #[test]
+    fn event_is_shared_one_element_tag_not_shared() {
+        // ["shared"] — only one element — not shared (fails the == 2 check).
+        let ev = make_persona_event(&[&["d", "my-agent"], &["shared"]]);
+        assert!(!event_is_shared(&ev));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_author_always_allowed() {
+        // Even without a shared tag the event author should not be blocked.
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let keys = Keys::generate();
+        let ev = EventBuilder::new(Kind::Custom(KIND_PERSONA as u16), "")
+            .tags(vec![Tag::parse(["d", "my-agent"]).unwrap()])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let author_bytes = keys.public_key().to_bytes();
+        assert!(!is_unshared_gated_event(&ev, &author_bytes));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_foreign_no_tag() {
+        let ev = make_persona_event(&[&["d", "my-agent"]]);
+        let foreign = [0u8; 32];
+        assert!(is_unshared_gated_event(&ev, &foreign));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_foreign_shared_tag() {
+        let ev = make_persona_event(&[&["d", "my-agent"], &["shared", "true"]]);
+        let foreign = [0u8; 32];
+        assert!(!is_unshared_gated_event(&ev, &foreign));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_ungated_kind_passthrough() {
+        use nostr::{EventBuilder, Keys, Kind};
+        let keys = Keys::generate();
+        let ev = EventBuilder::new(Kind::Custom(KIND_TEAM as u16), "")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let foreign = [0u8; 32];
+        // Kinds outside SHARED_GATED_KINDS are never blocked by this gate.
+        assert!(!is_unshared_gated_event(&ev, &foreign));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_team_catalog_foreign_no_tag() {
+        // The gate must cover 30178 identically to 30175 — an unshared team
+        // catalog projection is author-only.
+        let ev = make_event_of_kind(KIND_TEAM_CATALOG, &[&["d", "team-1"]]);
+        let foreign = [0u8; 32];
+        assert!(is_unshared_gated_event(&ev, &foreign));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_team_catalog_foreign_shared_tag() {
+        let ev = make_event_of_kind(KIND_TEAM_CATALOG, &[&["d", "team-1"], &["shared", "true"]]);
+        let foreign = [0u8; 32];
+        assert!(!is_unshared_gated_event(&ev, &foreign));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_team_catalog_author_always_allowed() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let keys = Keys::generate();
+        let ev = EventBuilder::new(Kind::Custom(KIND_TEAM_CATALOG as u16), "")
+            .tags(vec![Tag::parse(["d", "team-1"]).unwrap()])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let author_bytes = keys.public_key().to_bytes();
+        assert!(!is_unshared_gated_event(&ev, &author_bytes));
+    }
+
+    #[test]
+    fn is_unshared_gated_event_team_catalog_malformed_shared_tag_fails_closed() {
+        // A three-element `shared` tag can never be stored (ingest rejects it),
+        // but the read gate must independently treat it as NOT shared.
+        let ev = make_event_of_kind(
+            KIND_TEAM_CATALOG,
+            &[&["d", "team-1"], &["shared", "true", "extra"]],
+        );
+        let foreign = [0u8; 32];
+        assert!(is_unshared_gated_event(&ev, &foreign));
+    }
+
+    #[test]
+    fn shared_gated_kinds_membership() {
+        assert!(is_shared_gated_kind(KIND_PERSONA));
+        assert!(is_shared_gated_kind(KIND_TEAM_CATALOG));
+        // 30176 has owner-private semantics, not catalog opt-in semantics: its
+        // writers never emit `shared`, so gating it here would hide every team
+        // from its own delegated readers.
+        assert!(!is_shared_gated_kind(KIND_TEAM));
+        assert!(!is_shared_gated_kind(KIND_MANAGED_AGENT));
     }
 }

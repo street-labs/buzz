@@ -7,10 +7,11 @@
 # and polls readiness.
 #
 # Usage:
-#   ./scripts/start-relay-for-tests.sh [--profile <cargo-profile>]
+#   ./scripts/start-relay-for-tests.sh [--profile <cargo-profile>] [--no-build]
 #
 # Options:
 #   --profile <profile>   Cargo build profile (default: ci)
+#   --no-build            Use existing target/<profile>/ binaries (CI artifact reuse)
 #
 # Exports:
 #   RELAY_URL=ws://localhost:3000
@@ -23,6 +24,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 CARGO_PROFILE="${CARGO_PROFILE:-ci}"
+SKIP_BUILD=false
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -31,6 +33,10 @@ while [[ $# -gt 0 ]]; do
     --profile)
       CARGO_PROFILE="$2"
       shift 2
+      ;;
+    --no-build)
+      SKIP_BUILD=true
+      shift
       ;;
     *)
       echo "Unknown option: $1" >&2
@@ -97,9 +103,13 @@ export PGSCHEMA_PLAN_DB=buzz
 export PGSCHEMA_PLAN_USER=buzz
 export PGSCHEMA_PLAN_PASSWORD=buzz_dev
 
+# This database persists across runs. One reconciled before the events_pkey
+# repair existed would fail apply, so repair it first (see the script).
+docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
+  psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 < scripts/repair-events-pkey.sql
 ./bin/pgschema apply --file schema/schema.sql --auto-approve
 docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
-  psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql
+  psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 < scripts/reconcile-schema-after-pgschema.sql
 ok "Schema applied"
 
 # ── Seed the deployment community ────────────────────────────────────────────
@@ -128,21 +138,49 @@ ok "Community seeded"
 
 # ── Build relay ──────────────────────────────────────────────────────────────
 
-log "Building relay (profile: ${CARGO_PROFILE})..."
-cargo build --profile "${CARGO_PROFILE}" -p buzz-relay -p git-credential-nostr
-ok "Relay built"
+if [[ "${SKIP_BUILD}" == "true" ]]; then
+  for bin in buzz-relay git-credential-nostr; do
+    if [[ ! -x "./target/${CARGO_PROFILE}/${bin}" ]]; then
+      err "--no-build: ./target/${CARGO_PROFILE}/${bin} missing or not executable"
+      exit 1
+    fi
+  done
+  log "Skipping relay build (--no-build); using existing target/${CARGO_PROFILE}/ binaries"
+else
+  log "Building relay (profile: ${CARGO_PROFILE})..."
+  cargo build --profile "${CARGO_PROFILE}" -p buzz-relay -p git-credential-nostr
+  ok "Relay built"
+fi
 
 # ── Start relay ──────────────────────────────────────────────────────────────
 
 log "Starting relay..."
+
+TEST_RELAY_PRIVATE_KEY="${BUZZ_RELAY_PRIVATE_KEY:-$(openssl rand -hex 32)}"
+
+# Optional NIP-43 membership gating: exported by callers that need a
+# membership-gated relay (e.g. the mesh lifecycle smoke). All three must be
+# set together — the relay fails fast otherwise.
+MEMBERSHIP_ENV=()
+if [[ "${BUZZ_REQUIRE_RELAY_MEMBERSHIP:-}" == "true" ]]; then
+  MEMBERSHIP_ENV+=(
+    BUZZ_REQUIRE_RELAY_MEMBERSHIP=true
+    RELAY_OWNER_PUBKEY="${RELAY_OWNER_PUBKEY:?RELAY_OWNER_PUBKEY required with BUZZ_REQUIRE_RELAY_MEMBERSHIP=true}"
+  )
+  : "${BUZZ_RELAY_PRIVATE_KEY:?BUZZ_RELAY_PRIVATE_KEY required with BUZZ_REQUIRE_RELAY_MEMBERSHIP=true}"
+  log "Membership gating enabled (NIP-43)"
+fi
+
 nohup env \
-  DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz \
+  DATABASE_URL="postgres://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}" \
   REDIS_URL=redis://localhost:6379 \
   RELAY_URL=ws://localhost:3000 \
   BUZZ_BIND_ADDR=0.0.0.0:3000 \
+  BUZZ_RELAY_PRIVATE_KEY="${TEST_RELAY_PRIVATE_KEY}" \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \
   BUZZ_GIT_PROBE_WRITERS=8 \
+  ${MEMBERSHIP_ENV[@]+"${MEMBERSHIP_ENV[@]}"} \
   "./target/${CARGO_PROFILE}/buzz-relay" > /tmp/buzz-relay.log 2>&1 &
 echo $! > /tmp/buzz-relay.pid
 

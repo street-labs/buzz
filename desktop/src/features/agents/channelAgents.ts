@@ -3,6 +3,7 @@ import {
   findReusableGenericAgent,
   findReusablePersonaAgent,
   pickPreferredManagedAgent,
+  resolveReusableAgentAccessPolicy,
 } from "@/features/agents/agentReuse";
 export { findReusableAgent } from "@/features/agents/agentReuse";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -14,10 +15,13 @@ import {
   listManagedAgents,
   updateManagedAgent,
 } from "@/shared/api/tauri";
+import { listPersonas } from "@/shared/api/tauriPersonas";
 import { startManagedAgent } from "@/shared/api/tauriManagedAgents";
 import type {
   AcpRuntime,
+  AgentPersona,
   ChannelRole,
+  CreateManagedAgentInput,
   ManagedAgent,
   ManagedAgentBackend,
   RespondToMode,
@@ -32,6 +36,16 @@ export type AttachManagedAgentToChannelInput = {
   agent: ManagedAgent;
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
+  /**
+   * When set, a needed start/deploy is handed to this callback instead of
+   * being awaited: the attach resolves as soon as the membership write lands
+   * and the callback owns the start, including surfacing its failure. The
+   * message-send path passes a queue collector here — the wake it records is
+   * flushed fire-and-forget only after the relay accepts the publish, with a
+   * replay floor stamped at queue time, so the spawned harness replays the
+   * published message and an aborted send leaves no orphan wake.
+   */
+  detachedStart?: (agent: ManagedAgent) => void;
 };
 
 export type AttachManagedAgentToChannelResult = {
@@ -58,6 +72,8 @@ export type CreateChannelManagedAgentInput = {
   systemPrompt?: string;
   avatarUrl?: string;
   personaId?: string | null;
+  /** Team this instance is deployed from; prevents cross-team reuse. */
+  teamId?: string | null;
   /**
    * True when `runtime` is a runtime the user deliberately picked to override
    * the persona (a deploy-dialog runtime selector), as opposed to a
@@ -70,12 +86,18 @@ export type CreateChannelManagedAgentInput = {
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
   backend?: ManagedAgentBackend;
-  /** Inbound author gate mode. Omitted = server default ("owner-only"). */
+  /**
+   * Inbound author gate mode. Omitted = linked persona default, then
+   * `"owner-only"` when the persona leaves it unset or no persona is linked.
+   */
   respondTo?: RespondToMode;
   /** Hex pubkeys for allowlist mode. */
   respondToAllowlist?: string[];
   /** Skip reuse logic and always create a fresh agent instance. */
   forceNewInstance?: boolean;
+  /** Detached start hook forwarded to the channel attach — see
+   * `AttachManagedAgentToChannelInput.detachedStart`. */
+  detachedStart?: (agent: ManagedAgent) => void;
 };
 
 export type CreateChannelManagedAgentResult =
@@ -83,6 +105,12 @@ export type CreateChannelManagedAgentResult =
     created: boolean;
     runtimeId: string;
   };
+
+export type ProvisionChannelManagedAgentResult = {
+  agent: ManagedAgent;
+  created: boolean;
+  runtimeId: string;
+};
 
 export type CreateChannelManagedAgentBatchFailure = {
   kind: "generic" | "persona";
@@ -95,6 +123,50 @@ export type CreateChannelManagedAgentsResult = {
   successes: CreateChannelManagedAgentResult[];
   failures: CreateChannelManagedAgentBatchFailure[];
 };
+
+type ChannelAgentReuseContext = {
+  managedAgents: ManagedAgent[];
+  channelMemberPubkeys: ReadonlySet<string>;
+  personas: readonly Pick<
+    AgentPersona,
+    "id" | "respondTo" | "respondToAllowlist"
+  >[];
+};
+
+export type ApplyReusableAgentAccessPolicyResult = {
+  agent: ManagedAgent;
+  /**
+   * True when reconciling the policy required a relay write. Callers that
+   * sequence authorization around this call — the message-send path revalidates
+   * mention authorization at the publish boundary whenever an awaited relay
+   * round-trip separated it from its earlier pass — depend on this flag rather
+   * than on comparing the returned record's identity against the input, so the
+   * signal survives any future change to whether an update returns a fresh
+   * object.
+   */
+  wrote: boolean;
+};
+
+export async function applyReusableAgentAccessPolicy(
+  agent: ManagedAgent,
+  request: Pick<CreateManagedAgentInput, "respondTo" | "respondToAllowlist">,
+  persona?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
+): Promise<ApplyReusableAgentAccessPolicyResult> {
+  const policy = resolveReusableAgentAccessPolicy(request, persona);
+  const matches =
+    agent.respondTo === policy.respondTo &&
+    agent.respondToAllowlist.length === policy.respondToAllowlist.length &&
+    agent.respondToAllowlist.every(
+      (pubkey, index) => pubkey === policy.respondToAllowlist[index],
+    );
+  if (matches) return { agent, wrote: false };
+
+  const { agent: updatedAgent } = await updateManagedAgent({
+    pubkey: agent.pubkey,
+    ...policy,
+  });
+  return { agent: updatedAgent, wrote: true };
+}
 
 export async function attachManagedAgentToChannel(
   channelId: string,
@@ -124,19 +196,23 @@ export async function attachManagedAgentToChannel(
   if (ensureRunning) {
     // Running agents (local or provider) auto-discover new channel membership
     // via the harness's membership notifications — no restart needed. Only
-    // not-yet-running agents need a start/deploy call before the first
-    // mention can reach them.
+    // not-yet-running agents need a start/deploy call before the first mention
+    // can reach them. For a local agent the status check and the start are both
+    // pair-scoped to the active community: `agent.status` reflects that
+    // community's (agent, relay) pair, and `startManagedAgent` spawns that same
+    // pair — so this ensures the pair the caller is attaching to, never
+    // another community's.
     const isRemote = input.agent.backend.type === "provider";
-    if (isRemote && input.agent.status !== "deployed") {
-      agent = await startManagedAgent(input.agent.pubkey);
-      started = true;
-    } else if (
-      !isRemote &&
-      input.agent.status !== "running" &&
-      input.agent.status !== "deployed"
-    ) {
-      agent = await startManagedAgent(input.agent.pubkey);
-      started = true;
+    const needsStart = isRemote
+      ? input.agent.status !== "deployed"
+      : input.agent.status !== "running" && input.agent.status !== "deployed";
+    if (needsStart) {
+      if (input.detachedStart) {
+        input.detachedStart(input.agent);
+      } else {
+        agent = await startManagedAgent(input.agent.pubkey);
+        started = true;
+      }
     }
   }
 
@@ -221,7 +297,9 @@ export async function ensureChannelAgentPresetInChannel(
     name: expectedName,
     acpCommand: "buzz-acp",
     agentCommand: input.runtime.command,
-    agentArgs: input.runtime.defaultArgs,
+    // Do NOT seed agentArgs from runtime.defaultArgs (see instanceInputForDefinition.ts
+    // for the rationale — empty args let spawn resolve definition args live).
+    agentArgs: [],
     mcpCommand: input.runtime.mcpCommand ?? "",
     spawnAfterCreate: false,
   });
@@ -238,16 +316,10 @@ export async function ensureChannelAgentPresetInChannel(
   };
 }
 
-export async function createChannelManagedAgent(
-  channelId: string,
+export async function provisionChannelManagedAgent(
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
-): Promise<CreateChannelManagedAgentResult> {
-  const role = input.role ?? "bot";
-  const ensureRunning = input.ensureRunning ?? true;
+  context?: ChannelAgentReuseContext,
+): Promise<ProvisionChannelManagedAgentResult> {
   const trimmedName = input.name.trim();
 
   if (trimmedName.length === 0) {
@@ -268,30 +340,17 @@ export async function createChannelManagedAgent(
       context.channelMemberPubkeys,
     );
     if (reusable) {
-      // Apply the caller's respondTo settings so the user's permission
-      // choice in the dialog is always honored, even when reusing.
-      const needsRespondToUpdate =
-        input.respondTo && input.respondTo !== "owner-only";
-      const updatedAgent = needsRespondToUpdate
-        ? (
-            await updateManagedAgent({
-              pubkey: reusable.pubkey,
-              respondTo: input.respondTo,
-              respondToAllowlist:
-                input.respondTo === "allowlist"
-                  ? input.respondToAllowlist
-                  : undefined,
-            })
-          ).agent
-        : reusable;
+      const definition = context.personas.find(
+        (persona) => persona.id === input.personaId,
+      );
+      const { agent: updatedAgent } = await applyReusableAgentAccessPolicy(
+        reusable,
+        input,
+        definition,
+      );
 
-      const attached = await attachManagedAgentToChannel(channelId, {
-        agent: updatedAgent,
-        role,
-        ensureRunning,
-      });
       return {
-        ...attached,
+        agent: updatedAgent,
         created: false,
         runtimeId: input.runtime.id,
       };
@@ -313,28 +372,13 @@ export async function createChannelManagedAgent(
       context.channelMemberPubkeys,
     );
     if (reusable) {
-      const needsRespondToUpdate =
-        input.respondTo && input.respondTo !== "owner-only";
-      const updatedAgent = needsRespondToUpdate
-        ? (
-            await updateManagedAgent({
-              pubkey: reusable.pubkey,
-              respondTo: input.respondTo,
-              respondToAllowlist:
-                input.respondTo === "allowlist"
-                  ? input.respondToAllowlist
-                  : undefined,
-            })
-          ).agent
-        : reusable;
+      const { agent: updatedAgent } = await applyReusableAgentAccessPolicy(
+        reusable,
+        input,
+      );
 
-      const attached = await attachManagedAgentToChannel(channelId, {
-        agent: updatedAgent,
-        role,
-        ensureRunning,
-      });
       return {
-        ...attached,
+        agent: updatedAgent,
         created: false,
         runtimeId: input.runtime.id,
       };
@@ -355,9 +399,12 @@ export async function createChannelManagedAgent(
     acpCommand: "buzz-acp",
     agentCommand: input.runtime.command,
     harnessOverride: input.harnessOverride ?? false,
-    agentArgs: input.runtime.defaultArgs,
+    // Do NOT seed agentArgs from runtime.defaultArgs (see instanceInputForDefinition.ts
+    // for the rationale — empty args let spawn resolve definition args live).
+    agentArgs: [],
     mcpCommand: input.runtime.mcpCommand ?? "",
     personaId: input.personaId ?? undefined,
+    teamId: input.teamId ?? undefined,
     systemPrompt: input.systemPrompt?.trim() || undefined,
     avatarUrl: resolvedAvatarUrl,
     model: input.model?.trim() || undefined,
@@ -373,16 +420,30 @@ export async function createChannelManagedAgent(
     throw new Error(created.spawnError);
   }
 
-  const attached = await attachManagedAgentToChannel(channelId, {
+  return {
     agent: created.agent,
-    role,
-    ensureRunning,
+    created: true,
+    runtimeId: input.runtime.id,
+  };
+}
+
+export async function createChannelManagedAgent(
+  channelId: string,
+  input: CreateChannelManagedAgentInput,
+  context?: ChannelAgentReuseContext,
+): Promise<CreateChannelManagedAgentResult> {
+  const provisioned = await provisionChannelManagedAgent(input, context);
+  const attached = await attachManagedAgentToChannel(channelId, {
+    agent: provisioned.agent,
+    role: input.role ?? "bot",
+    ensureRunning: input.ensureRunning ?? true,
+    detachedStart: input.detachedStart,
   });
 
   return {
     ...attached,
-    created: true,
-    runtimeId: input.runtime.id,
+    created: provisioned.created,
+    runtimeId: provisioned.runtimeId,
   };
 }
 
@@ -391,14 +452,23 @@ export async function createChannelManagedAgents(
   inputs: readonly CreateChannelManagedAgentInput[],
 ): Promise<CreateChannelManagedAgentsResult> {
   // Fetch managed agents and channel members once for smart reuse checks.
-  const [managedAgents, members] = await Promise.all([
+  const needsPersonaPolicy = inputs.some(
+    (input) =>
+      Boolean(input.personaId) &&
+      !input.forceNewInstance &&
+      input.respondTo === undefined,
+  );
+  const [managedAgents, members, personas] = await Promise.all([
     listManagedAgents(),
-    getChannelMembers(channelId),
+    // Read-your-writes: templates call this right after creating the channel,
+    // before a read replica may have the member list.
+    getChannelMembers(channelId, { readYourWrites: true }),
+    needsPersonaPolicy ? listPersonas() : Promise.resolve([]),
   ]);
   const channelMemberPubkeys = new Set(
     members.map((m) => normalizePubkey(m.pubkey)),
   );
-  const context = { managedAgents, channelMemberPubkeys };
+  const context = { managedAgents, channelMemberPubkeys, personas };
 
   // Sequential loop: each agent must be fully created and its relay membership
   // written before the next starts. Concurrent writes to the replaceable

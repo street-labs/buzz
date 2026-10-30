@@ -22,11 +22,11 @@ use crate::managed_agents::{
 /// - **Fail loudly per record**: a record that cannot be backfilled (slug
 ///   collision) is logged and skipped; the rest proceed.
 /// - **No behavior change**: the definition snapshots the record's own
-///   values (prompt present-even-if-empty via `to_persona_view`'s
+///   values (prompt present-even-if-empty via `to_definition_view`'s
 ///   `unwrap_or_default`, env COPIED so later instances inherit a working
 ///   config, quad copied to the definition defaults) and the record gains
 ///   `persona_source_version` = the new definition's content hash, so
-///   neither `spawn_config_hash` nor the drift badge moves.
+///   neither the spawn-config snapshot nor the drift badge moves.
 ///
 /// The manufactured definition's slug is the agent's pubkey: 64-hex passes
 /// the NIP-AP slug grammar on both relay and desktop ends, and agent pubkeys
@@ -65,12 +65,13 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
     }
 
     // Pre-migration backup, taken ONCE: a re-run after a partial failure must
-    // not overwrite the pristine backup with a half-migrated snapshot.
-    let bak_path = base_dir.join("managed-agents.json.pre-backfill.bak");
-    if !bak_path.exists() {
-        std::fs::write(&bak_path, &content)
-            .map_err(|e| format!("failed to write pre-backfill backup: {e}"))?;
-    }
+    // not overwrite the pristine backup with a half-migrated snapshot. Owner-only
+    // from the initial open, and sited next to the resolved store — see
+    // `create_restricted_backup_once` and `resolved_backup_path`.
+    let bak_path =
+        crate::util::resolved_backup_path(&agents_path, "managed-agents.json.pre-backfill.bak");
+    crate::util::create_restricted_backup_once(&bak_path, content.as_bytes())
+        .map_err(|e| format!("failed to write pre-backfill backup: {e}"))?;
 
     let existing_slugs: std::collections::HashSet<String> =
         all.iter().filter_map(|r| r.slug.clone()).collect();
@@ -105,9 +106,8 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
         // fields are the author's intent; copy them up.
         view_source.definition_respond_to = Some(record.respond_to.as_str().to_string());
         view_source.definition_respond_to_allowlist = record.respond_to_allowlist.clone();
-        view_source.definition_mcp_toolsets = record.mcp_toolsets.clone();
         view_source.definition_parallelism = Some(record.parallelism);
-        let Some(persona_view) = view_source.to_persona_view() else {
+        let Some(persona_view) = view_source.to_definition_view() else {
             eprintln!(
                 "buzz-desktop: standalone-backfill: agent {} produced no persona view — skipped",
                 record.pubkey

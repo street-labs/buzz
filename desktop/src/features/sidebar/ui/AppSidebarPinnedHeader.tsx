@@ -1,6 +1,7 @@
-import { Activity, Bot, FolderGit2, Inbox, Zap } from "lucide-react";
+import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
+import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
 import { FeatureGate } from "@/shared/features";
 import type { Channel, SearchHit } from "@/shared/api/types";
 import {
@@ -10,10 +11,13 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/shared/ui/sidebar";
+import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
+import { ProtectedBestieSidebarEntry } from "@protected-feature-components";
 
 type SidebarSelectedView =
   | "home"
   | "channel"
+  | "messages"
   | "agents"
   | "workflows"
   | "pulse"
@@ -21,71 +25,98 @@ type SidebarSelectedView =
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
+  currentChannelId?: string | null;
   currentPubkey?: string;
-  homeBadgeCount: number;
+  onBrowseChannels?: () => void;
   onCreateAgent: () => void;
   onCreateChannel: () => void;
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
-  onOpenSearchResult: (hit: SearchHit) => void;
-  onSelectAgents: () => void;
+  onOpenSearchResult: (hit: SearchHit, query: string) => void;
   onSelectChannel: (channelId: string) => void;
+  searchChannels: Channel[];
+  searchFocusRequest: number;
+  scopeSearchFocusRequest: number;
+  suggestionChannels: Channel[];
+};
+
+type AppSidebarPrimaryMenuProps = {
+  homeBadgeCount: number;
+  onSelectAgents: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
   onSelectWorkflows: () => void;
-  searchChannels: Channel[];
-  searchFocusRequest: number;
+  projectsOverviewActive: boolean;
   selectedView: SidebarSelectedView;
-  suggestionChannels: Channel[];
 };
 
 export function AppSidebarPinnedHeader({
   channelLabels,
+  currentChannelId,
   currentPubkey,
-  homeBadgeCount,
+  onBrowseChannels,
   onCreateAgent,
   onCreateChannel,
   onOpenDm,
   onOpenSearchResult,
-  onSelectAgents,
   onSelectChannel,
-  onSelectHome,
-  onSelectProjects,
-  onSelectPulse,
-  onSelectWorkflows,
   searchChannels,
   searchFocusRequest,
-  selectedView,
+  scopeSearchFocusRequest,
   suggestionChannels,
 }: AppSidebarPinnedHeaderProps) {
   return (
-    <div className="shrink-0 px-2" data-testid="sidebar-pinned-header">
+    <div
+      className="mx-[3px] shrink-0 px-2 pb-2 pt-3"
+      data-testid="sidebar-pinned-header"
+    >
       <TopbarSearch
         channelLabels={channelLabels}
         channels={searchChannels}
+        currentChannelId={currentChannelId}
         currentPubkey={currentPubkey}
         focusRequest={searchFocusRequest}
         onOpenChannel={onSelectChannel}
         onOpenResult={onOpenSearchResult}
         onOpenUser={(user) => onOpenDm({ pubkeys: [user.pubkey] })}
+        onBrowseChannels={onBrowseChannels}
         onCreateAgent={onCreateAgent}
         onCreateChannel={onCreateChannel}
+        scopeFocusRequest={scopeSearchFocusRequest}
         suggestionChannels={suggestionChannels}
       />
+    </div>
+  );
+}
+
+export function AppSidebarPrimaryMenu({
+  homeBadgeCount,
+  onSelectAgents,
+  onSelectHome,
+  onSelectProjects,
+  onSelectPulse,
+  onSelectWorkflows,
+  projectsOverviewActive,
+  selectedView,
+}: AppSidebarPrimaryMenuProps) {
+  return (
+    <>
       <SidebarHeader
-        className="cursor-default select-none px-0 pb-0 pt-2.5"
+        className="relative z-40 cursor-default select-none px-2 pb-0 pt-0"
         data-tauri-drag-region
+        data-testid="sidebar-primary-menu"
       >
-        <SidebarMenu className="pb-2">
+        <SidebarMenu className="sidebar-primary-menu pb-2">
           <SidebarMenuItem>
             <SidebarMenuButton
+              className="data-[active=true]:font-normal"
               isActive={selectedView === "home"}
               onClick={onSelectHome}
               tooltip="Inbox"
               type="button"
             >
               <Inbox className="h-4 w-4" />
-              <span>Inbox</span>
+              <SidebarMenuLabel>Inbox</SidebarMenuLabel>
             </SidebarMenuButton>
             {homeBadgeCount > 0 ? (
               <SidebarMenuBadge
@@ -106,7 +137,7 @@ export function AppSidebarPinnedHeader({
                 type="button"
               >
                 <Activity className="h-4 w-4" />
-                <span>Pulse</span>
+                <SidebarMenuLabel>Pulse</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>
@@ -114,18 +145,19 @@ export function AppSidebarPinnedHeader({
             <SidebarMenuItem>
               <SidebarMenuButton
                 data-testid="open-projects-view"
-                isActive={selectedView === "projects"}
+                isActive={selectedView === "projects" && projectsOverviewActive}
                 onClick={onSelectProjects}
                 tooltip="Projects"
                 type="button"
               >
-                <FolderGit2 className="h-4 w-4" />
-                <span>Projects</span>
+                <Folders className="h-4 w-4" />
+                <SidebarMenuLabel>Projects</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>
           <SidebarMenuItem>
             <SidebarMenuButton
+              className="data-[active=true]:font-normal"
               data-testid="open-agents-view"
               isActive={selectedView === "agents"}
               onClick={onSelectAgents}
@@ -133,9 +165,10 @@ export function AppSidebarPinnedHeader({
               type="button"
             >
               <Bot className="h-4 w-4" />
-              <span>Agents</span>
+              <SidebarMenuLabel>Agents</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
+          <ProtectedBestieSidebarEntry />
           <FeatureGate feature="workflows">
             <SidebarMenuItem>
               <SidebarMenuButton
@@ -146,12 +179,13 @@ export function AppSidebarPinnedHeader({
                 type="button"
               >
                 <Zap className="h-4 w-4" />
-                <span>Workflows</span>
+                <SidebarMenuLabel>Workflows</SidebarMenuLabel>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>
         </SidebarMenu>
       </SidebarHeader>
-    </div>
+      <SidebarProjectsSection />
+    </>
   );
 }

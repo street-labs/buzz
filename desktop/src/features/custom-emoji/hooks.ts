@@ -10,10 +10,11 @@ import {
   setCustomEmoji,
 } from "@/shared/api/customEmoji";
 import { relayClient } from "@/shared/api/relayClient";
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 
 /**
- * React-query hooks for the workspace custom emoji palette (NIP-30, kind:30030).
+ * React-query hooks for the community custom emoji palette (NIP-30, kind:30030).
  *
  * The palette is the client-side UNION of every member's own kind:30030 set, so
  * the query key is stable — not keyed by channel or pubkey. Freshness comes from
@@ -22,25 +23,45 @@ import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
  * live event is missed. Mirrors `user-status/hooks.ts`.
  */
 
+/** Poll backstop cadence. The live subscription (invalidate on any member's
+ * new 30030) and the reconnect invalidation are the freshness paths; this
+ * poll exists only to cover a silently dropped live event, so it can be
+ * rare. At the previous 2-minute cadence it refetched every member's full
+ * set (~300 KB burst) often enough to dominate desktop relay traffic. */
+export const CUSTOM_EMOJI_REFETCH_INTERVAL_MS = 20 * 60_000;
+/** Suppresses the focus refetch until emoji data is genuinely stale.
+ * The live subscription (invalidateQueries) is the primary freshness path. */
+export const CUSTOM_EMOJI_FOCUS_STALE_TIME_MS = 5 * 60_000;
+
+/** Focus-refetch policy for the custom emoji query; consumed by focusRefetchPolicy.test.mjs. */
+export const customEmojiFocusRefetchPolicy = {
+  staleTime: CUSTOM_EMOJI_FOCUS_STALE_TIME_MS,
+  refetchOnWindowFocus: false,
+} as const;
+
 export const customEmojiQueryKey = ["custom-emoji"] as const;
 
 /** Query key for the caller's OWN editable 30030 set (distinct from the union). */
 export const ownCustomEmojiQueryKey = ["custom-emoji-own"] as const;
 
 export function useCustomEmojiQuery() {
+  const refetchInterval = useFocusedRefetchInterval(
+    CUSTOM_EMOJI_REFETCH_INTERVAL_MS,
+  );
+
   return useQuery<CustomEmoji[]>({
     queryKey: customEmojiQueryKey,
     queryFn: listCustomEmoji,
     // The palette changes rarely; avoid refetch storms while the picker is open,
     // but poll every 2 minutes as a backstop for any missed live event.
-    staleTime: 60_000,
-    refetchInterval: 120_000,
+    refetchInterval,
+    ...customEmojiFocusRefetchPolicy,
   });
 }
 
 /**
  * The caller's OWN custom emoji set — the only thing the settings card may add
- * to or remove from. Distinct from the workspace union (`useCustomEmojiQuery`),
+ * to or remove from. Distinct from the community union (`useCustomEmojiQuery`),
  * which is read-only across members.
  */
 export function useOwnCustomEmojiQuery() {
@@ -56,7 +77,7 @@ export function useOwnCustomEmojiQuery() {
  * query whenever one arrives. Call once near the app root (alongside other
  * global live subscriptions). Safe to mount once; disposes on unmount.
  */
-export function useWorkspaceEmojiLiveUpdates(): void {
+export function useCommunityEmojiLiveUpdates(): void {
   const queryClient = useQueryClient();
 
   React.useEffect(() => {
@@ -80,7 +101,7 @@ export function useWorkspaceEmojiLiveUpdates(): void {
         }
       })
       .catch((error) => {
-        console.error("Failed to subscribe to workspace custom emoji", error);
+        console.error("Failed to subscribe to community custom emoji", error);
       });
 
     // Re-sync on reconnect: a member's 30030 published while we were

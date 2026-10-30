@@ -6,18 +6,23 @@ import type {
   ManagedAgent,
   UpdatePersonaInput,
 } from "@/shared/api/types";
-import { Switch } from "@/shared/ui/switch";
-import type { BackendIntent } from "../lib/instanceInputForDefinition";
 import {
-  definitionCreateDialogState,
-  intentForStartToggle,
-  type AgentCreateIntent,
-} from "./agentCreateIntent";
+  runLocationForBackend,
+  runLocationForRunOn,
+} from "../lib/agentAccessWarning";
+import { AgentRunLocationProvider } from "./AgentRunLocationContext";
+import type { BackendIntent } from "../lib/instanceInputForDefinition";
+import type { AgentCreateIntent } from "./agentCreateIntent";
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog";
 import { createPersonaDialogState } from "./personaDialogState";
-import { AgentDefinitionDialog } from "./AgentDefinitionDialog";
+import {
+  AgentDefinitionDialog,
+  type AgentDefinitionSubmitOptions,
+} from "./AgentDefinitionDialog";
 import { WhereToRunSection } from "./WhereToRunSection";
+import { EffortPickerField } from "./EffortPickerField";
+import { isSavableEffort } from "./effortPicker";
 import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
@@ -26,15 +31,20 @@ import {
 
 type AgentDialogCreateProps = {
   mode: "definition";
+  embedded?: boolean;
+  submitLabel?: string;
+  initialValues?: CreatePersonaInput | null;
+  onDirtyChange?: (dirty: boolean) => void;
   onOpenChange: (open: boolean) => void;
   definitionError: Error | null;
   isDefinitionPending: boolean;
   runtimes: AcpRuntimeCatalogEntry[];
-  runtimesLoading: boolean;
+  runtimeCatalogStatus: "loading" | "ready" | "error";
   onSubmitDefinition: (
     input: CreatePersonaInput | UpdatePersonaInput,
     intent: AgentCreateIntent,
     backendIntent: BackendIntent | null,
+    effortLevel: string | null,
   ) => Promise<boolean>;
 };
 
@@ -63,18 +73,14 @@ type AgentDialogDefinitionEditProps = {
   initialValues: CreatePersonaInput | UpdatePersonaInput | null;
   error: Error | null;
   isPending: boolean;
-  isImportPending?: boolean;
   runtimes: AcpRuntimeCatalogEntry[];
-  runtimesLoading?: boolean;
+  runtimeCatalogStatus?: "loading" | "ready" | "error";
   onOpenChange: (open: boolean) => void;
   onSubmit: (
     input: CreatePersonaInput | UpdatePersonaInput,
+    options: AgentDefinitionSubmitOptions,
   ) => Promise<unknown>;
-  onImportUpdateFile?: (
-    personaId: string,
-    fileBytes: number[],
-    fileName: string,
-  ) => Promise<void>;
+  publishCatalogUpdatesOnSave?: boolean;
 };
 
 type AgentDialogProps =
@@ -85,25 +91,34 @@ type AgentDialogProps =
 /**
  * Unified entry point (Phase 1B.2/1B.3b/1B.3c): routes an intent to the form
  * that owns it. The definition family renders AgentDefinitionDialog — create
- * mode adds a "start after create" toggle, definition-edit passes the caller's
- * PersonaDialogState-derived props through unchanged (edit/duplicate/import).
- * instance-edit renders AgentInstanceEditDialog (persistent mount + `open`
- * toggle — its reset lifecycle is keyed on [open, agent.pubkey]).
+ * mode always starts the agent and includes a WhereToRunSection;
+ * definition-edit passes the caller's PersonaDialogState-derived props
+ * through unchanged (edit/duplicate/import). instance-edit renders
+ * AgentInstanceEditDialog (persistent mount + `open` toggle — its reset
+ * lifecycle is keyed on [open, agent.pubkey]).
  */
 export function AgentDialog(props: AgentDialogProps) {
   if (props.mode === "instance-edit") {
     return (
-      <AgentInstanceEditDialog
-        agent={props.agent}
-        onEditLinkedPersona={props.onEditLinkedPersona}
-        onOpenChange={props.onOpenChange}
-        onUpdated={props.onUpdated}
-        open={props.open}
-        initialFocus={props.initialFocus}
-      />
+      // A running instance knows its own backend, so the respond-to warning can
+      // name the machine it will actually run on.
+      <AgentRunLocationProvider
+        runLocation={runLocationForBackend(props.agent.backend)}
+      >
+        <AgentInstanceEditDialog
+          agent={props.agent}
+          onEditLinkedPersona={props.onEditLinkedPersona}
+          onOpenChange={props.onOpenChange}
+          onUpdated={props.onUpdated}
+          open={props.open}
+          initialFocus={props.initialFocus}
+        />
+      </AgentRunLocationProvider>
     );
   }
   if (props.mode === "definition-edit") {
+    // A definition has no instance and no run draft, so the run location stays
+    // unknown and the warning uses its local-wording fallback.
     const { mode: _mode, ...definitionProps } = props;
     return <AgentDefinitionDialog {...definitionProps} />;
   }
@@ -111,74 +126,82 @@ export function AgentDialog(props: AgentDialogProps) {
 }
 
 function AgentCreateDialogRouter({
+  embedded,
+  initialValues: providedInitialValues,
   onOpenChange,
   definitionError,
   isDefinitionPending,
   runtimes,
-  runtimesLoading,
+  runtimeCatalogStatus,
+  submitLabel,
+  onDirtyChange,
   onSubmitDefinition,
 }: AgentDialogCreateProps) {
-  const [startAfterCreate, setStartAfterCreate] = React.useState(true);
   const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
-  // Stable identity across toggle flips — AgentDefinitionDialog re-initializes its
-  // fields whenever `initialValues` changes.
+  const [effortLevel, setEffortLevel] = React.useState<string | null>(null);
   const initialValues = React.useMemo(
-    () => createPersonaDialogState().initialValues,
-    [],
+    () => providedInitialValues ?? createPersonaDialogState().initialValues,
+    [providedInitialValues],
   );
 
-  const copy = definitionCreateDialogState(startAfterCreate);
+  const copy = createPersonaDialogState();
+  // Effort is local-only: a provider backend sets it at deploy time.
+  const backendIntent = resolveBackendIntent(runDraft);
 
   return (
-    <AgentDefinitionDialog
-      createFooterSlot={
-        <label
-          className="flex cursor-pointer items-center gap-2 text-sm text-muted-foreground"
-          htmlFor="agent-dialog-start-toggle"
-        >
-          <Switch
-            checked={startAfterCreate}
-            data-testid="agent-dialog-start-toggle"
-            disabled={isDefinitionPending}
-            id="agent-dialog-start-toggle"
-            onCheckedChange={setStartAfterCreate}
-          />
-          Start agent after creation
-        </label>
-      }
-      createRunSection={
-        // "Where to run" is instance state: with the start toggle off no
-        // instance exists, so the section disappears instead of dangling.
-        startAfterCreate ? (
-          <WhereToRunSection
-            draft={runDraft}
-            isPending={isDefinitionPending}
-            onDraftChange={setRunDraft}
-          />
-        ) : null
-      }
-      createSubmitBlocked={!canSubmitWhereToRun(runDraft, startAfterCreate)}
-      createRunOnMesh={startAfterCreate && runDraft.runOn === "mesh"}
-      description={copy.description}
-      error={definitionError}
-      initialValues={initialValues}
-      isPending={isDefinitionPending}
-      onOpenChange={onOpenChange}
-      onSubmit={async (input) => {
-        const submitted = await onSubmitDefinition(
-          input,
-          intentForStartToggle(startAfterCreate),
-          resolveBackendIntent(runDraft, startAfterCreate),
-        );
-        if (submitted) {
-          onOpenChange(false);
-        }
-      }}
-      open
-      runtimes={runtimes}
-      runtimesLoading={runtimesLoading}
-      submitLabel={copy.submitLabel}
-      title={copy.title}
-    />
+    // The create flow is the one surface that knows where the agent will run,
+    // because it owns the "Run on" draft.
+    <AgentRunLocationProvider runLocation={runLocationForRunOn(runDraft.runOn)}>
+      <AgentDefinitionDialog
+        createRunSection={(effortOptions) => (
+          <>
+            <WhereToRunSection
+              draft={runDraft}
+              isPending={isDefinitionPending}
+              onDraftChange={(nextDraft) => {
+                setRunDraft(nextDraft);
+                onDirtyChange?.(true);
+              }}
+            />
+            {backendIntent ? null : (
+              <EffortPickerField
+                backend={{ type: "local" }}
+                choices={effortOptions}
+                disabled={isDefinitionPending}
+                onChange={setEffortLevel}
+                value={effortLevel}
+              />
+            )}
+          </>
+        )}
+        createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
+        description={copy.description}
+        embedded={embedded}
+        error={definitionError}
+        initialValues={initialValues}
+        isPending={isDefinitionPending}
+        onDirtyChange={onDirtyChange}
+        onOpenChange={onOpenChange}
+        onSubmit={async (input, { effortOptions }) => {
+          const submitted = await onSubmitDefinition(
+            input,
+            "definition_start",
+            backendIntent,
+            !backendIntent && isSavableEffort(effortLevel, effortOptions)
+              ? effortLevel
+              : null,
+          );
+          if (submitted) {
+            onDirtyChange?.(false);
+            onOpenChange(false);
+          }
+        }}
+        open
+        runtimes={runtimes}
+        runtimeCatalogStatus={runtimeCatalogStatus}
+        submitLabel={submitLabel ?? copy.submitLabel}
+        title={copy.title}
+      />
+    </AgentRunLocationProvider>
   );
 }

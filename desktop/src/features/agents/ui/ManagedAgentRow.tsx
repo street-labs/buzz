@@ -1,11 +1,6 @@
 import * as React from "react";
 
-import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronRight,
-  RefreshCw,
-} from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
@@ -26,6 +21,9 @@ import { AgentConfigPanel } from "./AgentConfigPanel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
+import { SubsectionLabel } from "@/shared/ui/PageHeader";
+import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
+import { RestartDiffBadge } from "./RestartDiffBadge";
 
 export function ManagedAgentRow({
   agent,
@@ -85,7 +83,7 @@ export function ManagedAgentRow({
   // When the harness recovered a meaningful error string from the agent's
   // log tail (Max's seam in `managed_agents/storage.rs`), promote it to
   // user-visible copy below the process detail. Specifically renders the
-  // friendly "Relay mesh denied this agent — check your relay membership."
+  // friendly "Community access denied this agent — check its community membership."
   // for auth failures so the user knows it's a membership thing, not a
   // crash. Generic exits stay verbatim so we don't lie about other failures.
   const friendlyError = friendlyAgentLastError(
@@ -99,7 +97,7 @@ export function ManagedAgentRow({
         "overflow-hidden transition-colors",
         isLogSelected ? "bg-primary/5" : "hover:bg-muted/20",
       )}
-      data-testid={`managed-agent-${agent.pubkey}`}
+      data-testid={`managed-agent-row-${agent.pubkey}`}
     >
       <div className="flex items-start gap-3 px-4 py-3">
         {isLocal ? (
@@ -157,7 +155,16 @@ export function ManagedAgentRow({
           </div>
         )}
 
+        {/* B4: restart badge is a sibling of the expansion button — never
+            inside it. TooltipTrigger renders as a <span> (non-interactive),
+            so no nested interactive elements are introduced here. */}
         <div className="flex shrink-0 items-start gap-2 lg:pt-0.5">
+          {agent.needsRestart ? (
+            <RestartDiffBadge
+              autoRestartEnabled={agent.autoRestartOnConfigChange}
+              restartDiff={agent.restartDiff}
+            />
+          ) : null}
           <Button
             onClick={() => onOpenProfile(agent.pubkey)}
             size="sm"
@@ -237,10 +244,10 @@ function AgentSummary({
               <Badge variant="secondary">{personaLabel}</Badge>
             ) : null}
             <AgentOriginBadge agent={agent} />
-            {agent.needsRestart ? (
+            {agent.personaOrphaned ? (
               <Badge className="gap-1" variant="warning">
-                <RefreshCw className="h-3 w-3" />
-                Restart required
+                <AlertTriangle className="h-3 w-3" />
+                Configuration missing
               </Badge>
             ) : null}
             {agent.personaOutOfDate ? (
@@ -260,7 +267,12 @@ function AgentSummary({
               <span>Remote deployment</span>
             )}
           </div>
-          {agent.needsRestart ? (
+          {agent.personaOrphaned ? (
+            <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
+              This agent's configuration is missing — it may still be syncing or
+              was deleted on another device.
+            </p>
+          ) : agent.needsRestart ? (
             <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
               Configuration changed since this agent started. Restart to apply
               it.
@@ -358,9 +370,7 @@ function StatusBlock({
 }) {
   return (
     <div className="space-y-1 lg:pt-0.5">
-      <p className="text-2xs font-semibold uppercase tracking-[0.16em] text-muted-foreground lg:hidden">
-        Status
-      </p>
+      <SubsectionLabel className="lg:hidden">Status</SubsectionLabel>
       <AgentStatusBadge
         isWorking={isWorking}
         presenceLoaded={presenceLoaded}
@@ -394,16 +404,16 @@ function RuntimeBlock({
 }) {
   return (
     <div className="space-y-1 lg:pt-0.5">
-      <p className="text-2xs font-semibold uppercase tracking-[0.16em] text-muted-foreground lg:hidden">
-        Runtime
-      </p>
+      <SubsectionLabel className="lg:hidden">Runtime</SubsectionLabel>
       <p className="truncate font-mono text-xs text-foreground">
         {agent.agentCommand}
       </p>
       {runtimeSource || agent.model ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           {runtimeSource ? <span>{runtimeSource}</span> : null}
-          {agent.model ? <span>{agent.model}</span> : null}
+          {agent.model ? (
+            <span>{resolveModelLabel(agent.model, null, agent.provider)}</span>
+          ) : null}
         </div>
       ) : null}
     </div>

@@ -1,24 +1,26 @@
 import { useMemo, useState } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   Archive,
   BellRing,
   Bot,
-  Check,
+  ChevronDown,
   Cpu,
   Download,
   FlaskConical,
   Keyboard,
   LayoutTemplate,
-  LockKeyhole,
+  MessagesSquare,
   MonitorCog,
   Moon,
-  ShieldAlert,
+  ServerCog,
   Smartphone,
   Smile,
-  Stethoscope,
   Sun,
   SunMoon,
+  Ticket,
   UserRound,
+  Volume2,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -26,15 +28,13 @@ import type {
   NotificationSettings,
 } from "@/features/notifications/hooks";
 import type { SoundName, SoundSlot } from "@/features/notifications/lib/sound";
-import { RelayMembersSettingsCard } from "@/features/relay-members/ui/RelayMembersSettingsCard";
+import { CommunityMembersSettingsCard } from "@/features/community-members/ui/CommunityMembersSettingsCard";
 import { CustomEmojiSettingsCard } from "@/features/custom-emoji/ui/CustomEmojiSettingsCard";
 import { LocalArchiveSettingsCard } from "@/features/local-archive/ui/LocalArchiveSettingsCard";
 import { cn } from "@/shared/lib/cn";
-import {
-  ACCENT_COLORS,
-  NEUTRAL_ACCENT,
-  useTheme,
-} from "@/shared/theme/ThemeProvider";
+import { useCommunities } from "@/features/communities/useCommunities";
+import { Badge } from "@/shared/ui/badge";
+import { isBuzzTheme, useTheme } from "@/shared/theme/ThemeProvider";
 import {
   LIGHT_THEMES,
   SYNTAX_THEMES,
@@ -52,54 +52,72 @@ import {
   useThemePreviewVars,
   withAccentPreviewVars,
 } from "@/shared/theme/useThemePreviewVars";
+import { appearanceCommunityLabel } from "../lib/appearanceScopeCopy";
+import {
+  AccentPickerContent,
+  ConversationDisplaySettings,
+  GlassBackgroundSetting,
+  LinkPreviewStyleSetting,
+  ProminentActiveTabSetting,
+  ThreadLayoutSetting,
+} from "./AppearanceSettingsControls";
 import { ChannelTemplatesSettingsCard } from "./ChannelTemplatesSettingsCard";
-import { DoctorSettingsPanel } from "./DoctorSettingsPanel";
 import { ExperimentalFeaturesCard } from "./ExperimentalFeaturesCard";
 import { KeyboardShortcutsCard } from "./KeyboardShortcutsCard";
 import { MeshComputeSettingsCard } from "@/features/mesh-compute/ui/MeshComputeSettingsCard";
 import { MobilePairingCard } from "./MobilePairingCard";
-import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
-import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
+import { AgentsSettingsPanel } from "./AgentsSettingsPanel";
+import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
+import { AdminConsoleSettingsCard } from "@/features/admin-console/AdminConsoleSettingsCard";
+import {
+  SettingsOptionGroup,
+  SettingsOptionGroupList,
+  SettingsOptionRow,
+} from "./SettingsOptionGroup";
+import { SegmentedControl } from "@/shared/ui/segmented-control";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
+import { VoiceSettingsCard } from "./VoiceSettingsCard";
 
 export type SettingsSection =
   | "profile"
   | "notifications"
+  | "voice"
   | "experimental"
   | "agents"
   | "channel-templates"
   | "compute"
   | "appearance"
   | "shortcuts"
-  | "relay-members"
-  | "moderation"
+  | "hosted-communities"
+  | "community-members"
+  | "relay-admin"
   | "custom-emoji"
   | "local-archive"
   | "mobile"
-  | "updates"
-  | "doctor";
+  | "updates";
 
 export const DEFAULT_SETTINGS_SECTION: SettingsSection = "profile";
 
 const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "profile",
   "notifications",
+  "voice",
   "experimental",
   "agents",
   "channel-templates",
   "compute",
   "appearance",
   "shortcuts",
-  "relay-members",
-  "moderation",
+  "hosted-communities",
+  "community-members",
+  "relay-admin",
   "custom-emoji",
   "local-archive",
   "mobile",
   "updates",
-  "doctor",
 ];
 
 export function isSettingsSection(value: unknown): value is SettingsSection {
@@ -149,6 +167,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     icon: BellRing,
   },
   {
+    value: "voice",
+    label: "Voice",
+    icon: Volume2,
+  },
+  {
     value: "experimental",
     label: "Experiments",
     icon: FlaskConical,
@@ -161,7 +184,7 @@ export const settingsSections: SettingsSectionDescriptor[] = [
   },
   {
     value: "channel-templates",
-    label: "Templates",
+    label: "Channel templates",
     icon: LayoutTemplate,
     featureGate: "channel-templates",
   },
@@ -176,24 +199,29 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     icon: Keyboard,
   },
   {
-    value: "relay-members",
-    label: "Relay Access",
-    icon: LockKeyhole,
+    value: "hosted-communities",
+    label: "Hosted communities",
+    icon: MessagesSquare,
   },
   {
-    value: "moderation",
-    label: "Moderation",
-    icon: ShieldAlert,
+    value: "community-members",
+    label: "Invites",
+    icon: Ticket,
+  },
+  {
+    value: "relay-admin",
+    label: "Admin",
+    icon: ServerCog,
   },
   {
     value: "custom-emoji",
-    label: "Custom Emoji",
+    label: "Custom emoji",
     icon: Smile,
     featureGate: "custom-emoji",
   },
   {
     value: "local-archive",
-    label: "Local Archive",
+    label: "Local archive",
     icon: Archive,
   },
   {
@@ -205,12 +233,6 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "updates",
     label: "Updates",
     icon: Download,
-  },
-  {
-    value: "doctor",
-    label: "Doctor",
-    icon: Stethoscope,
-    featureGate: "doctor",
   },
 ];
 
@@ -378,16 +400,49 @@ function SingleThemeTile({
 
 type AppearanceMode = "system" | "light" | "dark";
 
+const APPEARANCE_MODE_OPTIONS = [
+  { mode: "system" as const, label: "System", Icon: SunMoon },
+  { mode: "light" as const, label: "Light", Icon: Sun },
+  { mode: "dark" as const, label: "Dark", Icon: Moon },
+] as const;
+
+// Reveal/hide motion for the accent picker: a small translate + opacity fade.
+// The picker sits below the theme grid and reads as tucking up behind it, so
+// it enters from above (slides *down* into place when a non-Buzz theme reveals
+// it) and exits upward (slides up behind the grid when Buzz hides it). No
+// height/scale — height collapse clipped the swatches behind the grid's bottom
+// fade (the "white bar"). Snappier than the modal 0.2s since this is a small
+// settings control, sharing the modal/ProfileSettingsCard easing curve.
+const ACCENT_PICKER_TRANSITION = {
+  duration: 0.16,
+  ease: [0.23, 1, 0.32, 1] as const,
+};
+
 function ThemeSettingsCard() {
   const {
     setTheme,
     selectedThemeName,
+    themeName,
     isDark,
     accentColor,
     setAccentColor,
     followSystem,
     setFollowSystem,
   } = useTheme();
+
+  // Per-community scoping labels only earn their place when the user is
+  // actually in more than one community; with a single community there is
+  // nothing to disambiguate.
+  const { activeCommunity, communities } = useCommunities();
+  const showCommunityScope = communities.length > 1;
+  const communityLabel = appearanceCommunityLabel(activeCommunity?.name);
+
+  // Buzz themes pin a neutral accent (GitHub black in light, white in dark),
+  // so the accent picker is hidden while a Buzz theme is active. `themeName` is
+  // the effective theme, so this also covers System mode resolving to Buzz.
+  const buzzThemeSelected = isBuzzTheme(themeName);
+  const accentPickerHidden = buzzThemeSelected;
+  const shouldReduceMotion = useReducedMotion();
 
   const previewVarsByTheme = useThemePreviewVars();
   const { pairedLight, lightOnly, darkOnly } = useThemeCategories();
@@ -400,6 +455,7 @@ function ThemeSettingsCard() {
       : "light";
 
   const [selectedMode, setSelectedMode] = useState<AppearanceMode>(activeMode);
+  const [themeStyleExpanded, setThemeStyleExpanded] = useState(false);
 
   const getVars = (name: SyntaxThemeName) =>
     withAccentPreviewVars(
@@ -472,47 +528,44 @@ function ThemeSettingsCard() {
     const darkName = getThemePair(lightName);
     return selectedThemeName === lightName || selectedThemeName === darkName;
   };
-
-  return (
-    <section
-      className="flex min-h-0 flex-1 flex-col overflow-y-auto"
-      data-testid="settings-theme"
+  const selectedPairedTheme =
+    selectedMode === "system" ? pairedLight.find(isPairActive) : undefined;
+  const selectedTheme = selectedThemeName as SyntaxThemeName;
+  const selectedPairedDarkTheme = selectedPairedTheme
+    ? getThemePair(selectedPairedTheme)
+    : undefined;
+  const selectedThemeLabel = selectedPairedTheme
+    ? pairedThemeLabel(selectedPairedTheme)
+    : formatThemeLabel(selectedTheme);
+  const selectedThemePreview = selectedPairedTheme ? (
+    <SystemPreferencePreviewFrame
+      className="h-[112px] w-[168px] shrink-0"
+      darkGradient={
+        selectedPairedDarkTheme
+          ? BUZZ_GRADIENT_STOPS[selectedPairedDarkTheme]
+          : undefined
+      }
+      darkVars={
+        selectedPairedDarkTheme ? getVars(selectedPairedDarkTheme) : null
+      }
+      lightGradient={BUZZ_GRADIENT_STOPS[selectedPairedTheme]}
+      lightVars={getVars(selectedPairedTheme)}
+    />
+  ) : (
+    <ThemePreviewFrame
+      className="h-[112px] w-[168px] shrink-0"
+      sidebarGradient={BUZZ_GRADIENT_STOPS[selectedTheme]}
+      vars={getVars(selectedTheme)}
+    />
+  );
+  const themeStyleGrid = (
+    <div
+      className="px-4 pb-4 pt-1"
+      data-testid="theme-style-options"
+      id="theme-style-options"
     >
-      <SettingsSectionHeader
-        title="Appearance"
-        description="Choose a theme for Buzz."
-      />
-
-      {/* Mode selector: System / Light / Dark */}
-      <div className="mb-4 flex gap-2">
-        {(
-          [
-            { mode: "system" as const, label: "System", Icon: SunMoon },
-            { mode: "light" as const, label: "Light", Icon: Sun },
-            { mode: "dark" as const, label: "Dark", Icon: Moon },
-          ] as const
-        ).map(({ mode, label, Icon }) => (
-          <button
-            aria-pressed={selectedMode === mode}
-            className={cn(
-              "flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-              selectedMode === mode
-                ? "border-primary bg-primary/10 text-foreground"
-                : "border-border/70 text-muted-foreground hover:border-border hover:text-foreground",
-            )}
-            data-testid={`appearance-mode-${mode}`}
-            key={mode}
-            onClick={() => handleModeSelect(mode)}
-            type="button"
-          >
-            <Icon className="h-4 w-4" />
-            {label}
-          </button>
-        ))}
-      </div>
-
       {/* Theme grid — constrained to ~3 rows, scrolls internally */}
-      <div className="relative mb-6">
+      <div className="relative">
         {/* Top fade */}
         <div
           aria-hidden="true"
@@ -522,15 +575,19 @@ function ThemeSettingsCard() {
               "linear-gradient(to bottom, hsl(var(--background)), hsl(var(--background) / 0))",
           }}
         />
-        {/* Bottom fade */}
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-3"
-          style={{
-            background:
-              "linear-gradient(to top, hsl(var(--background)), hsl(var(--background) / 0))",
-          }}
-        />
+        {/* Bottom fade — hidden while the accent picker is visible so its
+            near-white gradient (Buzz light) can't mask the swatches below it
+            (the "white bar"). Kept only when the picker is hidden. */}
+        {accentPickerHidden ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-3"
+            style={{
+              background:
+                "linear-gradient(to top, hsl(var(--background)), hsl(var(--background) / 0))",
+            }}
+          />
+        ) : null}
         <div className="max-h-[430px] overflow-y-auto rounded-lg pt-2">
           <div className="flex flex-wrap gap-4 p-1">
             {selectedMode === "system" &&
@@ -571,41 +628,173 @@ function ThemeSettingsCard() {
           </div>
         </div>
       </div>
+    </div>
+  );
 
-      {/* Accent color picker */}
-      <div className="shrink-0 px-1 pb-2">
-        <h3 className="mb-2 text-sm font-medium">Accent color</h3>
-        <div className="flex flex-wrap gap-2 p-1">
-          {ACCENT_COLORS.map((color) => {
-            const isNeutral = color.value === NEUTRAL_ACCENT;
-            const swatchColor = isNeutral
-              ? "hsl(var(--foreground))"
-              : color.value;
-            const checkClassName =
-              isNeutral && isDark ? "text-black" : "text-white";
+  return (
+    <section
+      className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+      data-testid="settings-theme"
+    >
+      <SettingsSectionHeader
+        title="Appearance"
+        description="Choose how Buzz looks and feels."
+      />
 
-            return (
-              <button
-                className={cn(
-                  "flex h-7 w-7 items-center justify-center rounded-full border border-border/50 transition-transform hover:scale-110",
-                  accentColor === color.value &&
-                    "ring-2 ring-ring ring-offset-2 ring-offset-background",
-                )}
-                data-testid={`accent-color-${color.name.toLowerCase()}`}
-                key={color.value}
-                onClick={() => setAccentColor(color.value)}
-                style={{ backgroundColor: swatchColor }}
-                title={color.name}
-                type="button"
+      <SettingsOptionGroupList>
+        <SettingsOptionGroup
+          data-testid="appearance-theme-card"
+          headerAction={
+            showCommunityScope && activeCommunity ? (
+              <Badge
+                className="max-w-56 font-medium normal-case tracking-normal"
+                data-testid="appearance-community-badge"
+                variant="outline"
               >
-                {accentColor === color.value && (
-                  <Check className={cn("h-4 w-4", checkClassName)} />
+                <span className="truncate">{communityLabel}</span>
+              </Badge>
+            ) : null
+          }
+          title={
+            <>
+              Theme
+              {showCommunityScope ? (
+                <span className="ml-1 font-normal text-muted-foreground">
+                  (per community)
+                </span>
+              ) : null}
+            </>
+          }
+        >
+          <SettingsOptionRow data-testid="appearance-color-mode-row">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">Color mode</p>
+              <p
+                className="text-sm font-normal text-muted-foreground/70"
+                data-settings-subcopy
+              >
+                Follow your system or choose a light or dark appearance.
+              </p>
+            </div>
+            <SegmentedControl
+              indicatorTestId="appearance-color-mode-indicator"
+              legend="Color mode"
+              onValueChange={handleModeSelect}
+              optionTestIdPrefix="appearance-mode"
+              options={APPEARANCE_MODE_OPTIONS.map(({ mode, label, Icon }) => ({
+                value: mode,
+                label,
+                Icon,
+              }))}
+              testId="appearance-color-mode-control"
+              value={selectedMode}
+            />
+          </SettingsOptionRow>
+
+          <SettingsOptionRow data-testid="theme-style-row">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">Theme style</p>
+              <p
+                className="text-sm font-normal text-muted-foreground/70"
+                data-settings-subcopy
+              >
+                Choose the colors used throughout Buzz.
+              </p>
+            </div>
+            <button
+              aria-label={`Theme style, ${selectedThemeLabel}`}
+              aria-controls="theme-style-options"
+              aria-expanded={themeStyleExpanded}
+              className="flex h-auto min-w-0 items-center gap-2 rounded-md bg-transparent p-0 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              data-testid="theme-style-trigger"
+              onClick={() => setThemeStyleExpanded((expanded) => !expanded)}
+              type="button"
+            >
+              <span
+                className="shrink-0"
+                data-testid="theme-style-selected-preview"
+              >
+                {selectedThemePreview}
+              </span>
+              <ChevronDown
+                className={cn(
+                  "h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out motion-reduce:transition-none",
+                  themeStyleExpanded && "rotate-180",
                 )}
-              </button>
-            );
-          })}
-        </div>
-      </div>
+              />
+            </button>
+          </SettingsOptionRow>
+
+          {shouldReduceMotion ? (
+            themeStyleExpanded ? (
+              themeStyleGrid
+            ) : null
+          ) : (
+            <AnimatePresence initial={false}>
+              {themeStyleExpanded ? (
+                <motion.div
+                  animate={{ height: "auto", opacity: 1, y: 0 }}
+                  className="overflow-hidden"
+                  exit={{ height: 0, opacity: 0, y: -6 }}
+                  initial={{ height: 0, opacity: 0, y: -6 }}
+                  key="theme-style-options"
+                  transition={{
+                    duration: 0.22,
+                    ease: [0.23, 1, 0.32, 1],
+                  }}
+                >
+                  {themeStyleGrid}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          )}
+
+          {/* Accent color picker — hidden for Buzz themes (pinned neutral accent).
+              Reveal/hide with the translate-up + opacity fade defined by
+              ACCENT_PICKER_TRANSITION above. Reduced motion skips the transition
+              and just renders/unrenders. */}
+          {shouldReduceMotion ? (
+            accentPickerHidden ? null : (
+              <AccentPickerContent
+                accentColor={accentColor}
+                isDark={isDark}
+                setAccentColor={setAccentColor}
+              />
+            )
+          ) : (
+            <AnimatePresence initial={false}>
+              {accentPickerHidden ? null : (
+                <motion.div
+                  animate={{ opacity: 1, y: 0 }}
+                  className="will-change-[opacity,transform]"
+                  exit={{ opacity: 0, y: -10 }}
+                  initial={{ opacity: 0, y: -10 }}
+                  key="accent-picker"
+                  transition={ACCENT_PICKER_TRANSITION}
+                >
+                  <AccentPickerContent
+                    accentColor={accentColor}
+                    isDark={isDark}
+                    setAccentColor={setAccentColor}
+                  />
+                </motion.div>
+              )}
+            </AnimatePresence>
+          )}
+
+          <GlassBackgroundSetting />
+          {buzzThemeSelected ? <ProminentActiveTabSetting /> : null}
+        </SettingsOptionGroup>
+
+        <SettingsOptionGroup
+          data-testid="appearance-preferences-card"
+          title="Preferences"
+        >
+          <ConversationDisplaySettings />
+          <LinkPreviewStyleSetting />
+          <ThreadLayoutSetting />
+        </SettingsOptionGroup>
+      </SettingsOptionGroupList>
     </section>
   );
 }
@@ -639,10 +828,12 @@ export function renderSettingsSection(
           onSetSoundForSlot={props.onSetSoundForSlot}
         />
       );
+    case "voice":
+      return <VoiceSettingsCard />;
     case "experimental":
       return <ExperimentalFeaturesCard />;
     case "agents":
-      return <PreventSleepSettingsCard />;
+      return <AgentsSettingsPanel />;
     case "channel-templates":
       return <ChannelTemplatesSettingsCard />;
     case "compute":
@@ -651,10 +842,14 @@ export function renderSettingsSection(
       return <ThemeSettingsCard />;
     case "shortcuts":
       return <KeyboardShortcutsCard />;
-    case "relay-members":
-      return <RelayMembersSettingsCard currentPubkey={props.currentPubkey} />;
-    case "moderation":
-      return <ModerationQueueCard />;
+    case "hosted-communities":
+      return <HostedCommunitiesSettingsCard />;
+    case "community-members":
+      return (
+        <CommunityMembersSettingsCard currentPubkey={props.currentPubkey} />
+      );
+    case "relay-admin":
+      return <AdminConsoleSettingsCard />;
     case "custom-emoji":
       return <CustomEmojiSettingsCard />;
     case "local-archive":
@@ -663,8 +858,6 @@ export function renderSettingsSection(
       return <MobilePairingCard currentPubkey={props.currentPubkey} />;
     case "updates":
       return <UpdateChecker />;
-    case "doctor":
-      return <DoctorSettingsPanel />;
     default: {
       const exhaustiveCheck: never = section;
       return exhaustiveCheck;

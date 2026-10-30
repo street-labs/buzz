@@ -7,7 +7,6 @@ import {
   duplicatePersonaDialogState,
   editPersonaDialogState,
   formatPersonaNamePoolText,
-  importPersonaDialogState,
   parsePersonaNamePoolText,
 } from "./personaDialogState.ts";
 
@@ -65,6 +64,7 @@ test("createPersonaDialogState returns a fresh empty draft", () => {
     displayName: "",
     avatarUrl: "",
     systemPrompt: "",
+    acpCommand: "buzz-acp",
     runtime: undefined,
     model: undefined,
   });
@@ -76,7 +76,9 @@ test("duplicatePersonaDialogState copies persona fields into a new draft", () =>
     id: "persona-1",
     displayName: "Solo",
     avatarUrl: "avatar://solo",
+    description: "Reviews desktop changes.",
     systemPrompt: "Be direct.",
+    acpCommand: "buzz-acp",
     runtime: "provider-a",
     model: "model-a",
     provider: null,
@@ -89,7 +91,9 @@ test("duplicatePersonaDialogState copies persona fields into a new draft", () =>
   assert.deepEqual(state.initialValues, {
     displayName: "Solo copy",
     avatarUrl: "avatar://solo",
+    description: "Reviews desktop changes.",
     systemPrompt: "Be direct.",
+    acpCommand: "buzz-acp",
     runtime: "provider-a",
     model: "model-a",
     provider: undefined,
@@ -129,7 +133,9 @@ test("editPersonaDialogState preserves the persona id for updates", () => {
     id: "persona-2",
     displayName: "Kit",
     avatarUrl: null,
+    description: "Finds unusual solutions.",
     systemPrompt: "Keep it weird.",
+    acpCommand: "buzz-acp",
     runtime: null,
     model: null,
     provider: null,
@@ -146,7 +152,9 @@ test("editPersonaDialogState preserves the persona id for updates", () => {
     id: "persona-2",
     displayName: "Kit",
     avatarUrl: "",
+    description: "Finds unusual solutions.",
     systemPrompt: "Keep it weird.",
+    acpCommand: "buzz-acp",
     runtime: undefined,
     model: undefined,
     provider: undefined,
@@ -175,118 +183,6 @@ test("editPersonaDialogState seeds envVars and namePool from the persona", () =>
     ANTHROPIC_API_KEY: "sk-test",
   });
   assert.deepEqual(state.initialValues.namePool, ["alice", "bob"]);
-});
-
-test("importPersonaDialogState maps parsed persona previews into create drafts", () => {
-  const state = importPersonaDialogState({
-    displayName: "Imported",
-    avatarDataUrl: null,
-    avatarRef: null,
-    systemPrompt: "Imported prompt",
-    runtime: null,
-    model: "model-b",
-    provider: null,
-    namePool: [],
-    sourceFile: "import.persona.json",
-  });
-
-  assert.equal(state.title, "Import Imported");
-  assert.deepEqual(state.initialValues, {
-    displayName: "Imported",
-    avatarUrl: "",
-    systemPrompt: "Imported prompt",
-    runtime: undefined,
-    model: "model-b",
-    provider: undefined,
-  });
-});
-
-test("importPersonaDialogState preserves imported name pools", () => {
-  const state = importPersonaDialogState({
-    displayName: "Named imports",
-    avatarDataUrl: null,
-    avatarRef: null,
-    systemPrompt: "Imported prompt",
-    runtime: null,
-    model: null,
-    provider: null,
-    namePool: ["Birch", "Compass"],
-    sourceFile: "named.persona.json",
-  });
-
-  assert.deepEqual(state.initialValues.namePool, ["Birch", "Compass"]);
-});
-
-test("importPersonaDialogState filters unresolved Goose app-avatar refs", () => {
-  const state = importPersonaDialogState({
-    displayName: "Goosey",
-    avatarDataUrl: null,
-    avatarRef: "app-avatar:gloopies-19",
-    systemPrompt: "Imported prompt",
-    runtime: null,
-    model: null,
-    provider: null,
-    namePool: [],
-    sourceFile: "goosey.persona.md",
-  });
-
-  assert.equal(state.initialValues.avatarUrl, "");
-});
-
-test("importPersonaDialogState filters nonpersistent imported avatar refs", () => {
-  for (const avatarRef of [
-    "blob:https://buzz.example/temporary-avatar",
-    "ipfs://bafybeigdyrzt",
-  ]) {
-    const state = importPersonaDialogState({
-      displayName: "Packed avatar",
-      avatarDataUrl: null,
-      avatarRef,
-      systemPrompt: "Imported prompt",
-      runtime: null,
-      model: null,
-      provider: null,
-      namePool: [],
-      sourceFile: "pack.persona.zip",
-    });
-
-    assert.equal(state.initialValues.avatarUrl, "");
-  }
-});
-
-test("importPersonaDialogState preserves URL-like avatar refs", () => {
-  const state = importPersonaDialogState({
-    displayName: "Hosted avatar",
-    avatarDataUrl: null,
-    avatarRef: "https://relay.example/avatar.png",
-    systemPrompt: "Imported prompt",
-    runtime: null,
-    model: null,
-    provider: null,
-    namePool: [],
-    sourceFile: "hosted.persona.md",
-  });
-
-  assert.equal(
-    state.initialValues.avatarUrl,
-    "https://relay.example/avatar.png",
-  );
-});
-
-test("importPersonaDialogState filters relative avatar refs from packs", () => {
-  const state = importPersonaDialogState({
-    displayName: "Packed avatar",
-    avatarDataUrl: null,
-    avatarRef: "./avatars/lep.png",
-    systemPrompt: "Imported prompt",
-    runtime: null,
-    model: null,
-    provider: null,
-    namePool: [],
-    sourceFile: "pack.persona.zip",
-  });
-
-  assert.equal(state.initialValues.avatarUrl, "");
 });
 
 test("editPersonaDialogState preserves provider=databricks", () => {
@@ -349,22 +245,6 @@ test("duplicatePersonaDialogState preserves provider=databricks", () => {
   assert.equal(state.initialValues.provider, "databricks");
 });
 
-test("importPersonaDialogState preserves provider=anthropic", () => {
-  const state = importPersonaDialogState({
-    displayName: "Imported With Provider",
-    avatarDataUrl: null,
-    avatarRef: null,
-    systemPrompt: "Anthropic agent.",
-    runtime: "goose",
-    model: "claude-sonnet",
-    provider: "anthropic",
-    namePool: [],
-    sourceFile: "provider-test.persona.json",
-  });
-
-  assert.equal(state.initialValues.provider, "anthropic");
-});
-
 test("edit and duplicate seed the behavior group from a quad-bearing persona", () => {
   const persona = {
     id: "persona-quad",
@@ -378,8 +258,8 @@ test("edit and duplicate seed the behavior group from a quad-bearing persona", (
     isActive: true,
     respondTo: "allowlist",
     respondToAllowlist: ["a".repeat(64)],
-    mcpToolsets: "developer",
     parallelism: 4,
+    sessionPolicy: "thread",
     createdAt: "2025-01-01T00:00:00Z",
     updatedAt: "2025-01-02T00:00:00Z",
   };
@@ -387,8 +267,8 @@ test("edit and duplicate seed the behavior group from a quad-bearing persona", (
   const expected = {
     respondTo: "allowlist",
     respondToAllowlist: ["a".repeat(64)],
-    mcpToolsets: "developer",
     parallelism: 4,
+    sessionPolicy: "thread",
   };
   assert.deepEqual(
     editPersonaDialogState(persona).initialValues.behavior,
@@ -398,6 +278,38 @@ test("edit and duplicate seed the behavior group from a quad-bearing persona", (
     duplicatePersonaDialogState(persona).initialValues.behavior,
     expected,
   );
+});
+
+test("a linked instance overrides stale definition access in the edit dialog", () => {
+  const persona = {
+    id: "persona-instance-access",
+    displayName: "Shared",
+    avatarUrl: null,
+    systemPrompt: "Shared.",
+    runtime: null,
+    model: null,
+    provider: null,
+    isBuiltIn: false,
+    isActive: true,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+    parallelism: 2,
+    sessionPolicy: "channel",
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-02T00:00:00Z",
+  };
+
+  const state = editPersonaDialogState(persona, {
+    respondTo: "allowlist",
+    respondToAllowlist: ["c".repeat(64)],
+  });
+
+  assert.deepEqual(state.initialValues.behavior, {
+    respondTo: "allowlist",
+    respondToAllowlist: ["c".repeat(64)],
+    parallelism: 2,
+    sessionPolicy: "channel",
+  });
 });
 
 test("a non-allowlist mode does not seed a stale allowlist into the dialog", () => {
@@ -413,7 +325,6 @@ test("a non-allowlist mode does not seed a stale allowlist into the dialog", () 
     isActive: true,
     respondTo: "owner-only",
     respondToAllowlist: ["b".repeat(64)],
-    mcpToolsets: null,
     parallelism: null,
     createdAt: "2025-01-01T00:00:00Z",
     updatedAt: "2025-01-02T00:00:00Z",

@@ -1,306 +1,363 @@
-import { Check, MessageSquare, X } from "lucide-react";
+import { FolderKanban, GitPullRequest } from "lucide-react";
+import * as React from "react";
 
 import type {
   Project,
   ProjectPullRequest,
   ProjectPullRequestListItem,
+  Repository,
 } from "@/features/projects/hooks";
+import { pullRequestShareLink } from "@/features/projects/lib/projectShareLinks";
+import { selectionItemFromReview } from "@/features/projects/lib/projectSelection";
+import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
+import {
+  countGroupedRows,
+  sliceGroupedRows,
+  useIncrementalMount,
+} from "@/shared/hooks/useIncrementalMount";
+import { cn } from "@/shared/lib/cn";
 import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import { BuzzLoadingState } from "@/shared/ui/BuzzLoadingState";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
+import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
+import { ProjectAuthorIdentity } from "./ProjectAuthorIdentity";
+import { ProjectEntityListRow } from "./ProjectEntityListRow";
+import { ProjectEventTypeIcon } from "./ProjectEventTypeIcon";
+import { PROJECT_GRID_CARD_BODY_CLASS } from "./projectGridCardStyles";
+import { ProjectListRowMenu } from "./ProjectListRowMenu";
+import { ProjectSelectableGroup } from "./ProjectSelectableGroup";
+import { ProjectPanelState } from "./ProjectPanelState";
+import { ProjectsWorkItemsLoadNotice } from "./ProjectsWorkItemsLoadNotice";
+import { groupProjectWorkItemsByProject } from "./projectWorkItemGroups";
 
 type ProjectsPullRequestsListProps = {
+  /** Render without container chrome — a parent table container provides border and rounding. */
+  embedded?: boolean;
+  emptyMessage?: string;
+  error: unknown;
+  failedSections: ProjectWorkItemSection[];
   isLoading: boolean;
-  onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
+  isRetrying: boolean;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    pullRequest: ProjectPullRequest,
+  ) => void;
+  onRetry: () => void;
   profiles?: UserProfileLookup;
   pullRequests: ProjectPullRequestListItem[];
   viewMode: "grid" | "list";
 };
 
-function formatRelativeTime(createdAt: number) {
-  const elapsedSeconds = Math.max(
-    1,
-    Math.floor(Date.now() / 1_000 - createdAt),
-  );
-  const units = [
-    { label: "year", seconds: 365 * 24 * 60 * 60 },
-    { label: "month", seconds: 30 * 24 * 60 * 60 },
-    { label: "day", seconds: 24 * 60 * 60 },
-    { label: "hour", seconds: 60 * 60 },
-    { label: "minute", seconds: 60 },
-  ];
-  const unit =
-    units.find((item) => elapsedSeconds >= item.seconds) ??
-    units[units.length - 1];
-  const value = Math.max(1, Math.floor(elapsedSeconds / unit.seconds));
-  return `${value} ${unit.label}${value === 1 ? "" : "s"} ago`;
-}
-
-function pullRequestStatusClassName(status: ProjectPullRequest["status"]) {
-  if (status === "Closed") return "text-destructive";
-  if (status === "Draft") return "text-muted-foreground";
-  if (status === "Merged") return "text-purple-400";
-  return "text-green-500";
-}
-
 function nextStepLabel(status: ProjectPullRequest["status"]) {
   if (status === "Draft") return "View draft";
   if (status === "Merged") return "View merge";
   if (status === "Closed") return "View closed";
-  return "Review PR";
+  return "Open review";
 }
 
-function PullRequestGridCard({
+const PullRequestGridCard = React.memo(function PullRequestGridCard({
   project,
-  profiles,
   pullRequest,
   onOpen,
+  repository,
 }: {
   project: Project;
-  profiles?: UserProfileLookup;
   pullRequest: ProjectPullRequest;
-  onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    pullRequest: ProjectPullRequest,
+  ) => void;
+  repository: Repository;
 }) {
-  const authorLabel = resolveUserLabel({
-    profiles,
-    pubkey: pullRequest.author,
-  });
-  const authorProfile = profiles?.[normalizePubkey(pullRequest.author)];
-  const StatusIcon =
-    pullRequest.status === "Closed" || pullRequest.status === "Draft"
-      ? X
-      : Check;
-
   return (
-    <Card className="group relative flex min-h-40 flex-col overflow-hidden border-border/60 bg-card p-4 shadow-none transition-colors duration-150 hover:bg-muted/20">
+    <Card
+      className="group relative flex min-h-32 flex-col overflow-hidden border-border/60 bg-transparent p-4 shadow-none transition-colors duration-150 hover:bg-muted/20"
+      data-projects-grid-card
+    >
       <button
         className="absolute inset-0"
-        onClick={() => onOpen(project, pullRequest)}
+        onClick={() => onOpen(project, repository, pullRequest)}
         type="button"
       >
-        <span className="sr-only">View {pullRequest.title}</span>
+        <span className="sr-only">View review {pullRequest.title}</span>
       </button>
-      <div className="flex min-h-0 flex-1 flex-col gap-3">
-        <div className="flex min-w-0 items-start gap-3">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="relative z-10 inline-flex shrink-0">
-                <UserAvatar
-                  accent={authorProfile?.isAgent === true}
-                  avatarUrl={authorProfile?.avatarUrl ?? null}
-                  displayName={authorLabel}
-                  size="md"
-                />
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>{authorLabel}</TooltipContent>
-          </Tooltip>
-          <div className="min-w-0 flex-1 space-y-1">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <p className="truncate text-sm font-semibold text-foreground">
-                {pullRequest.title}
-              </p>
-              <StatusIcon
-                className={`h-3.5 w-3.5 shrink-0 ${pullRequestStatusClassName(
-                  pullRequest.status,
-                )}`}
-              />
-            </div>
-            <p className="truncate text-xs text-muted-foreground">
-              {project.name}
-            </p>
-          </div>
-          <Button
-            className="relative z-10 h-7 shrink-0 px-2.5"
-            onClick={(event) => {
-              event.stopPropagation();
-              onOpen(project, pullRequest);
-            }}
-            size="xs"
-            type="button"
-            variant="default"
-          >
-            {nextStepLabel(pullRequest.status)}
-          </Button>
-        </div>
-
-        {pullRequest.content ? (
-          <p className="line-clamp-2 text-sm text-foreground/90">
-            {pullRequest.content}
-          </p>
-        ) : null}
-
-        <div className="mt-auto border border-border/60 bg-muted/30 px-2.5 py-2">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-foreground/80">
-            <span className="font-mono text-foreground">
-              #{pullRequest.id.slice(0, 8)}
-            </span>
-            <span className="font-medium text-foreground">
-              {pullRequest.status}
-            </span>
-            <span>opened {formatRelativeTime(pullRequest.createdAt)}</span>
-            <span>by {authorLabel}</span>
-            {pullRequest.comments.length > 0 ? (
-              <span className="flex items-center gap-1">
-                <MessageSquare className="h-3.5 w-3.5" />
-                {pullRequest.comments.length}
-              </span>
-            ) : null}
-          </div>
+      <div className="flex min-h-0 flex-1 flex-col gap-2">
+        <h3
+          className="truncate text-sm font-semibold leading-5 text-foreground"
+          data-testid="projects-grid-card-title"
+        >
+          {pullRequest.title}
+        </h3>
+        <p
+          className={cn(PROJECT_GRID_CARD_BODY_CLASS, "text-muted-foreground")}
+          data-testid="projects-grid-card-body"
+        >
+          {pullRequest.content || "No description provided."}
+        </p>
+        <div
+          className="mt-auto flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+          data-testid="projects-grid-card-indicator"
+        >
+          <ProjectEventTypeIcon className="h-3.5 w-3.5" kind="pull-request" />
+          <span>{pullRequest.status}</span>
         </div>
       </div>
     </Card>
   );
+});
+
+function reviewSelectionItem(
+  project: Project,
+  repository: Repository,
+  pullRequest: ProjectPullRequest,
+) {
+  return selectionItemFromReview({
+    author: pullRequest.author,
+    channelId: repository.channelId ?? project.projectChannelId,
+    id: pullRequest.id,
+    shareLink: pullRequestShareLink(pullRequest),
+    title: pullRequest.title,
+  });
 }
 
-function PullRequestListRow({
+// Memoized: these rows render in unbounded lists, and any Projects-view
+// state change used to re-render every row. Props are kept identity-stable
+// by the list (memoized groups/selection arrays, stable onOpen).
+const PullRequestListRow = React.memo(function PullRequestListRow({
   project,
   profiles,
   pullRequest,
+  rangeItems,
+  repository,
   onOpen,
 }: {
   project: Project;
   profiles?: UserProfileLookup;
   pullRequest: ProjectPullRequest;
-  onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
+  rangeItems: ReturnType<typeof reviewSelectionItem>[];
+  repository: Repository;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    pullRequest: ProjectPullRequest,
+  ) => void;
 }) {
   const authorLabel = resolveUserLabel({
     profiles,
     pubkey: pullRequest.author,
   });
-  const authorProfile = profiles?.[normalizePubkey(pullRequest.author)];
-  const StatusIcon =
-    pullRequest.status === "Closed" || pullRequest.status === "Draft"
-      ? X
-      : Check;
 
   return (
-    <div className="group relative px-4 py-2.5 transition-colors duration-150 hover:bg-muted/20">
-      <button
-        className="absolute inset-0"
-        onClick={() => onOpen(project, pullRequest)}
-        type="button"
-      >
-        <span className="sr-only">View {pullRequest.title}</span>
-      </button>
-      <div className="flex min-w-0 items-start gap-3">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="relative z-10 inline-flex shrink-0">
-              <UserAvatar
-                accent={authorProfile?.isAgent === true}
-                avatarUrl={authorProfile?.avatarUrl ?? null}
-                displayName={authorLabel}
-                size="md"
-              />
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>{authorLabel}</TooltipContent>
-        </Tooltip>
-        <div className="min-w-0 flex-1 space-y-1">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <p className="truncate text-sm font-semibold text-foreground">
-              {pullRequest.title}
-            </p>
-            <StatusIcon
-              className={`h-3.5 w-3.5 shrink-0 ${pullRequestStatusClassName(
-                pullRequest.status,
-              )}`}
-            />
-          </div>
-          <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-foreground/80">
-            <span>{project.name}</span>
-            <span>·</span>
-            <span className="font-mono text-foreground">
-              #{pullRequest.id.slice(0, 8)}
-            </span>
-            <span>opened {formatRelativeTime(pullRequest.createdAt)}</span>
-            <span>by {authorLabel}</span>
-            <span>·</span>
-            <span>{pullRequest.status}</span>
-          </div>
-        </div>
-        <div className="relative z-10 flex shrink-0 items-center gap-2">
-          {pullRequest.comments.length > 0 ? (
-            <span className="flex items-center gap-1 text-xs text-muted-foreground">
-              <MessageSquare className="h-3.5 w-3.5" />
-              {pullRequest.comments.length}
-            </span>
-          ) : null}
-          <Button
-            className="h-7 px-2.5"
-            onClick={(event) => {
-              event.stopPropagation();
-              onOpen(project, pullRequest);
-            }}
-            size="xs"
-            type="button"
-            variant="default"
+    <ProjectEntityListRow
+      affiliation={repository.name}
+      count={pullRequest.comments.length}
+      dateSeconds={pullRequest.updatedAt}
+      dateTestId="projects-row-date"
+      icon={null}
+      onClick={() => onOpen(project, repository, pullRequest)}
+      peopleSlot={
+        <ProjectAuthorIdentity
+          label={authorLabel}
+          labelClassName="sr-only"
+          profiles={profiles}
+          pubkey={pullRequest.author}
+          testId="projects-pr-author"
+        />
+      }
+      selection={{
+        item: reviewSelectionItem(project, repository, pullRequest),
+        rangeItems,
+      }}
+      testId={`projects-pr-row-${pullRequest.id}`}
+      title={pullRequest.title}
+      titleAttr={`Open review ${pullRequest.title}`}
+      titleIcon={
+        <ProjectEventTypeIcon className="h-3.5 w-3.5" kind="pull-request" />
+      }
+      trailing={
+        <ProjectListRowMenu label={`More options for ${pullRequest.title}`}>
+          <DropdownMenuItem
+            onSelect={() => onOpen(project, repository, pullRequest)}
           >
+            <GitPullRequest className="h-4 w-4" />
             {nextStepLabel(pullRequest.status)}
-          </Button>
-        </div>
-      </div>
-    </div>
+          </DropdownMenuItem>
+          <CopyShareLinkMenuItem
+            link={pullRequestShareLink(pullRequest)}
+            label="Copy review link"
+            testId={`projects-pull-request-copy-link-${pullRequest.id}`}
+          />
+        </ProjectListRowMenu>
+      }
+    />
   );
-}
+});
 
 export function ProjectsPullRequestsList({
+  embedded,
+  emptyMessage = "No reviews yet",
+  error,
+  failedSections,
   isLoading,
+  isRetrying,
   onOpen,
+  onRetry,
   profiles,
   pullRequests,
   viewMode,
 }: ProjectsPullRequestsListProps) {
+  // Grouping and per-group selection arrays are identity-stable across
+  // re-renders so the memoized rows only re-render when their data changes.
+  const allGroups = React.useMemo(
+    () =>
+      groupProjectWorkItemsByProject(pullRequests).map((group) => ({
+        ...group,
+        selectionItems: group.rows.map((row) =>
+          reviewSelectionItem(row.project, row.repository, row.pullRequest),
+        ),
+      })),
+    [pullRequests],
+  );
+  // Mount rows progressively: a one-shot mount of hundreds of rows blocked
+  // the main thread for over a second on tab entry.
+  // Each layout's counter grows only while that layout is active: otherwise
+  // a layout switch would find the other counter already grown and mount the
+  // whole collection in one commit.
+  const mountedRowCount = useIncrementalMount(
+    countGroupedRows(allGroups),
+    30,
+    60,
+    viewMode !== "grid",
+  );
+  const mountedGridCount = useIncrementalMount(
+    pullRequests.length,
+    30,
+    60,
+    viewMode === "grid",
+  );
+  const groups = React.useMemo(
+    () => sliceGroupedRows(allGroups, mountedRowCount),
+    [allGroups, mountedRowCount],
+  );
+
   if (isLoading) {
+    return <BuzzLoadingState label="Loading reviews" />;
+  }
+
+  const loadNotice = (
+    <ProjectsWorkItemsLoadNotice
+      error={error}
+      failedSections={failedSections}
+      isRetrying={isRetrying}
+      onRetry={onRetry}
+      subject="pull requests"
+    />
+  );
+
+  if (error && pullRequests.length === 0) {
     return (
-      <div className="border border-border/60 px-4 py-12 text-center text-sm text-muted-foreground">
-        Loading pull requests...
-      </div>
+      <ProjectPanelState
+        action={
+          <Button
+            disabled={isRetrying}
+            onClick={onRetry}
+            size="sm"
+            variant="outline"
+          >
+            {isRetrying ? "Retrying..." : "Retry"}
+          </Button>
+        }
+        description={
+          error instanceof Error ? error.message : "The relay request failed."
+        }
+        error
+        panel={false}
+        title="Could not load reviews"
+      />
     );
   }
 
   if (pullRequests.length === 0) {
     return (
-      <div className="border border-dashed border-border/60 px-4 py-12 text-center text-sm text-muted-foreground">
-        No pull requests yet.
+      <div className="space-y-3">
+        {loadNotice}
+        <ProjectPanelState
+          className={cn(!embedded && "border border-dashed border-border/60")}
+          panel={false}
+          title={emptyMessage}
+        />
       </div>
     );
   }
 
   if (viewMode === "grid") {
     return (
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {pullRequests.map(({ project, pullRequest }) => (
-          <PullRequestGridCard
-            key={pullRequest.id}
-            onOpen={onOpen}
-            profiles={profiles}
-            project={project}
-            pullRequest={pullRequest}
-          />
-        ))}
+      <div className="space-y-3">
+        {loadNotice}
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {pullRequests
+            .slice(0, mountedGridCount)
+            .map(({ project, pullRequest, repository }) => (
+              <PullRequestGridCard
+                key={`${repository.id}:${pullRequest.id}`}
+                onOpen={onOpen}
+                project={project}
+                pullRequest={pullRequest}
+                repository={repository}
+              />
+            ))}
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="-mx-4 divide-y divide-border/60 border-y border-border/60 bg-card">
-      {pullRequests.map(({ project, pullRequest }) => (
-        <PullRequestListRow
-          key={pullRequest.id}
-          onOpen={onOpen}
-          profiles={profiles}
-          project={project}
-          pullRequest={pullRequest}
-        />
-      ))}
+    <div className="space-y-3">
+      {loadNotice}
+      <div data-testid="projects-list-container">
+        {groups.map((group) => {
+          const groupSelectionItems = group.selectionItems;
+          return (
+            <ProjectSelectableGroup
+              count={group.rows.length}
+              groupKey={group.project.id}
+              headerClassName="mx-0 gap-3 px-4"
+              headerTestId="projects-review-project-group-header"
+              icon={<FolderKanban className="h-4 w-4" />}
+              items={groupSelectionItems}
+              key={group.project.id}
+              label={group.project.name}
+              labelTestId="project-review-project"
+              testId="projects-review-project-group"
+            >
+              <ul>
+                {group.rows.map(({ project, pullRequest, repository }) => (
+                  <li
+                    className="[contain-intrinsic-size:auto_3.5rem] [content-visibility:auto]"
+                    key={`${repository.id}:${pullRequest.id}`}
+                  >
+                    <PullRequestListRow
+                      onOpen={onOpen}
+                      profiles={profiles}
+                      project={project}
+                      pullRequest={pullRequest}
+                      rangeItems={groupSelectionItems}
+                      repository={repository}
+                    />
+                  </li>
+                ))}
+              </ul>
+            </ProjectSelectableGroup>
+          );
+        })}
+      </div>
     </div>
   );
 }

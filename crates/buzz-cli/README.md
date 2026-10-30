@@ -22,7 +22,7 @@ buzz channels list
 
 ## Usage
 
-All output is JSON on stdout. Errors are JSON on stderr. Exit codes: 0=ok, 1=user error, 2=network, 3=auth, 4=other.
+All output is JSON on stdout. Errors are JSON on stderr. Exit codes: 0=ok, 1=user error, 2=network, 3=auth, 4=other, 5=write conflict.
 
 ```bash
 # Set relay URL (defaults to http://localhost:3000)
@@ -34,6 +34,7 @@ buzz messages send --channel <uuid> --content "Reply" --reply-to <event-id> --br
 buzz messages send --channel <uuid> --content - < message.md   # read body from stdin
 buzz messages get --channel <uuid> --limit 20
 buzz messages thread --channel <uuid> --event <event-id>
+buzz messages thread --link 'buzz://message?channel=<uuid>&id=<event-id>&thread=<root-id>'
 buzz messages search --query "architecture"
 buzz messages search --author <pubkey|npub|name> --since <unix-ts>
 buzz messages edit --event <event-id> --content "Updated text"
@@ -52,11 +53,25 @@ buzz channels topic --channel <uuid> --topic "New topic"
 buzz reactions add --event <event-id> --emoji "👍"
 buzz reactions get --event <event-id>
 
+# GIFs (requires relay to advertise buzz-gif / KLIPY)
+buzz gifs search                              # trending GIFs
+buzz gifs search --query "celebration"        # search GIFs
+buzz gifs share --slug <slug>                 # report selection to provider Recents
+# Paste the `cdn_url` from a search result directly into messages send --content
+
+# Custom emoji in messages
+# buzz messages send scans outgoing content for :shortcode: patterns and
+# automatically attaches NIP-30 ["emoji", shortcode, url] tags from the
+# workspace palette — identical to the desktop composer behavior.
+
 # Users & Presence
 buzz users get                          # your own profile
 buzz users get --pubkey <hex>           # single user
 buzz users get --pubkey <hex> --pubkey <hex>  # batch (max 200)
+buzz users get --name Honey --owner me  # exact-name lookup in your managed agents
 buzz users set-presence --status online
+buzz users set-status --text "heads down on the CLI" --emoji "🚀"
+buzz users set-status --clear                 # remove your status
 
 # DMs
 buzz dms open --pubkey <hex>
@@ -82,11 +97,26 @@ buzz mem set <slug> "my-value"
 buzz mem patch <slug> --base-hash <hex> < diff.patch  # or --no-base-hash
 buzz mem rm <slug>
 
+# Repository protection
+buzz repos protect list --id my-repo
+buzz repos protect set --id my-repo --ref refs/heads/main --push admin --no-force-push --no-delete
+buzz repos protect remove --id my-repo --ref refs/heads/main
+
 # Pipe to jq
 buzz channels list | jq '.[].name'
 ```
 
-## 60 Subcommands across 13 Groups
+`protect set` replaces every existing rule for the exact ref pattern. Any
+constraint omitted from the command is removed. `protect list` reports malformed
+stored rules in `validation_error` so an owner can remove and repair them.
+
+## Commands
+
+`buzz --help` prints this whole surface as an indented tree — every group with
+its subcommands and their descriptions — so there is no need to run `--help`
+once per group to find a command. `buzz -h` keeps the short group-level
+summary, and `buzz <group> <subcommand> --help` has the flags and examples.
+The table below mirrors that tree for readers who are not at a terminal.
 
 | Group | Subcommand | Description |
 |-------|-----------|-------------|
@@ -117,6 +147,8 @@ buzz channels list | jq '.[].name'
 | `reactions` | `add` | React to a message |
 | | `remove` | Remove a reaction |
 | | `get` | List reactions |
+| `gifs` | `search` | Search or browse trending GIFs (requires relay buzz-gif support) |
+| | `share` | Report a selected GIF to the provider's Recents |
 | `dms` | `list` | List DM conversations |
 | | `open` | Open a DM (1–8 pubkeys) |
 | | `add-member` | Add member to DM group |
@@ -124,6 +156,7 @@ buzz channels list | jq '.[].name'
 | | `set-profile` | Update your profile |
 | | `presence` | Get presence status |
 | | `set-presence` | Set presence status |
+| | `set-status` | Set or clear your NIP-38 profile status |
 | `workflows` | `list` | List workflows |
 | | `get` | Get workflow definition |
 | | `create` | Create a workflow |
@@ -141,6 +174,10 @@ buzz channels list | jq '.[].name'
 | `repos` | `create` | Announce a git repository (NIP-34) |
 | | `get` | Get a repository announcement |
 | | `list` | List repository announcements |
+| | `default-branch get/set` | Read or select an existing default branch (requires relay support) |
+| | `protect list` | List branch and tag protection rules |
+| | `protect set` | Create or replace a protection rule |
+| | `protect remove` | Remove a protection rule |
 | `upload` | `file` | Upload a file to the Blossom store |
 | `pack` | `validate` | Validate a persona pack (local, no relay) |
 | | `inspect` | Inspect a persona pack (local, no relay) |
@@ -164,5 +201,31 @@ buzz <group> <subcommand> [flags]
 
 stdout: raw relay JSON
 stderr: {"error": "category", "message": "detail"}
-exit:   0=ok  1=user  2=network  3=auth  4=other
+exit:   0=ok  1=user  2=network  3=auth  4=other  5=write conflict
 ```
+
+
+### Default branch
+
+After deploying relay support, select an existing published branch without
+renaming or deleting any branch:
+
+```bash
+buzz repos default-branch get --owner <owner-hex> --id my-repo
+buzz repos default-branch set --owner <owner-hex> --id my-repo --branch main
+# For an explicitly reviewed version, use the manifest digest returned by get:
+buzz repos default-branch set --owner <owner-hex> --id my-repo --branch main \
+  --expected-manifest <manifest-digest>
+```
+
+`--owner` defaults to the signing identity, not an agent's attested human owner.
+`set` without `--expected-manifest` reads the current version first. Success
+returns `branch`, `head`, `manifest` and `changed`; `get` omits `changed`.
+A stale version returns conflict (exit 5). Ambiguous write failures return
+`delivery_unknown` with `retryable:false` and the original digest: **read before
+retrying**, and do not blindly re-run against a newly fetched version.
+
+The signer must be a current channel member and a repository manager, directly
+or through an unrestricted, valid NIP-OA owner attestation; permission to push is
+not permission to change the default. See the
+[protocol and authorization contract](../../docs/git-on-object-storage.md#default-branch-management).

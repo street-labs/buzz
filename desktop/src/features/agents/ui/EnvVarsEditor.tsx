@@ -7,7 +7,7 @@ import { cn } from "@/shared/lib/cn";
 import {
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
-} from "./personaDialogPickers";
+} from "./agentConfigOptions";
 
 export type EnvVarsValue = Record<string, string>;
 
@@ -44,7 +44,9 @@ export function toRows(
  * Collapse an ordered row list back to a record, skipping rows with empty
  * keys. Exported for unit tests.
  */
-export function toRecord(rows: Row[]): EnvVarsValue {
+export function toRecord(
+  rows: readonly { key: string; value: string }[],
+): EnvVarsValue {
   const out: EnvVarsValue = {};
   for (const row of rows) {
     // Empty key = user is mid-edit; skip it so we don't poison the record.
@@ -140,6 +142,11 @@ type EnvVarsEditorProps = {
    */
   fileSatisfiedKeys?: readonly string[];
   /**
+   * Keys owned by a first-class field outside this editor. They remain in the
+   * emitted map but never render as generic rows here.
+   */
+  hiddenKeys?: readonly string[];
+  /**
    * When set, scroll the matching required-key row into view and focus its
    * value input on mount. One-shot: ignored after the first render in which
    * it is set. Only acts on keys that appear in `requiredKeys`.
@@ -160,9 +167,38 @@ type EnvVarsEditorProps = {
   inheritedRows?: readonly InheritedEnvRow[];
   /** Label for the inherited-row tag (e.g. "build"). Defaults to "build". */
   inheritedRowsLabel?: string;
+  /**
+   * Optional muted one-line annotation for specific env var keys. Rendered
+   * below any row whose key appears in this map — required rows, user rows,
+   * and user rows whose key is typed mid-edit. Intended for contextual hints
+   * like `{ OPENAI_API_KEY: "Used for minting agent trading cards" }` that
+   * help users distinguish two keys with similar names.
+   */
+  keyAnnotations?: Readonly<Record<string, string>>;
 };
 
 type Row = { id: string; key: string; value: string };
+
+/**
+ * Pure record builder: merges `toRecord(nextRows)` with the current values of
+ * `requiredKeys` and `hiddenKeys` from `value`. Required and hidden keys are
+ * excluded from the row state (`skipKeys`), so this merge is the only place
+ * their current values survive an `onChange` emit cycle.
+ *
+ * Exported for unit testing. `EnvVarsEditor` calls this internally.
+ */
+export function buildRecord(
+  nextRows: readonly { key: string; value: string }[],
+  value: EnvVarsValue,
+  requiredKeys: readonly string[],
+  hiddenKeys: readonly string[],
+): EnvVarsValue {
+  const base: EnvVarsValue = {};
+  for (const key of [...requiredKeys, ...hiddenKeys]) {
+    if (key in value) base[key] = value[key];
+  }
+  return { ...base, ...toRecord(nextRows) };
+}
 
 /**
  * A flat key/value editor for environment variables.
@@ -182,9 +218,11 @@ export function EnvVarsEditor({
   disabled = false,
   requiredKeys = [],
   fileSatisfiedKeys = [],
+  hiddenKeys = [],
   focusKey,
   inheritedRows = [],
   inheritedRowsLabel = "build",
+  keyAnnotations,
 }: EnvVarsEditorProps) {
   // Keys that render as their own special rows (required amber rows or
   // file-satisfied read-only rows). These must NEVER enter `rows` state —
@@ -192,8 +230,8 @@ export function EnvVarsEditor({
   // Keeping them out of rows is the invariant that prevents a pre-saved
   // required key from appearing as a duplicate normal editable row.
   const skipKeys = React.useMemo(
-    () => new Set([...requiredKeys, ...fileSatisfiedKeys]),
-    [requiredKeys, fileSatisfiedKeys],
+    () => new Set([...requiredKeys, ...fileSatisfiedKeys, ...hiddenKeys]),
+    [requiredKeys, fileSatisfiedKeys, hiddenKeys],
   );
 
   // Local ordered row state — normal (non-special) keys only. Synced from
@@ -225,18 +263,6 @@ export function EnvVarsEditor({
       setRows(toRows(value, skipKeys));
     }
   }, [value, skipKeys]);
-
-  // Build the emitted record: normal rows + required-key values preserved
-  // from `value`. Required keys are never in `rows`, so `toRecord(rows)`
-  // would silently drop any required secret the user just typed unless we
-  // merge them back explicitly.
-  function buildRecord(nextRows: Row[]): EnvVarsValue {
-    const base: EnvVarsValue = {};
-    for (const key of requiredKeys) {
-      if (key in value) base[key] = value[key];
-    }
-    return { ...base, ...toRecord(nextRows) };
-  }
 
   // Ref map: key → required-value Input element. Populated via callback refs
   // on each required-key row's value Input so focus can be dispatched directly
@@ -279,7 +305,7 @@ export function EnvVarsEditor({
 
   function emit(next: Row[]) {
     setRows(next);
-    const record = buildRecord(next);
+    const record = buildRecord(next, value, requiredKeys, hiddenKeys);
     lastEmitted.current = record;
     onChange(record);
   }
@@ -400,6 +426,14 @@ export function EnvVarsEditor({
                   </p>
                 );
               })()}
+              {keyAnnotations?.[key] ? (
+                <p
+                  className="ml-1 text-xs text-muted-foreground"
+                  data-testid="env-vars-key-annotation"
+                >
+                  {keyAnnotations[key]}
+                </p>
+              ) : null}
             </div>
           );
         })}
@@ -590,6 +624,14 @@ export function EnvVarsEditor({
                   </p>
                 );
               })()}
+              {row.key.length > 0 && keyAnnotations?.[row.key] ? (
+                <p
+                  className="ml-1 text-xs text-muted-foreground"
+                  data-testid="env-vars-key-annotation"
+                >
+                  {keyAnnotations[row.key]}
+                </p>
+              ) : null}
             </div>
           );
         })}

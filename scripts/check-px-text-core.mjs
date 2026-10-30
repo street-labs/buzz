@@ -50,7 +50,7 @@ async function walkFiles(directory) {
  * @param {string} options.projectRoot Absolute path the rule roots resolve against.
  * @param {Array<{root: string, extensions: Set<string>}>} options.rules Where to scan.
  * @param {string} options.label Human label for the failure header.
- * @param {Set<string>} [options.overrides] Allowlisted "relativePath:lineNumber" entries.
+ * @param {Set<string>} [options.overrides] Allowlisted "relativePath:matchedLiteral" entries.
  * @param {string} options.scriptPath Path mentioned in the failure hint.
  */
 export async function runPxTextCheck({
@@ -75,10 +75,14 @@ export async function runPxTextCheck({
   const violations = [];
 
   for (const filePath of candidateFiles) {
-    const relativePath = path.relative(projectRoot, filePath);
-    const rule = rules.find((r) =>
-      relativePath.startsWith(`${r.root}${path.sep}`),
-    );
+    // `rules[].root` and the `overrides` keys are authored with `/`, but
+    // path.relative yields `\` on Windows — so every comparison against them
+    // has to happen in posix form or it silently matches nothing.
+    const relativePath = path
+      .relative(projectRoot, filePath)
+      .split(path.sep)
+      .join("/");
+    const rule = rules.find((r) => relativePath.startsWith(`${r.root}/`));
     if (!rule) {
       continue;
     }
@@ -94,16 +98,15 @@ export async function runPxTextCheck({
     const lines = content.split(/\r?\n/);
     lines.forEach((line, index) => {
       const lineNumber = index + 1;
-      const key = `${relativePath}:${lineNumber}`;
-      if (overrides.has(key)) {
-        return;
-      }
       const matches = [
         ...(line.match(TEXT_ARBITRARY_RE) ?? []),
         ...(line.match(FONT_SIZE_PX_RE) ?? []),
       ];
       for (const match of matches) {
-        violations.push({ relativePath, lineNumber, match });
+        const key = `${relativePath}:${match}`;
+        if (!overrides.has(key)) {
+          violations.push({ relativePath, lineNumber, match });
+        }
       }
     });
   }
@@ -119,7 +122,7 @@ export async function runPxTextCheck({
         "tokens) so the text scales with Cmd +/- zoom and stays on one scale. " +
         "If this size is " +
         "genuinely decorative/chrome (not readable message text), add a " +
-        `narrowly scoped \`relativePath:lineNumber\` exception in \`${scriptPath}\`.`,
+        `narrowly scoped \`relativePath:matchedLiteral\` exception in \`${scriptPath}\`.`,
     );
     process.exit(1);
   }

@@ -2,7 +2,6 @@ part of '../channels_page.dart';
 
 class _ChannelTile extends ConsumerWidget {
   final Channel channel;
-  final int? unreadCount;
   final bool isUnread;
   final bool isMuted;
   final String? currentPubkey;
@@ -17,7 +16,6 @@ class _ChannelTile extends ConsumerWidget {
 
   const _ChannelTile({
     required this.channel,
-    this.unreadCount,
     required this.isUnread,
     required this.currentPubkey,
     required this.onTap,
@@ -28,6 +26,10 @@ class _ChannelTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final contentColor = isMuted
+        ? navigationMetadataForeground(context)
+        : channelNavigationForeground(context);
+
     return InkWell(
       borderRadius: BorderRadius.circular(Radii.md),
       onTap: onTap,
@@ -41,35 +43,59 @@ class _ChannelTile extends ConsumerWidget {
         ),
         child: Row(
           children: [
-            if (channel.isDm)
-              _DmAvatar(channel: channel, currentPubkey: currentPubkey)
-            else
+            if (channel.isDm) ...[
+              SizedBox(
+                width: _kChannelLeadingWidth,
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: _DmAvatar(
+                    channel: channel,
+                    currentPubkey: currentPubkey,
+                  ),
+                ),
+              ),
+              const SizedBox(width: _kChannelLabelGap),
+            ] else ...[
               SizedBox(
                 width: _kChannelLeadingWidth,
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Icon(
-                    channelIcon(channel),
+                    channel.visibility == 'private'
+                        ? BuzzIcons.lock
+                        : BuzzIcons.hash,
+                    key: ValueKey('channel-icon-${channel.id}'),
                     size: _kChannelIconSize,
-                    color: context.colors.onSurface,
+                    color: contentColor,
                   ),
                 ),
               ),
-            const SizedBox(width: _kChannelLabelGap),
+              const SizedBox(width: _kChannelLabelGap),
+            ],
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    resolveDmChannelDisplayLabel(
-                      channel,
-                      currentPubkey: currentPubkey,
+                    ref.watch(
+                      identityNameSourcesProvider.select(
+                        (names) => resolveDmChannelDisplayLabel(
+                          channel,
+                          currentPubkey: currentPubkey,
+                          names: names,
+                        ),
+                      ),
                     ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: context.textTheme.bodyMedium?.copyWith(
-                      color: context.colors.onSurface,
-                      fontWeight: isUnread ? FontWeight.w700 : FontWeight.w400,
+                    style: navigationChatTitleTextStyle.copyWith(
+                      color: isMuted
+                          ? contentColor
+                          : channelNavigationForeground(
+                              context,
+                              unread: isUnread,
+                            ),
+                      fontWeight: isUnread ? FontWeight.w700 : FontWeight.w500,
                     ),
                   ),
                 ],
@@ -81,15 +107,16 @@ class _ChannelTile extends ConsumerWidget {
             ],
             if (isMuted) ...[
               const SizedBox(width: Grid.xxs),
-              Icon(
-                LucideIcons.bellOff,
-                size: 12,
-                color: context.colors.onSurfaceVariant,
+              SizedBox(
+                width: _kChannelIconSize,
+                child: Center(
+                  child: Icon(
+                    BuzzIcons.bellOff,
+                    size: 12,
+                    color: navigationMetadataForeground(context),
+                  ),
+                ),
               ),
-            ],
-            if (isUnread && !channel.isDm) ...[
-              const SizedBox(width: Grid.xxs),
-              _UnreadBadge(channelId: channel.id, count: unreadCount ?? 0),
             ],
             if (!channel.isMember && !channel.isDm)
               Padding(
@@ -119,205 +146,12 @@ class _ChannelTile extends ConsumerWidget {
   }
 
   void _showChannelActions(BuildContext context, WidgetRef ref) {
-    showModalBottomSheet<void>(
+    showChannelActionsSheet(
       context: context,
-      showDragHandle: true,
-      builder: (sheetContext) {
-        final sections = ref.read(channelSectionsProvider).store.sections
-          ..sort((a, b) => a.order.compareTo(b.order));
-        final isStarred =
-            ref
-                .read(channelStarsProvider)
-                .store
-                .channels[channel.id]
-                ?.starred ==
-            true;
-
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(
-              Grid.gutter,
-              0,
-              Grid.gutter,
-              Grid.xs,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ListTile(
-                  leading: Icon(
-                    isStarred ? LucideIcons.starOff : LucideIcons.star,
-                  ),
-                  title: Text(isStarred ? 'Unstar channel' : 'Star channel'),
-                  onTap: () {
-                    Navigator.of(sheetContext).pop();
-                    if (isStarred) {
-                      ref
-                          .read(channelStarsProvider.notifier)
-                          .unstarChannel(channel.id);
-                    } else {
-                      ref
-                          .read(channelStarsProvider.notifier)
-                          .starChannel(channel.id);
-                    }
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(LucideIcons.folderInput),
-                  title: const Text('Move to section'),
-                  onTap: () async {
-                    Navigator.of(sheetContext).pop();
-                    await _showMoveSectionSheet(context, ref, sections);
-                  },
-                ),
-                ListTile(
-                  leading: Icon(
-                    isMuted ? LucideIcons.bell : LucideIcons.bellOff,
-                  ),
-                  title: Text(isMuted ? 'Unmute channel' : 'Mute channel'),
-                  onTap: () {
-                    Navigator.of(sheetContext).pop();
-                    if (isMuted) {
-                      ref
-                          .read(channelMutesProvider.notifier)
-                          .unmuteChannel(channel.id);
-                    } else {
-                      ref
-                          .read(channelMutesProvider.notifier)
-                          .muteChannel(channel.id);
-                    }
-                  },
-                ),
-                ListTile(
-                  leading: Icon(
-                    isUnread ? LucideIcons.checkCheck : LucideIcons.circleDot,
-                  ),
-                  title: Text(isUnread ? 'Mark as read' : 'Mark as unread'),
-                  onTap: () {
-                    Navigator.of(sheetContext).pop();
-                    final ts = dateTimeToUnixSeconds(channel.lastMessageAt);
-                    if (ts != null) {
-                      if (isUnread) {
-                        onMarkRead?.call();
-                        ref
-                            .read(readStateProvider.notifier)
-                            .markContextRead(channel.id, ts);
-                        ref
-                            .read(channelsProvider.notifier)
-                            .clearObservedUnreadCoveredByRead(channel.id, ts);
-                      } else {
-                        ref
-                            .read(readStateProvider.notifier)
-                            .markContextUnread(channel.id);
-                      }
-                    }
-                  },
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _showMoveSectionSheet(
-    BuildContext context,
-    WidgetRef ref,
-    List<ChannelSection> sections,
-  ) async {
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheetContext) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(
-              Grid.gutter,
-              0,
-              Grid.gutter,
-              Grid.xs,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                for (final section in sections)
-                  ListTile(
-                    leading: Icon(
-                      LucideIcons.folder,
-                      color: sectionId == section.id
-                          ? sheetContext.colors.primary
-                          : null,
-                    ),
-                    title: Text(section.name),
-                    trailing: sectionId == section.id
-                        ? Icon(
-                            LucideIcons.check,
-                            color: sheetContext.colors.primary,
-                          )
-                        : null,
-                    onTap: () {
-                      Navigator.of(sheetContext).pop();
-                      ref
-                          .read(channelSectionsProvider.notifier)
-                          .assignChannel(channel.id, section.id);
-                    },
-                  ),
-                ListTile(
-                  leading: const Icon(LucideIcons.folderPlus),
-                  title: const Text('New section…'),
-                  onTap: () async {
-                    Navigator.of(sheetContext).pop();
-                    if (!context.mounted) return;
-                    final name = await showDialog<String>(
-                      context: context,
-                      builder: (_) => const _SectionNameDialog(
-                        title: 'New Section',
-                        confirmLabel: 'Create',
-                      ),
-                    );
-                    if (name != null && name.isNotEmpty) {
-                      ref
-                          .read(channelSectionsProvider.notifier)
-                          .createSection(name);
-                      // Assign after create — sections list has been mutated,
-                      // re-read to find the new section by name.
-                      final newSection = ref
-                          .read(channelSectionsProvider)
-                          .store
-                          .sections
-                          .lastWhere(
-                            (s) => s.name == name.trim(),
-                            orElse: () => const ChannelSection(
-                              id: '',
-                              name: '',
-                              order: -1,
-                            ),
-                          );
-                      if (newSection.id.isNotEmpty) {
-                        ref
-                            .read(channelSectionsProvider.notifier)
-                            .assignChannel(channel.id, newSection.id);
-                      }
-                    }
-                  },
-                ),
-                if (sectionId != null)
-                  ListTile(
-                    leading: const Icon(LucideIcons.folderMinus),
-                    title: const Text('Remove from section'),
-                    onTap: () {
-                      Navigator.of(sheetContext).pop();
-                      ref
-                          .read(channelSectionsProvider.notifier)
-                          .unassignChannel(channel.id);
-                    },
-                  ),
-              ],
-            ),
-          ),
-        );
-      },
+      channel: channel,
+      isUnread: isUnread,
+      onMarkRead: onMarkRead,
+      sectionId: sectionId,
     );
   }
 }
@@ -330,8 +164,6 @@ class _DmAvatar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final profiles = ref.watch(userCacheProvider);
-    final presenceMap = ref.watch(presenceCacheProvider);
     final normalizedCurrent = currentPubkey?.toLowerCase();
     final otherPubkeys = [
       for (final pk in channel.participantPubkeys)
@@ -343,8 +175,8 @@ class _DmAvatar extends ConsumerWidget {
 
     if (visiblePubkeys.length > 1) {
       return Container(
-        width: 22,
-        height: 22,
+        width: _kDmAvatarSize,
+        height: _kDmAvatarSize,
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: context.colors.surfaceContainerHighest,
@@ -354,7 +186,7 @@ class _DmAvatar extends ConsumerWidget {
         child: Text(
           '${visiblePubkeys.length}',
           style: context.textTheme.labelSmall?.copyWith(
-            fontSize: 10,
+            fontSize: 9,
             color: context.colors.onSurface,
             fontWeight: FontWeight.w600,
             height: 1,
@@ -364,7 +196,16 @@ class _DmAvatar extends ConsumerWidget {
     }
 
     final otherPubkey = visiblePubkeys.isNotEmpty ? visiblePubkeys.first : null;
-    final profile = otherPubkey != null ? profiles[otherPubkey] : null;
+    final profile = ref.watch(
+      userCacheProvider.select(
+        (profiles) => otherPubkey == null ? null : profiles[otherPubkey],
+      ),
+    );
+    final presence = ref.watch(
+      presentedPresenceProvider.select(
+        (presenceMap) => otherPubkey == null ? null : presenceMap[otherPubkey],
+      ),
+    );
 
     // Trigger fetches if not cached yet.
     if (otherPubkey != null) {
@@ -375,58 +216,57 @@ class _DmAvatar extends ConsumerWidget {
     }
 
     final avatarUrl = profile?.avatarUrl;
+    // Keyed to the hex public key when the counterpart is unnamed and the
+    // profile isn't cached — the compact-npub participant label would
+    // otherwise render `N` for every unnamed DM counterpart. Selection skips
+    // the current user like the row label does, so the initial always
+    // identifies the same counterpart the label names.
     final initial =
         profile?.initial ??
-        (channel.participants.isNotEmpty
-            ? channel.participants.first[0].toUpperCase()
-            : '?');
-    final presence = otherPubkey != null
-        ? (presenceMap[otherPubkey] ?? 'offline')
-        : 'offline';
-
+        dmAvatarInitial(channel, currentPubkey: currentPubkey);
     return SizedBox(
-      width: 22,
-      height: 22,
+      width: _kDmAvatarSize,
+      height: _kDmAvatarSize,
       child: Stack(
         clipBehavior: Clip.none,
         children: [
-          CircleAvatar(
-            radius: 10,
-            backgroundColor: context.colors.primaryContainer,
-            backgroundImage: avatarUrl != null ? NetworkImage(avatarUrl) : null,
-            child: avatarUrl == null
-                ? Text(
-                    initial,
-                    style: context.textTheme.labelSmall?.copyWith(
-                      fontSize: 9,
-                      color: context.colors.onPrimaryContainer,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  )
-                : null,
+          AvatarImage(
+            imageUrl: avatarUrl,
+            radius: _kDmAvatarSize / 2,
+            backgroundColor: context.controlSurface,
+            fallback: Text(
+              initial,
+              style: context.textTheme.labelSmall?.copyWith(
+                fontSize: 9,
+                color: context.colors.onPrimaryContainer,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            isAgent: profile?.isAgent == true,
           ),
-          Positioned(
-            right: -1,
-            bottom: -1,
-            child: Container(
-              width: 9,
-              height: 9,
-              decoration: BoxDecoration(
-                color: _presenceColor(context, presence),
-                shape: BoxShape.circle,
-                border: Border.all(
-                  color: context.theme.scaffoldBackgroundColor,
-                  width: 1.5,
+          if (presence != null)
+            Positioned(
+              right: -1,
+              bottom: -1,
+              child: Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: _presenceColor(context, presence),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: context.theme.scaffoldBackgroundColor,
+                    width: 1.5,
+                  ),
                 ),
               ),
             ),
-          ),
         ],
       ),
     );
   }
 
-  Color _presenceColor(BuildContext context, String presence) {
+  Color _presenceColor(BuildContext context, String? presence) {
     return switch (presence) {
       'online' => context.appColors.success,
       'away' => context.appColors.warning,

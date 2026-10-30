@@ -1,9 +1,12 @@
+pub mod agent_management;
 mod client;
 mod commands;
 mod error;
+mod help_tree;
+mod links;
 mod validate;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use client::BuzzClient;
 use error::CliError;
 use nostr::Keys;
@@ -24,7 +27,19 @@ where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    // Install ring as the process-level rustls CryptoProvider. Required because the
+    // release workflow builds all binaries in one cargo invocation, which unifies
+    // features across the workspace and enables *both* ring (from buzz-acp/buzz-dev-mcp)
+    // and aws-lc-rs (from reqwest's rustls feature via hyper-rustls). With both on,
+    // rustls cannot auto-select a provider, and any code that reaches
+    // ClientConfig::builder() — specifically the WSS path in publish_ephemeral_event
+    // used by `agents draft-create`, `agents draft-update`, and `users set-presence`
+    // — panics at rustls crypto/mod.rs. The `let _ =` swallow is intentional: when
+    // buzz-dev-mcp delegates to run_from_args, it has already installed ring; the
+    // double-install returns Err and is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cli = match parse_args(args) {
         Ok(cli) => cli,
         Err(e) => {
             if e.use_stderr() {
@@ -46,6 +61,61 @@ where
     }
 }
 
+/// Root help layout. Identical to clap's default except that `{subcommands}`
+/// is dropped and the command tree arrives through `{after-help}` instead, so
+/// the group list is not printed twice. `{options}` and `{subcommands}` emit no
+/// heading of their own — clap writes those from `write_all_args`, which this
+/// template bypasses — so the headings are spelled out here.
+const ROOT_HELP_TEMPLATE: &str = "\
+{before-help}{about-with-newline}
+{usage-heading} {usage}{after-help}
+
+Options:
+{options}";
+
+/// The root command with the agent-friendly command tree installed.
+///
+/// clap picks `after_long_help` for `--help` and falls back to `after_help`
+/// for `-h`, which is what gives the two depths: `-h` keeps the group-level
+/// summary, `--help` shows every subcommand under every group.
+fn build_command() -> clap::Command {
+    let cmd = Cli::command();
+    let groups = help_tree::render(&cmd, 1);
+    let full = help_tree::render(&cmd, usize::MAX);
+    cmd.help_template(ROOT_HELP_TEMPLATE)
+        .after_help(format!("Commands:\n{groups}"))
+        .after_long_help(format!("Commands:\n{full}"))
+}
+
+fn parse_args<I, S>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString> + Clone,
+{
+    let matches = build_command().try_get_matches_from(args)?;
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    if matches.value_source("format") == Some(clap::parser::ValueSource::DefaultValue) {
+        cli.format = env_output_format(std::env::var_os("BUZZ_OUTPUT_FORMAT").as_deref());
+    }
+    Ok(cli)
+}
+
+/// `BUZZ_OUTPUT_FORMAT` only picks the default `--format`, so an empty or
+/// unknown value (e.g. one a newer harness sets) falls back to `json` rather
+/// than failing every command, writes included.
+fn env_output_format(value: Option<&std::ffi::OsStr>) -> OutputFormat {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return OutputFormat::default();
+    };
+    value
+        .to_str()
+        .and_then(|value| OutputFormat::from_str(value, false).ok())
+        .unwrap_or_else(|| {
+            eprintln!("warning: ignoring unsupported BUZZ_OUTPUT_FORMAT={value:?}; using json");
+            OutputFormat::default()
+        })
+}
+
 #[derive(Parser)]
 #[command(
     name = "buzz",
@@ -57,6 +127,7 @@ Configuration (flags override env vars):
   BUZZ_RELAY_URL     Relay base URL        [default: http://localhost:3000]
   BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required]
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
+  BUZZ_OUTPUT_FORMAT Default --format; unknown values fall back to json  [optional]
 
 The 'pack' subcommand runs locally and does not require a relay connection.
 
@@ -69,14 +140,16 @@ struct Cli {
     relay: String,
 
     /// Nostr private key (hex or nsec). This is the CLI's identity.
-    #[arg(long, env = "BUZZ_PRIVATE_KEY")]
+    #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
     private_key: Option<String>,
 
     /// NIP-OA auth tag JSON (owner attestation). Injected into every signed event.
-    #[arg(long, env = "BUZZ_AUTH_TAG")]
+    #[arg(long, env = "BUZZ_AUTH_TAG", hide_env_values = true)]
     auth_tag: Option<String>,
 
-    /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
+    /// Output format: 'json' (default, full fields), 'compact' (reduced fields),
+    /// or 'agent' (event reads without signature material). Defaults to
+    /// `BUZZ_OUTPUT_FORMAT` when that names a known format.
     #[arg(long, value_enum, default_value = "json")]
     format: OutputFormat,
 
@@ -114,6 +187,27 @@ impl std::fmt::Display for ChannelVisibility {
         match self {
             Self::Open => write!(f, "open"),
             Self::Private => write!(f, "private"),
+        }
+    }
+}
+
+/// The role a new person gets in a channel (`join_role`).
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ChannelJoinRoleArg {
+    /// New people become members (default).
+    #[value(name = "member")]
+    Member,
+    /// New people become guests, who can read but not write. On an open
+    /// channel this makes an announce channel.
+    #[value(name = "guest")]
+    Guest,
+}
+
+impl From<ChannelJoinRoleArg> for buzz_sdk::ChannelJoinRole {
+    fn from(value: ChannelJoinRoleArg) -> Self {
+        match value {
+            ChannelJoinRoleArg::Member => Self::Member,
+            ChannelJoinRoleArg::Guest => Self::Guest,
         }
     }
 }
@@ -156,10 +250,19 @@ pub enum OutputFormat {
     /// Reduced fields for agent scanning
     #[value(name = "compact")]
     Compact,
+    /// Event reads drop signature material (`sig`, NIP-OA `auth` conditions and
+    /// signature) and fold NIP-10 thread markers into `reply_to`/`thread_root`;
+    /// other reads match `json`.
+    /// Default for harness-managed agents.
+    #[value(name = "agent")]
+    Agent,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Draft owner-reviewed agent creation and updates
+    #[command(subcommand)]
+    Agents(AgentsCmd),
     /// Send, read, search, and manage messages
     #[command(subcommand)]
     Messages(MessagesCmd),
@@ -175,6 +278,9 @@ enum Cmd {
     /// Manage your custom emoji set (workspace palette is the union of all members' sets)
     #[command(subcommand)]
     Emoji(EmojiCmd),
+    /// Search and share GIFs via the relay's KLIPY proxy
+    #[command(subcommand)]
+    Gifs(GifsCmd),
     /// List, open, and manage direct messages
     #[command(subcommand)]
     Dms(DmsCmd),
@@ -196,6 +302,9 @@ enum Cmd {
     /// Announce and discover git repositories (NIP-34)
     #[command(subcommand)]
     Repos(ReposCmd),
+    /// Create and manage multi-repo projects (NIP-MP)
+    #[command(subcommand)]
+    Projects(ProjectsCmd),
     /// Send, get, list, and set status on git patches (NIP-34)
     #[command(subcommand)]
     Patches(PatchesCmd),
@@ -205,6 +314,9 @@ enum Cmd {
     /// Open, update, list, and set status on git pull requests (NIP-34)
     #[command(subcommand)]
     Pr(PrCmd),
+    /// Upload and download relay Blossom media
+    #[command(subcommand)]
+    Media(MediaCmd),
     /// Upload files to the relay's Blossom store
     #[command(subcommand)]
     Upload(UploadCmd),
@@ -217,6 +329,131 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum RespondToArg {
+    #[value(name = "owner-only")]
+    OwnerOnly,
+    #[value(name = "anyone")]
+    Anyone,
+}
+
+impl RespondToArg {
+    fn to_wire(self) -> String {
+        match self {
+            Self::OwnerOnly => "owner-only",
+            Self::Anyone => "anyone",
+        }
+        .to_string()
+    }
+}
+
+#[derive(Subcommand)]
+pub enum AgentsCmd {
+    /// Open a prefilled create-agent form in the owner's Buzz Desktop
+    DraftCreate {
+        /// Current channel UUID; the new agent is added here after save
+        #[arg(long)]
+        channel: String,
+        /// Proposed agent name
+        #[arg(long)]
+        display_name: String,
+        /// Proposed instructions; use '-' to read from stdin
+        #[arg(long)]
+        system_prompt: String,
+    },
+    /// Open a prefilled edit-agent form in the owner's Buzz Desktop
+    DraftUpdate {
+        /// Current channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Current name of the personal agent to update
+        #[arg(long)]
+        agent_name: String,
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Replacement instructions; use '-' to read from stdin
+        #[arg(long)]
+        system_prompt: Option<String>,
+        #[arg(long)]
+        runtime: Option<String>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_enum)]
+        respond_to: Option<RespondToArg>,
+    },
+    /// Submit a NIP-IA archive request for an identity (kind 9035)
+    #[command(
+        after_help = "Auth flow: when target != signer, the CLI fetches the target's kind:0 and \
+attaches its owner-auth tag. On extraction failure it retries once (common cause: profile \
+republish in progress). If the retry also fails, the command exits with an error — use \
+--admin to bypass this guard when your key is a relay admin.\n\n\
+Suggested --reason codes (unknown values are allowed): rotated, retired, \
+bot-rebuilt, left-organization, spam\n\n\
+Archiving a third-party identity is a human owner/admin action: an agent \
+running under BUZZ_AUTH_TAG signs as itself, so it can only ever satisfy \
+the self path (target == signer) — not the owner-of-agent path for another \
+identity.\n\n\
+Examples:\n  \
+buzz agents archive <PUBKEY> --reason retired\n  \
+buzz agents archive <PUBKEY> --reason bot-rebuilt --replaced-by <NEW_PUBKEY>"
+    )]
+    Archive {
+        /// Target identity pubkey (hex)
+        target_pubkey: String,
+        /// Machine-readable reason code, max 64 UTF-8 bytes
+        #[arg(long)]
+        reason: Option<String>,
+        /// Rotation pointer pubkey (hex); must differ from the target
+        #[arg(long)]
+        replaced_by: Option<String>,
+        /// Optional human-readable note (not parsed for authorization)
+        #[arg(long, default_value = "")]
+        content: String,
+        /// Allow sending without owner-auth attestation after extraction fails
+        /// (relay-admin path). Use only when your key is a relay admin; ordinary
+        /// owners do not need this flag. Without it, auth-extraction failure after
+        /// one automatic retry is a hard error rather than a silent bare send.
+        #[arg(long, default_value_t = false)]
+        admin: bool,
+    },
+    /// Submit a NIP-IA unarchive request for an identity (kind 9036)
+    #[command(
+        after_help = "Auth flow: same as `archive` — retries kind:0 fetch once on \
+extraction failure, then exits with an error if still unresolvable. Use --admin to bypass \
+for relay-admin callers.\n\n\
+Examples:\n  \
+buzz agents unarchive <PUBKEY> --reason returned"
+    )]
+    Unarchive {
+        /// Target identity pubkey (hex)
+        target_pubkey: String,
+        /// Machine-readable reason code, max 64 UTF-8 bytes
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional human-readable note (not parsed for authorization)
+        #[arg(long, default_value = "")]
+        content: String,
+        /// Allow sending without owner-auth attestation after extraction fails
+        /// (relay-admin path). Use only when your key is a relay admin; ordinary
+        /// owners do not need this flag. Without it, auth-extraction failure after
+        /// one automatic retry is a hard error rather than a silent bare send.
+        #[arg(long, default_value_t = false)]
+        admin: bool,
+    },
+    /// Read the relay's current NIP-IA archive snapshot (kind 13535)
+    #[command(
+        after_help = "Verifies the snapshot's NIP-11 `self` authorship, event id, signature, \
+and NIP-70 `-` protection tag before trusting it. Any trust failure is a \
+nonzero-exit error, never a false-empty success — this command's whole \
+purpose is verification.\n\n\
+Examples:\n  \
+buzz agents archived"
+    )]
+    Archived,
 }
 
 #[derive(Subcommand)]
@@ -244,6 +481,9 @@ pub enum MessagesCmd {
         /// Attach file(s) — uploads and includes as imeta tags
         #[arg(long = "file")]
         files: Vec<String>,
+        /// Pubkey to mention (hex or npub; repeatable). Supplying any explicit identity permits unresolved or ambiguous @Name text as presentation-only; uniquely resolved member names still notify.
+        #[arg(long = "mention")]
+        mentions: Vec<String>,
     },
     /// Send a code diff / patch to a channel
     SendDiff {
@@ -329,14 +569,20 @@ pub enum MessagesCmd {
         #[arg(long)]
         kinds: Option<String>,
     },
-    /// Get a message thread (replies to a root message)
+    /// Get the containing thread for a message or Buzz message link
+    #[command(
+        after_help = "Examples:\n  buzz messages thread --channel <UUID> --event <EVENT_ID>\n  buzz messages thread --link 'buzz://message?channel=<UUID>&id=<EVENT_ID>&thread=<ROOT_ID>'"
+    )]
     Thread {
-        /// Channel UUID
-        #[arg(long)]
-        channel: String,
-        /// Root message event ID (64-char hex)
-        #[arg(long)]
-        event: String,
+        /// Channel UUID; required unless --link is supplied
+        #[arg(long, required_unless_present = "link", conflicts_with = "link")]
+        channel: Option<String>,
+        /// Message event ID (64-char hex); required unless --link is supplied
+        #[arg(long, required_unless_present = "link", conflicts_with = "link")]
+        event: Option<String>,
+        /// Canonical buzz://message deep link; uses the configured relay and identity
+        #[arg(long, conflicts_with_all = ["channel", "event"])]
+        link: Option<String>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
@@ -416,27 +662,47 @@ pub enum ChannelsCmd {
     },
     /// Create a new channel
     #[command(
-        after_help = "Examples:\n  buzz channels create --name general --type stream --visibility open\n  buzz channels create --name design --type forum --visibility open --description \"Design discussions\"\n  buzz channels create --name standup --type stream --visibility open --ttl 3600  # ephemeral, archived after 1h idle"
+        after_help = "Examples:\n  buzz channels create --name general --type stream --visibility open\n  buzz channels create --name design --type forum --visibility open --description \"Design discussions\"\n  buzz channels create --name standup --type stream --visibility open --ttl 3600  # ephemeral, archived after 1h idle\n  buzz channels create --name project-x --template \"Buzz Team\"  # type/visibility/canvas/roster from the template; explicit flags override\n  buzz channels create --name notes --type stream --visibility private --unlisted  # never listed, even after it is made open"
     )]
     Create {
         /// Channel name
         #[arg(long)]
         name: String,
-        /// Channel type
-        #[arg(long = "type", value_enum)]
-        channel_type: ChannelType,
-        /// Channel visibility
-        #[arg(long, value_enum)]
-        visibility: ChannelVisibility,
+        /// Channel type. Required unless --template supplies one.
+        #[arg(long = "type", value_enum, required_unless_present = "template")]
+        channel_type: Option<ChannelType>,
+        /// Channel visibility. Required unless --template supplies one.
+        #[arg(long, value_enum, required_unless_present = "template")]
+        visibility: Option<ChannelVisibility>,
         /// Channel description
         #[arg(long)]
         description: Option<String>,
-        /// Make the channel ephemeral: lifetime in seconds. The relay archives
-        /// it once this many seconds pass without a new message.
+        /// Make the channel temporary/ephemeral: idle lifetime in seconds. If
+        /// omitted, the channel is permanent. The relay archives it once this
+        /// many seconds pass without a new message.
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<i64>,
+        /// Create the channel unlisted: left out of channel lists for people
+        /// who are not members. Anyone can still read and join an unlisted
+        /// open channel by its id. Change it later with `channels update
+        /// --unlisted`. Refused if the relay does not advertise
+        /// `buzz-unlisted-channels`.
+        #[arg(long)]
+        unlisted: bool,
+        /// Apply a desktop-local channel template by name (case-insensitive):
+        /// supplies default type/visibility/description/canvas, and resolves
+        /// its agent roster against the relay to add as members.
+        #[arg(long)]
+        template: Option<String>,
+        /// Override the channel-templates.json path (default: the desktop
+        /// app's prod app-data dir). Mainly for the dev store or testing.
+        #[arg(long, value_name = "PATH")]
+        templates_file: Option<String>,
     },
-    /// Update channel name, description, or ephemeral TTL
+    /// Update channel name, description, visibility, join role, unlisted, or ephemeral TTL
+    #[command(
+        after_help = "Examples:\n  buzz channels update --channel <uuid> --name general\n  buzz channels update --channel <uuid> --visibility open\n  buzz channels update --channel <uuid> --visibility private\n  buzz channels update --channel <uuid> --join-role guest\n  buzz channels update --channel <uuid> --visibility open --unlisted true"
+    )]
     Update {
         /// Channel UUID
         #[arg(long)]
@@ -447,6 +713,9 @@ pub enum ChannelsCmd {
         /// New channel description
         #[arg(long)]
         description: Option<String>,
+        /// New channel visibility
+        #[arg(long, value_enum)]
+        visibility: Option<ChannelVisibility>,
         /// Make the channel ephemeral (or change its lifetime): seconds until
         /// the relay archives it after the last message. Conflicts with --no-ttl.
         #[arg(long, value_name = "SECONDS", conflicts_with = "no_ttl")]
@@ -454,6 +723,18 @@ pub enum ChannelsCmd {
         /// Clear an existing TTL, making the channel permanent.
         #[arg(long)]
         no_ttl: bool,
+        /// The role a new person gets when nobody picks one. `guest` on an
+        /// open channel makes an announce channel: people who join can read
+        /// but not write. Does not change existing members. Owner/admin only.
+        #[arg(long, value_enum)]
+        join_role: Option<ChannelJoinRoleArg>,
+        /// Leave the channel out of channel lists for people who are not
+        /// members (`true`), or list it again (`false`). Anyone can still read
+        /// and join an unlisted open channel by its id. Matters only while the
+        /// channel is open. Owner/admin only. `true` is refused if the relay
+        /// does not advertise `buzz-unlisted-channels`.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        unlisted: Option<bool>,
     },
     /// Set the channel topic
     Topic {
@@ -548,6 +829,10 @@ pub enum CanvasCmd {
         /// Channel UUID
         #[arg(long)]
         channel: String,
+        /// Fetch a specific historical revision by event ID (64-char hex);
+        /// defaults to the current head
+        #[arg(long)]
+        revision: Option<String>,
     },
     /// Set (replace) the canvas document for a channel
     Set {
@@ -557,6 +842,24 @@ pub enum CanvasCmd {
         /// Canvas content (markdown; use '-' to read from stdin)
         #[arg(long)]
         content: String,
+    },
+    /// List canvas revision history for a channel, newest first
+    History {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Maximum number of revisions to return (1–10000)
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        limit: u32,
+    },
+    /// Restore the canvas to a previous revision by re-publishing its content
+    Restore {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Revision event ID to restore (64-char hex)
+        #[arg(long)]
+        revision: String,
     },
 }
 
@@ -634,6 +937,31 @@ pub enum EmojiCmd {
 }
 
 #[derive(Subcommand)]
+pub enum GifsCmd {
+    /// Search or browse trending GIFs via the relay's KLIPY proxy.
+    ///
+    /// Omitting --query returns trending GIFs. The output is a JSON array of
+    /// GIF objects; paste the `cdn_url` field directly into
+    /// `buzz messages send --content` to share a GIF.
+    Search {
+        /// Search text; omit or leave empty for trending
+        #[arg(long)]
+        query: Option<String>,
+        /// BCP 47 locale for provider results (default: $LANG or en_US)
+        #[arg(long)]
+        locale: Option<String>,
+    },
+    /// Report a selected GIF to the provider so it enters your Recents.
+    ///
+    /// The slug is the provider identifier in the search result objects.
+    Share {
+        /// Provider GIF slug from a search result
+        #[arg(long)]
+        slug: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum DmsCmd {
     /// List direct message conversations
     List {
@@ -674,6 +1002,9 @@ pub enum UsersCmd {
         /// Search by display name (case-insensitive substring match)
         #[arg(long = "name")]
         name: Option<String>,
+        /// Scope an exact-name agent lookup to its owner (`me`, hex, or npub)
+        #[arg(long = "owner", requires = "name")]
+        owner: Option<String>,
     },
     /// Update the current identity's profile
     #[command(name = "set-profile")]
@@ -703,6 +1034,19 @@ pub enum UsersCmd {
         /// Presence status
         #[arg(long, value_enum)]
         status: PresenceStatus,
+    },
+    /// Set your user status (NIP-38 kind:30315 — the "status" line on your profile)
+    #[command(name = "set-status")]
+    SetStatus {
+        /// Status text (required unless --clear)
+        #[arg(long, required_unless_present = "clear")]
+        text: Option<String>,
+        /// Optional emoji shown before the status text
+        #[arg(long)]
+        emoji: Option<String>,
+        /// Remove your status entirely
+        #[arg(long, conflicts_with_all = ["text", "emoji"])]
+        clear: bool,
     },
 }
 
@@ -979,6 +1323,11 @@ pub enum ReposCmd {
         /// Preferred Nostr relay(s) for repo discovery — can be specified multiple times
         #[arg(long = "nostr-relay")]
         relays: Vec<String>,
+        /// Channel UUID to bind the repo to. The `buzz-channel` tag is the
+        /// git ACL: without it the relay 404s every clone/fetch/push until
+        /// the author runs `buzz repos bind` (issue #3527).
+        #[arg(long)]
+        channel: Option<String>,
     },
     /// Get a repository announcement
     Get {
@@ -997,6 +1346,246 @@ pub enum ReposCmd {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// Bind (or rebind) one of your repositories to a channel.
+    ///
+    /// The `buzz-channel` tag on the announcement is the git ACL: the relay
+    /// authorizes clone/fetch/push by membership in the bound channel. A
+    /// repo announced without it (e.g. by a vanilla NIP-34 client) returns
+    /// 404 for everyone until its author binds it here.
+    Bind {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Channel UUID to bind. Replaces any existing binding.
+        #[arg(long)]
+        channel: String,
+    },
+    /// Manage branch and tag protection rules on one of your repositories.
+    #[command(subcommand)]
+    Protect(ReposProtectCmd),
+    /// Inspect or change the relay-hosted repository's default branch.
+    #[command(subcommand)]
+    DefaultBranch(ReposDefaultBranchCmd),
+}
+
+/// Commands for the authoritative Git default branch, not announcement metadata.
+#[derive(Subcommand)]
+pub enum ReposDefaultBranchCmd {
+    /// Read the default branch and observed manifest version.
+    Get {
+        /// Repository identifier.
+        #[arg(long)]
+        id: String,
+        /// Repository owner (64-char hex). Defaults to your signing identity.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Select an existing branch without moving or deleting any refs.
+    Set {
+        /// Repository identifier.
+        #[arg(long)]
+        id: String,
+        /// Repository owner (64-char hex). Defaults to your signing identity.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Short branch name, e.g. main or release/v1 (not refs/heads/main).
+        #[arg(long)]
+        branch: String,
+        /// Manifest digest returned by get. Omit to read it before updating.
+        #[arg(long)]
+        expected_manifest: Option<String>,
+    },
+}
+
+/// Commands for inspecting and changing repository protection rules.
+#[derive(Subcommand)]
+pub enum ReposProtectCmd {
+    /// List the repository's protection rules.
+    List {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+    },
+    /// Create or replace the rule for an exact ref pattern.
+    Set {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Full ref pattern, such as refs/heads/main or refs/heads/*.
+        #[arg(long = "ref")]
+        ref_pattern: String,
+        /// Minimum role allowed to push.
+        #[arg(long)]
+        push: Option<RepoPushRole>,
+        /// Reject non-fast-forward updates.
+        #[arg(long, default_value_t = false)]
+        no_force_push: bool,
+        /// Reject deletion of matching refs.
+        #[arg(long, default_value_t = false)]
+        no_delete: bool,
+        /// Require the NIP-34 patch workflow instead of direct pushes.
+        #[arg(long, default_value_t = false)]
+        require_patch: bool,
+    },
+    /// Remove every protection rule for an exact ref pattern.
+    Remove {
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        id: String,
+        /// Full ref pattern to remove.
+        #[arg(long = "ref")]
+        ref_pattern: String,
+    },
+}
+
+/// Minimum channel role accepted by a repository push rule.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum RepoPushRole {
+    /// Repository owner only.
+    Owner,
+    /// Repository owner or channel admin.
+    Admin,
+    /// Any channel member.
+    Member,
+}
+
+/// Visibility of a multi-repo project listing.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ProjectVisibility {
+    /// Project appears in public listings (default).
+    Listed,
+    /// Project is hidden from public listings.
+    Unlisted,
+}
+
+impl ProjectVisibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectVisibility::Listed => "listed",
+            ProjectVisibility::Unlisted => "unlisted",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum ProjectsCmd {
+    /// Create a new multi-repo project (NIP-MP kind:30621)
+    ///
+    /// With no `--repo`, creates a default repository bound to `--channel`.
+    /// Fails with Conflict if the project already exists.
+    Create {
+        /// Project identifier (slug), up to 1024 bytes
+        slug: String,
+        /// Member repository coordinate: bare Buzz repo id (e.g. `buzz`) or full
+        /// `30617:<owner-hex>:<repo-d>` for cross-owner or colon-bearing repo ids.
+        /// Omit to create a default repository named after the slug (requires `--channel`).
+        #[arg(long = "repo")]
+        repo: Vec<String>,
+        /// Display name (≤256 bytes)
+        #[arg(long)]
+        name: Option<String>,
+        /// Description (≤2048 bytes)
+        #[arg(long)]
+        description: Option<String>,
+        /// Associated Buzz channel UUID
+        #[arg(long)]
+        channel: Option<String>,
+        /// Visibility: `listed` (default) or `unlisted`
+        #[arg(long)]
+        visibility: Option<ProjectVisibility>,
+    },
+    /// Get a project by slug
+    Get {
+        /// Project slug
+        slug: String,
+        /// Owner pubkey (64-char hex). Defaults to the current identity.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// List projects
+    List {
+        /// Owner pubkey (64-char hex). Defaults to the current identity.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Maximum number of results
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Add one or more member repositories to a project
+    #[command(name = "add-repo")]
+    AddRepo {
+        /// Project slug
+        slug: String,
+        /// Member repository coordinate (bare id or full `30617:<owner-hex>:<repo-d>`)
+        #[arg(long = "repo", required = true)]
+        repo: Vec<String>,
+    },
+    /// Draft a project-linked channel for owner review in Buzz Desktop
+    #[command(name = "add-channel")]
+    AddChannel {
+        /// Project home channel UUID from the current ACP [Context]
+        #[arg(long)]
+        home_channel: String,
+        /// New channel name
+        #[arg(long)]
+        name: String,
+        /// Optional channel description
+        #[arg(long)]
+        description: Option<String>,
+        /// Channel visibility
+        #[arg(long, value_enum, default_value = "open")]
+        visibility: ChannelVisibility,
+        /// Optional temporary-channel lifetime in seconds
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// Optional Desktop channel-template name
+        #[arg(long)]
+        template: Option<String>,
+    },
+    /// Remove one or more member repositories from a project
+    #[command(name = "remove-repo")]
+    RemoveRepo {
+        /// Project slug
+        slug: String,
+        /// Member repository coordinate to remove (bare id or full `30617:<owner-hex>:<repo-d>`)
+        #[arg(long = "repo", required = true)]
+        repo: Vec<String>,
+    },
+    /// Update project metadata (at least one setter or clearer required)
+    #[command(group = clap::ArgGroup::new("mutation").required(true).multiple(true))]
+    Update {
+        /// Project slug
+        slug: String,
+        /// Set the display name
+        #[arg(long, group = "mutation")]
+        name: Option<String>,
+        /// Remove the display name
+        #[arg(long, group = "mutation", conflicts_with = "name")]
+        clear_name: bool,
+        /// Set the description
+        #[arg(long, group = "mutation")]
+        description: Option<String>,
+        /// Remove the description
+        #[arg(long, group = "mutation", conflicts_with = "description")]
+        clear_description: bool,
+        /// Set the associated Buzz channel UUID
+        #[arg(long, group = "mutation")]
+        channel: Option<String>,
+        /// Remove the associated channel
+        #[arg(long, group = "mutation", conflicts_with = "channel")]
+        clear_channel: bool,
+        /// Set visibility: `listed` or `unlisted`
+        #[arg(long, group = "mutation")]
+        visibility: Option<ProjectVisibility>,
+        /// Remove the visibility tag (absence defaults to `listed`)
+        #[arg(long, group = "mutation", conflicts_with = "visibility")]
+        clear_visibility: bool,
+    },
+    /// Delete a project (head-based tombstone; verified after submit)
+    Delete {
+        /// Project slug
+        slug: String,
     },
 }
 
@@ -1149,6 +1738,9 @@ pub enum PrCmd {
         /// Additional recipient pubkey(s) — can be specified multiple times
         #[arg(long = "to")]
         to: Vec<String>,
+        /// Channel where this pull request originated (NIP-29 h-tag)
+        #[arg(long)]
+        channel: Option<String>,
         /// Root patch event id this PR revises
         #[arg(long)]
         revision_of: Option<String>,
@@ -1251,12 +1843,18 @@ pub enum PrCmd {
 pub enum IssuesCmd {
     /// Create a git issue (NIP-34 kind:1621)
     Create {
-        /// Repo owner pubkey (64-char hex)
+        /// Repo owner pubkey (64-char hex). Optional when `--channel` (or
+        /// `BUZZ_GIT_ORIGIN_CHANNEL_ID`) names a project home.
         #[arg(long)]
-        repo_owner: String,
-        /// Repo identifier (d-tag)
+        repo_owner: Option<String>,
+        /// Repo identifier (d-tag). Optional when `--channel` (or
+        /// `BUZZ_GIT_ORIGIN_CHANNEL_ID`) names a project home.
         #[arg(long)]
-        repo_id: String,
+        repo_id: Option<String>,
+        /// Project home channel. Infers the repository, creating one bound to
+        /// this project when none exists. Defaults to `BUZZ_GIT_ORIGIN_CHANNEL_ID`.
+        #[arg(long)]
+        channel: Option<String>,
         /// Issue title
         #[arg(long, alias = "subject")]
         title: String,
@@ -1320,6 +1918,47 @@ pub enum IssuesCmd {
         #[arg(long = "to")]
         to: Vec<String>,
     },
+    /// Assign an issue to one or more people or agents. Only assignments
+    /// signed by the issue author or repo owner are trusted by clients;
+    /// anyone may assign themselves (sole assignee = your own pubkey).
+    Assign {
+        /// Issue event id (64-char hex)
+        #[arg(long)]
+        issue: String,
+        /// Repo owner pubkey (64-char hex)
+        #[arg(long)]
+        repo_owner: String,
+        /// Repo identifier (d-tag)
+        #[arg(long)]
+        repo_id: String,
+        /// Assignee pubkey (64-char hex) — can be specified multiple times
+        #[arg(long = "assignee", required = true)]
+        assignee: Vec<String>,
+        /// Human-readable assignee name(s) for the note body, e.g. "Thomas".
+        /// Defaults to the truncated assignee pubkeys.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove one or more assignees from an issue. Issue authors and repo
+    /// owners may remove anyone; other users may remove only themselves.
+    Unassign {
+        /// Issue event id (64-char hex)
+        #[arg(long)]
+        issue: String,
+        /// Repo owner pubkey (64-char hex)
+        #[arg(long)]
+        repo_owner: String,
+        /// Repo identifier (d-tag)
+        #[arg(long)]
+        repo_id: String,
+        /// Assignee pubkey to remove — can be specified multiple times
+        #[arg(long = "assignee", required = true)]
+        assignee: Vec<String>,
+        /// Human-readable assignee name(s) for the note body.
+        /// Defaults to the truncated assignee pubkeys.
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1329,6 +1968,18 @@ pub enum UploadCmd {
         /// Path to the file to upload
         #[arg(long)]
         file: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MediaCmd {
+    /// Download relay media with Blossom get auth
+    Get {
+        /// Relay media URL or sha256[.ext] path segment
+        input: String,
+        /// Output path. Omit or use '-' to write raw bytes to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -1526,6 +2177,41 @@ pub enum ModerationCmd {
     },
 }
 
+/// Normalize hand-authored `BUZZ_AUTH_TAG` input to strict JSON.
+///
+/// `.env` files and shell exports sometimes carry the tag in the unquoted
+/// shorthand `[auth,<hex>,<conditions>,<hex>]` (quotes dropped by hand).
+/// When the input is not valid JSON but is bracket-delimited, rewrite it as
+/// a JSON array of the comma-separated fields (an empty field `,,` becomes
+/// `""`, matching the canonical form `["auth","hex","","hex"]`).
+///
+/// This is presentation-layer leniency at the configuration edge only: the
+/// output is always fed through the SDK's strict `parse_auth_tag` /
+/// `verify_auth_tag`, which enforce structure, hex, the conditions grammar,
+/// and the BIP-340 signature. Inputs that are already valid JSON — or not
+/// recognizable as the shorthand — are returned unchanged so the strict
+/// parser reports the error on the original bytes.
+fn normalize_auth_tag_input(input: &str) -> String {
+    let trimmed = input.trim();
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return trimmed.to_owned();
+    }
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let fields: Vec<&str> = trimmed[1..trimmed.len() - 1]
+            .split(',')
+            .map(str::trim)
+            .collect();
+        // Only a plausible 4-field auth tag is rewritten; anything else is
+        // passed through untouched for the strict parser to reject with an
+        // error that references the caller's original input.
+        if fields.len() == 4 && !fields.iter().any(|f| f.contains('"')) {
+            // serde_json cannot fail serializing a Vec<&str>.
+            return serde_json::to_string(&fields).expect("string array serializes");
+        }
+    }
+    trimmed.to_owned()
+}
+
 async fn run(cli: Cli) -> Result<(), CliError> {
     let relay_url = client::normalize_relay_url(&cli.relay);
 
@@ -1546,17 +2232,28 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
 
     // NIP-OA: parse and verify the auth tag if provided.
+    //
+    // `BUZZ_AUTH_TAG` is hand-authored configuration, so the unquoted raw
+    // shorthand `[auth,hex,,hex]` is normalized to JSON here — at this input
+    // edge only. The SDK grammar and the `x-auth-tag` wire format stay strict
+    // JSON; all validation and signature verification happen on the strict
+    // path below, unchanged.
     let (auth_tag, auth_tag_json) = match cli.auth_tag {
-        Some(ref json) if !json.is_empty() => {
-            let tag = buzz_sdk::nip_oa::parse_auth_tag(json)
+        Some(ref input) if !input.is_empty() => {
+            let json = normalize_auth_tag_input(input);
+            let tag = buzz_sdk::nip_oa::parse_auth_tag(&json)
                 .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG is malformed: {e}")))?;
-            buzz_sdk::nip_oa::verify_auth_tag(json, &keys.public_key()).map_err(|e| {
+            buzz_sdk::nip_oa::verify_auth_tag(&json, &keys.public_key()).map_err(|e| {
                 CliError::Auth(format!(
                     "BUZZ_AUTH_TAG verification failed for pubkey {}: {e}",
                     keys.public_key().to_hex()
                 ))
             })?;
-            (Some(tag), Some(json.clone()))
+            // Canonical wire form derives from the parsed-and-verified tag
+            // (same shape as buzz-acp's RestClient), never from raw input.
+            let canonical = serde_json::to_string(tag.as_slice())
+                .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG serialization failed: {e}")))?;
+            (Some(tag), Some(canonical))
         }
         _ => (None, None),
     };
@@ -1564,11 +2261,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
 
     match cli.command {
+        Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,
         Cmd::Emoji(sub) => commands::emoji::dispatch(sub, &client).await,
+        Cmd::Gifs(sub) => commands::gifs::dispatch(sub, &client).await,
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
@@ -1576,9 +2275,11 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
+        Cmd::Projects(sub) => commands::projects::dispatch(sub, &client).await,
         Cmd::Patches(sub) => commands::patches::dispatch(sub, &client).await,
         Cmd::Issues(sub) => commands::issues::dispatch(sub, &client).await,
         Cmd::Pr(sub) => commands::pr::dispatch(sub, &client).await,
+        Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
@@ -1591,21 +2292,175 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// Raw shorthand `[auth,hex,,hex]` normalizes to strict JSON; the empty
+    /// conditions field becomes `""`.
+    #[test]
+    fn normalize_auth_tag_raw_shorthand() {
+        let owner = "a".repeat(64);
+        let sig = "b".repeat(128);
+
+        let raw = format!("[auth,{owner},,{sig}]");
+        let json = normalize_auth_tag_input(&raw);
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("output must be JSON");
+        assert_eq!(parsed, vec!["auth", &owner, "", &sig]);
+
+        // With conditions and surrounding whitespace (shell/.env artifacts).
+        let raw = format!("  [auth, {owner} , kind=9, {sig}]  \n");
+        let json = normalize_auth_tag_input(&raw);
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("output must be JSON");
+        assert_eq!(parsed, vec!["auth", &owner, "kind=9", &sig]);
+    }
+
+    /// Valid JSON input passes through byte-identical (modulo outer trim) —
+    /// the normalizer must never rewrite well-formed input.
+    #[test]
+    fn normalize_auth_tag_json_passthrough() {
+        let owner = "a".repeat(64);
+        let sig = "b".repeat(128);
+        let json_in = serde_json::json!(["auth", owner, "kind=9", sig]).to_string();
+        assert_eq!(normalize_auth_tag_input(&json_in), json_in);
+    }
+
+    /// Inputs that are neither JSON nor a plausible 4-field shorthand pass
+    /// through unchanged, so the strict parser rejects the original bytes.
+    #[test]
+    fn normalize_auth_tag_leaves_garbage_untouched() {
+        for garbage in [
+            "not a tag",
+            "[auth,too,few]",
+            "[a,b,c,d,e]",
+            r#"[auth,"quoted",x,y]"#, // quote chars => not the shorthand
+            "[]",
+            "{\"auth\":1}",
+        ] {
+            assert_eq!(normalize_auth_tag_input(garbage), garbage.trim());
+        }
+    }
+
     /// Smoke test: CLI definition is valid and parseable.
+    #[test]
+    fn output_format_env_is_a_lenient_default_but_the_flag_stays_strict() {
+        use std::ffi::OsStr;
+        assert!(matches!(env_output_format(None), OutputFormat::Json));
+        for ignored in ["", "agent-v2"] {
+            assert!(matches!(
+                env_output_format(Some(OsStr::new(ignored))),
+                OutputFormat::Json
+            ));
+        }
+        assert!(matches!(
+            env_output_format(Some(OsStr::new("agent"))),
+            OutputFormat::Agent
+        ));
+        assert!(parse_args(["buzz", "--format", "agent", "pack", "validate", "x"]).is_ok());
+        assert!(parse_args(["buzz", "--format", "agent-v2", "pack", "validate", "x"]).is_err());
+    }
+
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
     }
 
     #[test]
+    fn messages_thread_accepts_link_or_explicit_identifiers() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let event = "a".repeat(64);
+        let link = format!("buzz://message?channel={channel}&id={event}");
+
+        assert!(
+            Cli::try_parse_from(["buzz", "messages", "thread", "--link", link.as_str(),]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "thread",
+            "--channel",
+            channel,
+            "--event",
+            event.as_str(),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn messages_thread_rejects_partial_or_mixed_targets() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let event = "a".repeat(64);
+        let link = format!("buzz://message?channel={channel}&id={event}");
+
+        assert!(Cli::try_parse_from(["buzz", "messages", "thread"]).is_err());
+        assert!(Cli::try_parse_from(["buzz", "messages", "thread", "--channel", channel]).is_err());
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "thread",
+            "--link",
+            link.as_str(),
+            "--event",
+            event.as_str(),
+        ])
+        .is_err());
+    }
+
+    /// `canvas history --limit` is bounded 1–10000 at parse time: zero and
+    /// max+1 reject, the maximum is accepted, and the max stays above one
+    /// 1,000-row relay page so the >1,000 pagination path remains reachable.
+    #[test]
+    fn canvas_history_limit_is_bounded() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let parse = |limit: &str| {
+            Cli::try_parse_from([
+                "buzz",
+                "canvas",
+                "history",
+                "--channel",
+                channel,
+                "--limit",
+                limit,
+            ])
+        };
+        assert!(parse("0").is_err(), "zero must reject");
+        assert!(parse("10001").is_err(), "max+1 must reject");
+        assert!(parse("10000").is_ok(), "maximum must be accepted");
+        assert!(parse("1000").is_ok(), "one relay page must be reachable");
+    }
+
+    #[test]
+    fn set_status_clear_rejects_text_and_emoji() {
+        for extra in [["--text", "busy"], ["--emoji", "🎶"]] {
+            let args = ["buzz", "users", "set-status", "--clear"]
+                .into_iter()
+                .chain(extra);
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "--clear must conflict with {}",
+                extra[0]
+            );
+        }
+    }
+
+    #[test]
+    fn set_status_requires_text_or_clear() {
+        assert!(Cli::try_parse_from(["buzz", "users", "set-status"]).is_err());
+        assert!(
+            Cli::try_parse_from(["buzz", "users", "set-status", "--emoji", "🎶"]).is_err(),
+            "--emoji alone must not imply a status"
+        );
+        assert!(Cli::try_parse_from(["buzz", "users", "set-status", "--clear"]).is_ok());
+    }
+
+    #[test]
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
+            "agents",
             "canvas",
             "channels",
             "dms",
             "emoji",
             "feed",
+            "gifs",
             "issues",
+            "media",
             "mem",
             "messages",
             "moderation",
@@ -1613,6 +2468,7 @@ mod tests {
             "pack",
             "patches",
             "pr",
+            "projects",
             "reactions",
             "repos",
             "social",
@@ -1661,6 +2517,16 @@ mod tests {
 
         let cmd = Cli::command();
         assert_eq!(
+            names(&cmd, "agents"),
+            vec![
+                "archive",
+                "archived",
+                "draft-create",
+                "draft-update",
+                "unarchive"
+            ]
+        );
+        assert_eq!(
             names(&cmd, "messages"),
             vec![
                 "delete",
@@ -1694,7 +2560,10 @@ mod tests {
                 "update"
             ]
         );
-        assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
+        assert_eq!(
+            names(&cmd, "canvas"),
+            vec!["get", "history", "restore", "set"]
+        );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
             names(&cmd, "emoji"),
@@ -1706,7 +2575,13 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "users"),
-            vec!["get", "presence", "set-presence", "set-profile"]
+            vec![
+                "get",
+                "presence",
+                "set-presence",
+                "set-profile",
+                "set-status"
+            ]
         );
         assert_eq!(
             names(&cmd, "workflows"),
@@ -1725,7 +2600,26 @@ mod tests {
                 "set-list"
             ]
         );
-        assert_eq!(names(&cmd, "repos"), vec!["create", "get", "list"]);
+        assert_eq!(
+            names(&cmd, "repos"),
+            vec!["bind", "create", "default-branch", "get", "list", "protect"]
+        );
+        let repos = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "repos")
+            .expect("repos command");
+        assert_eq!(names(repos, "default-branch"), vec!["get", "set"]);
+        let protect = repos
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "protect")
+            .expect("repos protect command");
+        let mut protect_names: Vec<String> = protect
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_string())
+            .filter(|name| name != "help")
+            .collect();
+        protect_names.sort();
+        assert_eq!(protect_names, vec!["list", "remove", "set"]);
         assert_eq!(
             names(&cmd, "pr"),
             vec!["get", "list", "open", "status", "update"]
@@ -1735,9 +2629,23 @@ mod tests {
             vec!["get", "list", "send", "status"]
         );
         assert_eq!(
-            names(&cmd, "issues"),
-            vec!["create", "get", "list", "status"]
+            names(&cmd, "projects"),
+            vec![
+                "add-channel",
+                "add-repo",
+                "create",
+                "delete",
+                "get",
+                "list",
+                "remove-repo",
+                "update"
+            ]
         );
+        assert_eq!(
+            names(&cmd, "issues"),
+            vec!["assign", "create", "get", "list", "status", "unassign"]
+        );
+        assert_eq!(names(&cmd, "media"), vec!["get"]);
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
         assert_eq!(names(&cmd, "pack"), vec!["inspect", "validate"]);
         assert_eq!(
@@ -1758,21 +2666,24 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("canvas", 2),
+            ("agents", 5),
+            ("canvas", 4),
             ("channels", 16),
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),
-            ("issues", 4),
+            ("issues", 6),
+            ("media", 1),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),
             ("pr", 5),
+            ("projects", 8),
             ("reactions", 3),
-            ("repos", 3),
+            ("repos", 6),
             ("social", 7),
             ("upload", 1),
-            ("users", 4),
+            ("users", 5),
             ("workflows", 8),
         ];
 
@@ -1792,5 +2703,173 @@ mod tests {
                 group_name, expected_count, actual_count
             );
         }
+    }
+
+    /// Collect all args (recursing into subcommands) whose env var name looks
+    /// like a credential but does NOT have `hide_env_values` set.
+    fn collect_unhidden_secret_args(cmd: &clap::Command) -> Vec<(String, String)> {
+        const SECRET_PATTERNS: &[&str] = &["KEY", "SECRET", "TOKEN", "PASSWORD", "CRED", "AUTH"];
+
+        let mut violations: Vec<(String, String)> = Vec::new();
+
+        for arg in cmd.get_arguments() {
+            if let Some(env_key) = arg.get_env() {
+                let env_name = env_key.to_string_lossy().to_uppercase();
+                let is_secret = SECRET_PATTERNS.iter().any(|pat| env_name.contains(pat));
+                if is_secret && !arg.is_hide_env_values_set() {
+                    violations.push((cmd.get_name().to_string(), env_name));
+                }
+            }
+        }
+
+        for sub in cmd.get_subcommands() {
+            violations.extend(collect_unhidden_secret_args(sub));
+        }
+
+        violations
+    }
+
+    /// Every arg whose env var name contains KEY/SECRET/TOKEN/PASSWORD/CRED/AUTH
+    /// must set `hide_env_values = true` to prevent credential leakage in --help.
+    #[test]
+    fn secret_env_args_hide_their_values_in_help() {
+        let cmd = Cli::command();
+        let violations = collect_unhidden_secret_args(&cmd);
+        assert!(
+            violations.is_empty(),
+            "Found secret-bearing env args without hide_env_values=true. \
+             Add `hide_env_values = true` to each:\n{}",
+            violations
+                .iter()
+                .map(|(cmd, env)| format!("  command={cmd:?} env={env:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ── projects update mutation group ────────────────────────────────────────
+
+    /// Project-channel requests accept the owner-review metadata.
+    #[test]
+    fn projects_add_channel_accepts_owner_review_fields() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "projects",
+            "add-channel",
+            "--home-channel",
+            "11111111-1111-4111-8111-111111111111",
+            "--name",
+            "release-planning",
+            "--visibility",
+            "private",
+            "--template",
+            "Release team",
+        ])
+        .is_ok());
+    }
+
+    /// Multiple independent fields must be accepted in the same invocation.
+    #[test]
+    fn projects_update_multi_field_is_accepted() {
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "projects",
+                "update",
+                "my-slug",
+                "--name",
+                "X",
+                "--description",
+                "Y",
+            ])
+            .is_ok(),
+            "--name and --description together must be accepted"
+        );
+    }
+
+    /// A setter for one field and a clearer for a different field must be accepted.
+    #[test]
+    fn projects_update_setter_with_other_clearer_is_accepted() {
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "projects",
+                "update",
+                "my-slug",
+                "--name",
+                "X",
+                "--clear-description",
+            ])
+            .is_ok(),
+            "--name with --clear-description must be accepted"
+        );
+    }
+
+    /// A setter and its own clearer are mutually exclusive — clap must reject this.
+    #[test]
+    fn projects_update_setter_with_own_clearer_is_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "projects",
+                "update",
+                "my-slug",
+                "--name",
+                "X",
+                "--clear-name",
+            ])
+            .is_err(),
+            "--name and --clear-name together must be rejected by clap"
+        );
+    }
+
+    /// Providing no mutation options at all must be rejected by clap (required group).
+    #[test]
+    fn projects_update_no_mutation_is_rejected_by_clap() {
+        // Without credentials, a valid parse would reach authentication and fail
+        // with auth_error — but a clap-level rejection happens before any I/O.
+        // We verify it's a clap error (not just any error) by checking the error
+        // kind is not a runtime/auth failure — Cli::try_parse_from returns Err
+        // immediately for argument violations.
+        assert!(
+            Cli::try_parse_from(["buzz", "projects", "update", "my-slug"]).is_err(),
+            "update with no setters or clearers must be rejected at parse time"
+        );
+    }
+
+    /// An unrecognised visibility token must be rejected by clap before any I/O.
+    #[test]
+    fn projects_create_invalid_visibility_is_rejected_by_clap() {
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "projects",
+                "create",
+                "my-slug",
+                "--repo",
+                "buzz",
+                "--visibility",
+                "chartreuse",
+            ])
+            .is_err(),
+            "--visibility chartreuse must be rejected at parse time"
+        );
+    }
+
+    /// An unrecognised visibility token on update must be rejected by clap before any I/O.
+    #[test]
+    fn projects_update_invalid_visibility_is_rejected_by_clap() {
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "projects",
+                "update",
+                "my-slug",
+                "--visibility",
+                "chartreuse",
+            ])
+            .is_err(),
+            "--visibility chartreuse on update must be rejected at parse time"
+        );
     }
 }

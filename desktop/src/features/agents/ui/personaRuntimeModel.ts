@@ -1,3 +1,5 @@
+import { type EffortOptions, isSavableEffort } from "./effortPicker";
+
 /** Runtime provider-capability tri-state used by the submit path. */
 export type ProviderRuntimeCapability = "capable" | "locked" | "unknown";
 
@@ -91,6 +93,41 @@ export function resolveAgentCommandUpdate(input: {
 }
 
 /**
+ * Decide whether Save should persist the effort picker's selection, and with
+ * what value. Effort is embedded in the locked `update_managed_agent` payload
+ * (PR #4625) — this runs only inside the submit path, so Cancel and a failed
+ * Save never reach it, and no write is dispatched independently of the dialog
+ * outcome.
+ *
+ * `inheritTransition` is the pin→inherit case (the empty-command sentinel
+ * `resolveAgentCommandUpdate` returns). The locked `update_managed_agent` save
+ * already clears the record effort column AND its env aliases on that
+ * transition; re-persisting the picker value here would restore the very pin
+ * the transition just cleared — the r8 race. So the transition suppresses the
+ * effort write entirely, regardless of the picked value.
+ *
+ * Otherwise persist only a real change: an unchanged selection is a no-op, so
+ * a name-only edit never rewrites the effort column. A level the model being
+ * saved doesn't offer (`choices`, e.g. after switching to Haiku) is dropped;
+ * while that model is still unknown the pick is kept.
+ */
+export function resolveEffortSubmission(input: {
+  effortLevel: string | null;
+  originalEffortLevel: string | null;
+  inheritTransition: boolean;
+  choices: EffortOptions;
+}): { persist: boolean; level: string | null } {
+  if (
+    input.inheritTransition ||
+    input.effortLevel === input.originalEffortLevel ||
+    !isSavableEffort(input.effortLevel, input.choices)
+  ) {
+    return { persist: false, level: null };
+  }
+  return { persist: true, level: input.effortLevel };
+}
+
+/**
  * Whether any of the runtime/provider-required credential keys is unset.
  *
  * A key counts as missing when its env value is absent or an empty string
@@ -100,7 +137,7 @@ export function resolveAgentCommandUpdate(input: {
  * config contribute no entries, so this never blocks on out-of-band auth.
  */
 export function hasMissingRequiredEnvKey(
-  requiredEnvKeys: string[],
+  requiredEnvKeys: readonly string[],
   envVars: Record<string, string>,
 ): boolean {
   return requiredEnvKeys.some((key) => (envVars[key] ?? "").length === 0);
@@ -109,24 +146,27 @@ export function hasMissingRequiredEnvKey(
 /**
  * Resolve the provider and env-vars to PERSIST on Save.
  *
- * The spawn path reads ONLY the record snapshot (`record.provider`/
- * `record.env_vars`), never the live persona, and the record is authoritative:
- * `env_vars` is the complete pinned map (persona env snapshotted at create,
- * already merged UNDER the agent's own overrides), and the provider field is
- * user-editable in the dialog even while inheriting. So the local edit state IS
- * the record's own value and is honored verbatim in the normal case.
+ * This dialog edits an agent INSTANCE's own fields (`record.provider`/
+ * `record.env_vars`), which remain the source of truth for a definition-less
+ * (legacy) instance and for any local/display state before the next resolve.
+ * For a LINKED instance, spawn/deploy resolve the effective provider/model
+ * from the definition, never from the record's own `provider`/`model` bytes
+ * (see `effective_config::resolve_effective_config` on the desktop backend) —
+ * so persisting `record.provider` here only matters for definition-less
+ * instances and for keeping the record's display/legacy fields consistent;
+ * it does not change what a linked instance spawns with.
  *
- * The ONE exception is the inherit-TRANSITION-from-a-harness-pin: a previously
- * harness-pinned agent (e.g. Claude — `agent.agentCommandOverride != null` at
- * dialog open) has its `provider` cleared and carries no persona credential,
- * then the user checks "Inherit runtime from template" for a provider-backed
- * persona (e.g. buzz-agent/Anthropic). Persisting the local (empty) provider +
- * credential-less env would save an agent that fails readiness on next start.
+ * The one case this function still has to handle carefully is the
+ * inherit-TRANSITION-from-a-harness-pin: a previously harness-pinned agent
+ * (e.g. Claude — `agent.agentCommandOverride != null` at dialog open) has its
+ * `provider` cleared and carries no persona credential, then the user checks
+ * "Inherit runtime from template" for a provider-backed persona (e.g.
+ * buzz-agent/Anthropic). Persisting the local (empty) provider + credential-
+ * less env would leave a definition-less instance's record fields blank.
  * Only in that case — inheriting AND the local provider is empty AND the agent
  * was harness-pinned at open — do we substitute the persona snapshot: the
  * persona's provider and the persona-layered env (`{ ...personaEnv,
- * ...agentEnv }`, agent layer wins to mirror spawn-time layering), matching
- * create-time record pinning.
+ * ...agentEnv }`, agent layer wins to mirror spawn-time layering).
  *
  * A NON-empty local provider while inheriting (e.g. an Anthropic-persona agent
  * the user re-points to Databricks) is a deliberate edit and passes through
@@ -135,11 +175,11 @@ export function hasMissingRequiredEnvKey(
  * MODEL follows the same transition rule. buzz-agent/goose readiness requires a
  * model, but a Claude-pinned agent's record often carries no model (Claude
  * resolves its own). On the inherit-transition to a provider-backed persona with
- * a set `persona.model`, persisting the empty local model would save an agent
- * that inherits the provider + credentials but no model and fails readiness on
- * next start — so we substitute `personaModel` in that same case. A non-empty
- * local model (deliberate pick) always passes through; an empty local model in
- * steady state stays empty (runtime default), same authoritative logic.
+ * a set `persona.model`, persisting the empty local model would save a
+ * record-level model gap — so we substitute `personaModel` in that same case. A
+ * non-empty local model (deliberate pick) always passes through; an empty local
+ * model in steady state stays empty (runtime default), same authoritative
+ * logic.
  *
  * An EMPTY local provider while inheriting on an agent that was ALREADY
  * inheriting at open (`agentWasHarnessPinned` false) is ALSO authoritative: the
@@ -148,8 +188,6 @@ export function hasMissingRequiredEnvKey(
  * resurrect the persona provider — otherwise the Default option could never
  * actually clear an inherited agent's provider override.
  *
- * The result is the SAME effective value the required-credential gate
- * validates, so the gate, the submitted record, and the spawn snapshot agree.
  * Provider is normalized: trimmed, empty → `null`.
  */
 export function resolveInheritedRuntimeSubmission(input: {
@@ -266,5 +304,37 @@ export function computeEditAgentFormValidity(
     respondToValid &&
     customCommandValid &&
     !input.requiredEnvKeyMissing
+  );
+}
+
+export function isEditAgentProviderSaveValid({
+  llmProviderFieldVisible,
+  currentProvider,
+  originalProvider,
+  globalProvider,
+  originalRuntimeSupportsProvider,
+}: {
+  llmProviderFieldVisible: boolean;
+  currentProvider: string;
+  originalProvider: string | null | undefined;
+  globalProvider: string | null | undefined;
+  originalRuntimeSupportsProvider: boolean;
+}): boolean {
+  if (!llmProviderFieldVisible) return true;
+  if (currentProvider.trim() || (globalProvider ?? "").trim()) return true;
+  return (
+    (originalProvider ?? "").trim().length === 0 &&
+    originalRuntimeSupportsProvider
+  );
+}
+
+export function envVarsEqual(
+  a: Record<string, string>,
+  b: Record<string, string>,
+): boolean {
+  const aKeys = Object.keys(a);
+  return (
+    aKeys.length === Object.keys(b).length &&
+    aKeys.every((key) => a[key] === b[key])
   );
 }

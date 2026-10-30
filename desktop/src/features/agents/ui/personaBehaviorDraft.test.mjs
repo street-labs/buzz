@@ -49,23 +49,6 @@ test("parallelism submits only when parseInt > 0", () => {
   assert.equal(group.parallelism, 4);
 });
 
-test("mcpToolsets trims to undefined when empty", () => {
-  const blank = behaviorForSubmit(
-    { ...emptyPersonaBehaviorDraft, mcpToolsets: "   " },
-    emptyPersonaBehaviorDraft,
-    false,
-  );
-  assert.equal(blank, undefined, "whitespace-only toolsets is an empty quad");
-  const set = behaviorForSubmit(
-    { ...emptyPersonaBehaviorDraft, mcpToolsets: " developer " },
-    emptyPersonaBehaviorDraft,
-    false,
-  );
-  assert.equal(set.mcpToolsets, "developer");
-});
-
-// ── Unit semantics: mode and list travel together ────────────────────────────
-
 test("flipping allowlist back to owner-only drops the list from the submit", () => {
   const group = behaviorForSubmit(
     allowlistDraft({ respondTo: "owner-only" }),
@@ -82,14 +65,19 @@ test("flipping allowlist back to owner-only drops the list from the submit", () 
 
 // ── Absent-vs-present: unrelated edits must not touch the quad ───────────────
 
-test("create with an untouched empty quad submits nothing", () => {
-  assert.equal(
+test("create with an untouched draft submits the channel default", () => {
+  assert.deepEqual(
     behaviorForSubmit(
       emptyPersonaBehaviorDraft,
       emptyPersonaBehaviorDraft,
       false,
     ),
-    undefined,
+    {
+      respondTo: undefined,
+      respondToAllowlist: undefined,
+      parallelism: undefined,
+      sessionPolicy: "channel",
+    },
   );
 });
 
@@ -108,8 +96,8 @@ test("edit with a changed quad submits the full group", () => {
   assert.deepEqual(group, {
     respondTo: "allowlist",
     respondToAllowlist: [HEX, "b".repeat(64)],
-    mcpToolsets: undefined,
     parallelism: undefined,
+    sessionPolicy: "channel",
   });
 });
 
@@ -126,15 +114,15 @@ test("draftFromBehavior round-trips a full quad and copies the list", () => {
   const behavior = {
     respondTo: "allowlist",
     respondToAllowlist: [HEX],
-    mcpToolsets: "developer",
     parallelism: 3,
+    sessionPolicy: "thread",
   };
   const draft = draftFromBehavior(behavior);
   assert.deepEqual(draft, {
     respondTo: "allowlist",
     respondToAllowlist: [HEX],
-    mcpToolsets: "developer",
     parallelism: "3",
+    sessionPolicy: "thread",
   });
   draft.respondToAllowlist.push("mutated");
   assert.deepEqual(behavior.respondToAllowlist, [HEX], "list must be copied");
@@ -147,16 +135,23 @@ test("edit full-clear submits an explicit empty group, not nothing", () => {
   // silently resurrects on reopen.
   const seed = {
     ...emptyPersonaBehaviorDraft,
-    mcpToolsets: "developer",
     parallelism: "4",
   };
   const group = behaviorForSubmit(emptyPersonaBehaviorDraft, seed, true);
-  assert.deepEqual(group, {}, "full clear must submit a replace-with-empty");
+  assert.deepEqual(
+    group,
+    {
+      respondTo: undefined,
+      respondToAllowlist: undefined,
+      parallelism: undefined,
+      sessionPolicy: "channel",
+    },
+    "full clear must submit the channel default",
+  );
   // Partial clear keeps working: one field left set submits that field.
-  const partial = behaviorForSubmit({ ...seed, mcpToolsets: "" }, seed, true);
-  assert.equal(partial.parallelism, 4);
-  assert.equal(partial.mcpToolsets, undefined);
-  // Hash-quiet survives the fix: a no-op edit of an ALREADY-quad-less
+  const partial = behaviorForSubmit({ ...seed, parallelism: "8" }, seed, true);
+  assert.equal(partial.parallelism, 8);
+  // Hash-quiet survives the fix: a no-op edit of an already-default
   // definition still submits nothing — `{}` here would republish and flip
   // content hashes for exactly the definitions the hash-quiet row protects.
   const noop = behaviorForSubmit(

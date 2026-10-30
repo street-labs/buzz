@@ -22,7 +22,15 @@ import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Spinner } from "@/shared/ui/spinner";
 import { Textarea } from "@/shared/ui/textarea";
+import { PrivateKeyBackupRow } from "./PrivateKeyBackupRow";
+import {
+  SettingsOptionGroup,
+  SettingsOptionGroupList,
+} from "./SettingsOptionGroup";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
+import { SignOutSection } from "./SignOutSection";
+import { writeTextToClipboard } from "@/shared/lib/clipboard";
+import { canonicalNpub, UNAVAILABLE_KEY_LABEL } from "@/shared/lib/pubkey";
 
 type ProfileSettingsCardProps = {
   currentPubkey?: string;
@@ -72,7 +80,7 @@ function IdentityRow({
           className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-muted px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           data-testid={`copy-${testId}`}
           onClick={async () => {
-            await navigator.clipboard.writeText(copyValue);
+            await writeTextToClipboard(copyValue);
             toast.success("Copied to clipboard");
           }}
           title={`Copy ${label}`}
@@ -164,9 +172,11 @@ export function ProfileSettingsCard({
   const [avatarSquishKey, setAvatarSquishKey] = React.useState(0);
   const displayNameInputRef = React.useRef<HTMLInputElement>(null);
   const aboutTextareaRef = React.useRef<HTMLTextAreaElement>(null);
+  const sectionRef = React.useRef<HTMLElement>(null);
   const isEditingProfileMetadataRef = React.useRef(false);
   const avatarEditorOpenFrameRef = React.useRef<number | null>(null);
   const avatarEditorFinishTimeoutRef = React.useRef<number | null>(null);
+  const savedScrollTopRef = React.useRef<number | null>(null);
   isEditingProfileMetadataRef.current = isEditingProfileMetadata;
 
   React.useEffect(() => {
@@ -293,7 +303,10 @@ export function ProfileSettingsCard({
     profile?.displayName ||
     fallbackDisplayName ||
     "Your profile";
-  const resolvedPubkey = profile?.pubkey ?? currentPubkey ?? "Unavailable";
+  // Identity details show and copy the full canonical npub; a key that
+  // cannot be encoded renders the neutral label and is never copyable.
+  const identityNpub = canonicalNpub(profile?.pubkey ?? currentPubkey ?? "");
+  const resolvedPubkey = identityNpub ?? UNAVAILABLE_KEY_LABEL;
   const nip05Handle = profile?.nip05Handle ?? "Not set";
   const emojiAvatarPreview = React.useMemo(
     () => parseEmojiAvatarDataUrl(avatarUrlDraft),
@@ -323,14 +336,31 @@ export function ProfileSettingsCard({
     window.clearTimeout(avatarEditorFinishTimeoutRef.current);
     avatarEditorFinishTimeoutRef.current = null;
   }, []);
+  const saveScrollPosition = React.useCallback(() => {
+    const el = sectionRef.current;
+    if (!el) return;
+    const scroller = el.closest<HTMLElement>("[class*='overflow-y']");
+    if (scroller) savedScrollTopRef.current = scroller.scrollTop;
+  }, []);
+  const restoreScrollPosition = React.useCallback(() => {
+    const saved = savedScrollTopRef.current;
+    if (saved == null) return;
+    savedScrollTopRef.current = null;
+    const el = sectionRef.current;
+    if (!el) return;
+    const scroller = el.closest<HTMLElement>("[class*='overflow-y']");
+    if (scroller) scroller.scrollTop = saved;
+  }, []);
   const closeAvatarEditor = React.useCallback(() => {
     clearAvatarEditorFinishTimeout();
     setIsAvatarEditorOpen(false);
     setIsAvatarEditorFinishing(false);
-  }, [clearAvatarEditorFinishTimeout]);
+    restoreScrollPosition();
+  }, [clearAvatarEditorFinishTimeout, restoreScrollPosition]);
   const completeAvatarEditorClose = React.useCallback(() => {
     setIsAvatarEditorOpen(false);
     clearAvatarEditorFinishTimeout();
+    restoreScrollPosition();
     avatarEditorFinishTimeoutRef.current = window.setTimeout(
       () => {
         avatarEditorFinishTimeoutRef.current = null;
@@ -338,7 +368,11 @@ export function ProfileSettingsCard({
       },
       shouldReduceMotion ? 0 : AVATAR_EDITOR_TRANSITION_MS,
     );
-  }, [clearAvatarEditorFinishTimeout, shouldReduceMotion]);
+  }, [
+    clearAvatarEditorFinishTimeout,
+    restoreScrollPosition,
+    shouldReduceMotion,
+  ]);
   const reopenAvatarEditorAfterClose = React.useCallback(() => {
     clearAvatarEditorFinishTimeout();
     setShouldRenderAvatarEditor(true);
@@ -347,6 +381,7 @@ export function ProfileSettingsCard({
   }, [clearAvatarEditorFinishTimeout]);
 
   const openAvatarEditor = React.useCallback(() => {
+    saveScrollPosition();
     setShouldRenderAvatarEditor(true);
     setIsAvatarEditorFinishing(false);
     clearAvatarEditorFinishTimeout();
@@ -359,7 +394,7 @@ export function ProfileSettingsCard({
       avatarEditorOpenFrameRef.current = null;
       setIsAvatarEditorOpen(true);
     });
-  }, [clearAvatarEditorFinishTimeout]);
+  }, [clearAvatarEditorFinishTimeout, saveScrollPosition]);
 
   const saveProfile = React.useCallback(async () => {
     if (!canSave) {
@@ -447,7 +482,11 @@ export function ProfileSettingsCard({
   }, []);
 
   return (
-    <section className="min-w-0" data-testid="settings-profile">
+    <section
+      className="min-w-0"
+      data-testid="settings-profile"
+      ref={sectionRef}
+    >
       <div>
         <SettingsSectionHeader
           title="Profile"
@@ -637,15 +676,9 @@ export function ProfileSettingsCard({
                       data-testid="profile-readonly-content"
                       inert={isAvatarEditorOpen ? true : undefined}
                     >
-                      <div className="space-y-12">
-                        <div
-                          className="overflow-hidden rounded-xl border border-border/70 bg-background/70 shadow-xs divide-y divide-border/55"
-                          data-testid="profile-metadata-card"
-                        >
-                          <div className="flex min-h-14 items-center justify-between gap-4 px-4 py-3">
-                            <h3 className="text-sm font-medium">
-                              Profile info
-                            </h3>
+                      <SettingsOptionGroupList>
+                        <SettingsOptionGroup
+                          headerAction={
                             <EditProfileMetadataButton
                               disabled={updateProfileMutation.isPending}
                               isEditing={isEditingProfileMetadata}
@@ -653,8 +686,10 @@ export function ProfileSettingsCard({
                               onClick={handleProfileMetadataEdit}
                               testId="profile-metadata-edit"
                             />
-                          </div>
-
+                          }
+                          data-testid="profile-metadata-card"
+                          title="Profile info"
+                        >
                           <div className="flex min-h-16 items-center gap-4 px-4 py-3">
                             <div className="min-w-0 flex-1 space-y-1">
                               <label
@@ -725,22 +760,25 @@ export function ProfileSettingsCard({
                               )}
                             </div>
                           </div>
-                        </div>
+                        </SettingsOptionGroup>
 
-                        <div>
+                        <SettingsOptionGroup title="Identity">
                           <details
-                            className="group overflow-hidden rounded-xl border border-border/70 bg-background/70 shadow-xs"
+                            className="group divide-y divide-border/55"
                             data-testid="profile-identity-card"
                           >
                             <summary
-                              className="group/identity flex cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 text-sm transition-colors duration-150 ease-out hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-details-marker]:hidden"
+                              className="group/identity flex min-h-16 cursor-pointer list-none items-center justify-between gap-4 px-4 py-3 transition-colors duration-150 ease-out hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-details-marker]:hidden"
                               data-testid="profile-identity-toggle"
                             >
                               <div className="min-w-0">
-                                <h3 className="text-sm font-medium">
-                                  Identity
-                                </h3>
-                                <p className="mt-1 text-sm font-normal text-muted-foreground">
+                                <p className="text-sm font-medium">
+                                  Identity details
+                                </p>
+                                <p
+                                  className="text-sm font-normal text-muted-foreground/70"
+                                  data-settings-subcopy
+                                >
                                   Your keypair and NIP-05 handle are fixed for
                                   this device.
                                 </p>
@@ -748,13 +786,11 @@ export function ProfileSettingsCard({
                               <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-[color,transform] duration-150 ease-out group-open:rotate-180 group-hover/identity:text-foreground group-focus-visible/identity:text-foreground" />
                             </summary>
                             <div
-                              className="border-t border-border/55 divide-y divide-border/55"
+                              className="divide-y divide-border/55"
                               data-testid="profile-identity-details"
                             >
                               <IdentityRow
-                                copyValue={
-                                  profile?.pubkey ?? currentPubkey ?? undefined
-                                }
+                                copyValue={identityNpub ?? undefined}
                                 label="Public key"
                                 testId="profile-pubkey"
                                 value={resolvedPubkey}
@@ -765,10 +801,11 @@ export function ProfileSettingsCard({
                                 testId="profile-nip05"
                                 value={nip05Handle}
                               />
+                              <PrivateKeyBackupRow />
                             </div>
                           </details>
-                        </div>
-                      </div>
+                        </SettingsOptionGroup>
+                      </SettingsOptionGroupList>
                     </div>
 
                     {shouldRenderAvatarEditor ? (
@@ -824,6 +861,8 @@ export function ProfileSettingsCard({
           </div>
         </div>
       </div>
+
+      <SignOutSection />
     </section>
   );
 }

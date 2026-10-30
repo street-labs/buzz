@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:buzz/features/activity/feed_item.dart';
 
+import '../../helpers/thread_ids.dart';
+
 void main() {
   group('FeedItem.fromJson', () {
     test('parses all fields', () {
@@ -47,6 +49,59 @@ void main() {
       expect(item.channelId, isNull);
       expect(item.channelName, '');
       expect(item.tags, isEmpty);
+    });
+  });
+
+  group('FeedItem.threadHeadId', () {
+    FeedItem makeItem(List<List<String>> tags) => FeedItem(
+      id: 'reply',
+      kind: 9,
+      pubkey: 'pk',
+      content: '',
+      createdAt: 0,
+      channelId: 'channel',
+      channelName: '',
+      tags: tags,
+      category: 'mention',
+    );
+
+    test('uses the reply marker for a direct thread reply', () {
+      expect(
+        makeItem(const [
+          ['e', threadIdRoot, '', 'reply'],
+        ]).threadHeadId,
+        threadIdRoot,
+      );
+    });
+
+    test('uses the direct parent marker for a nested thread reply', () {
+      expect(
+        makeItem(const [
+          ['e', threadIdRoot, '', 'root'],
+          ['e', threadIdParent, '', 'reply'],
+        ]).threadHeadId,
+        threadIdParent,
+      );
+    });
+
+    test('uses the last valid parent and normalizes its case', () {
+      expect(
+        makeItem([
+          ['e', threadIdRoot, '', 'reply'],
+          ['e', threadIdParent.toUpperCase(), '', 'reply'],
+          ['e', 'bad', '', 'reply'],
+        ]).threadHeadId,
+        threadIdParent,
+      );
+    });
+
+    test('does not treat unrelated event references as threads', () {
+      expect(
+        makeItem(const [
+          ['e', 'linked-event'],
+        ]).threadHeadId,
+        isNull,
+      );
     });
   });
 

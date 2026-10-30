@@ -1,5 +1,12 @@
 import 'nostr_models.dart';
 
+/// Aggregate cap on explicit `#h` channel values the relay accepts across one
+/// REQ's filters before rejecting it as `restricted: too many explicit
+/// channels`. Mirrors `MAX_EXPLICIT_CHANNEL_VALUES` in
+/// `crates/buzz-relay/src/handlers/req.rs`. A subscription over more channels
+/// than this must be split into multiple REQs, each within the cap.
+const int kMaxExplicitChannelValues = 128;
+
 /// Canonical [NostrFilter] constructors for common Buzz queries.
 ///
 /// Centralising filter shapes keeps relay queries consistent across providers
@@ -40,6 +47,7 @@ abstract final class NostrFilters {
     String channelId, {
     int limit = 200,
     int? until,
+    String? beforeId,
   }) => NostrFilter(
     kinds: EventKind.channelEventKinds,
     tags: {
@@ -47,6 +55,16 @@ abstract final class NostrFilters {
     },
     limit: limit,
     until: until,
+    extensions: {'before_id': ?beforeId},
+  );
+
+  /// Huddle lifecycle state for one parent channel, independent of timeline paging.
+  static NostrFilter huddleLifecycle(String channelId) => NostrFilter(
+    kinds: [EventKind.huddleStarted, EventKind.huddleEnded],
+    tags: {
+      '#h': [channelId],
+    },
+    limit: 200,
   );
 
   /// Reactions (kind:7) on a specific event.
@@ -132,64 +150,23 @@ abstract final class NostrFilters {
     limit: limit,
   );
 
-  /// Deletions (kind:5) targeting event IDs.
-  static NostrFilter deletionsByTargetIds(
-    List<String> ids, {
-    List<String>? authors,
-  }) => NostrFilter(
-    kinds: [EventKind.deletion],
-    authors: authors,
-    tags: {'#e': ids},
-    limit: ids.length,
-  );
-
-  /// User notes (kind:1) for the global Pulse timeline.
-  static NostrFilter globalNotes({int limit = 50, int? until}) =>
-      NostrFilter(kinds: [EventKind.note], limit: limit, until: until);
-
-  /// Notes by a set of authors for Pulse timelines.
-  static NostrFilter notesTimeline(
-    List<String> pubkeys, {
-    int limit = 200,
-    int? until,
-  }) => NostrFilter(
-    kinds: [EventKind.note],
-    authors: pubkeys,
+  /// Global user search over kind:0 profiles (NIP-50 via the HTTP bridge).
+  ///
+  /// `search_mode: "prefix"` is a Buzz bridge-only extension: every caller is
+  /// a typeahead surface, so a partially typed name must match ("rac" →
+  /// "raccoon"). Mirrors desktop's `build_user_search_filter`
+  /// (desktop/src-tauri/src/commands/profile.rs). Bridge-only — send through
+  /// `queryRelay`, not a WebSocket REQ.
+  static NostrFilter searchUsers(String query, {int limit = 50}) => NostrFilter(
+    kinds: [0],
+    search: query,
     limit: limit,
-    until: until,
+    extensions: const {'search_mode': 'prefix'},
   );
-
-  /// Reactions authored by a user.
-  static NostrFilter userReactions(String pubkey, {int limit = 200}) =>
-      NostrFilter(kinds: [EventKind.reaction], authors: [pubkey], limit: limit);
-
-  /// Reactions targeting notes.
-  static NostrFilter noteReactions(List<String> noteIds) => NostrFilter(
-    kinds: [EventKind.reaction],
-    tags: {'#e': noteIds},
-    limit: 500,
-  );
-
-  /// Fetch notes by ids.
-  static NostrFilter notesByIds(List<String> ids) =>
-      NostrFilter(kinds: [EventKind.note], ids: ids, limit: ids.length);
-
-  /// User notes (kind:1) for a single author.
-  static NostrFilter userNotes(String pubkey, {int limit = 20, int? until}) =>
-      NostrFilter(
-        kinds: [EventKind.note],
-        authors: [pubkey],
-        limit: limit,
-        until: until,
-      );
-
-  /// Contact list (kind:3) for a user.
-  static NostrFilter contactList(String pubkey) =>
-      NostrFilter(kinds: [EventKind.contactList], authors: [pubkey], limit: 1);
 
   /// Relay membership list (kind:13534).
   static NostrFilter relayMembers() =>
-      const NostrFilter(kinds: [13534], limit: 1);
+      const NostrFilter(kinds: [EventKind.relayMembership], limit: 1);
 
   /// Agent profiles (kind:10100).
   static NostrFilter agentProfiles() =>

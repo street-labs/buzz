@@ -1,6 +1,6 @@
 /**
  * Persists whether the user has made an explicit choice about the
- * observer-feed archive default-on feature.
+ * observer-frame archive default-on feature.
  *
  * The key is identity-scoped so toggling off on one identity doesn't suppress
  * the default-on for another identity.  The value is:
@@ -8,9 +8,14 @@
  *   "0"  → user explicitly disabled
  *   null → no explicit choice yet (default-on seeding may still fire)
  *
- * Device-level localStorage — intentionally not reset on workspace switch
+ * Device-level localStorage — intentionally not reset on community switch
  * (the archive subscription itself is identity-scoped in SQLite; this flag
  * is just the UI gate that prevents re-seeding after an explicit opt-out).
+ *
+ * Storage-error contract: a single read that throws is treated the same as
+ * a stored "1" (treat-as-set, fail-closed). This matches the metric-archive
+ * path: a storage error must never cause the seeding guard to fire or allow
+ * a stored opt-out to be silently overridden.
  */
 
 const KEY_PREFIX = "buzz:observer-archive-default-seeded";
@@ -20,16 +25,25 @@ function storageKey(identityPubkey: string): string {
 }
 
 /**
- * Returns `true` if the user has already made an explicit choice for this
- * identity (either opted in or opted out).  When `false`, the seeding path
- * may fire.
+ * Reads the stored explicit choice for this identity in a single localStorage
+ * access.
+ *
+ * Returns:
+ *   `false`    — user explicitly opted out ("0" stored)
+ *   `true`     — user explicitly opted in ("1" stored)
+ *   `"unset"`  — no choice recorded yet
+ *
+ * On storage error, returns `true` (fail-closed: treat as already opted in,
+ * suppress auto-seeding, and never override a potentially stored opt-out).
  */
-export function hasExplicitObserverArchiveChoice(
+export function readExplicitObserverArchiveChoice(
   identityPubkey: string,
-): boolean {
+): boolean | "unset" {
   if (typeof window === "undefined") return true; // SSR/test: treat as set
   try {
-    return window.localStorage.getItem(storageKey(identityPubkey)) !== null;
+    const raw = window.localStorage.getItem(storageKey(identityPubkey));
+    if (raw === null) return "unset";
+    return raw !== "0";
   } catch {
     return true; // storage error → treat as set, never auto-seed
   }
@@ -52,7 +66,7 @@ export function setExplicitObserverArchiveChoice(
     );
   } catch {
     // Best-effort — the seeding guard will re-fire on next startup if storage
-    // is unavailable, but that is safe (create_save_subscription is idempotent).
+    // is unavailable, but that is safe (merge_save_subscription_kinds is idempotent).
   }
 }
 

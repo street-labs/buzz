@@ -114,17 +114,59 @@ test("inbox reaction on a thread-reply mention persists after refetch", async ({
     },
   );
 
-  // Open the inbox item and react via the hover action bar's quick reaction.
+  // Open the inbox item and react through Add reaction and the picker.
   const item = page.getByTestId(`home-inbox-item-${replyEvent.id}`);
   await item.click();
   const detail = page.getByTestId("home-inbox-detail");
   await expect(detail).toContainText("please react to this");
 
   const selectedMessage = page.getByTestId("home-inbox-selected-message");
+
+  // Detail renders from history before the paced background consumer is ready.
+  // Exercise live delivery only once this channel actually requests kind 7.
+  await page.waitForFunction(() =>
+    window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+      channelName: "general",
+      kind: 7,
+      exactChannel: true,
+    }),
+  );
+
+  // Deliver a live reaction with the real add_reaction wire shape: `e` target,
+  // no `h` channel tag. The Inbox must render it without waiting for another
+  // message or a context refetch.
+  await page.evaluate(async (eventId) => {
+    const invoke = (
+      window as Window & {
+        __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+          command: string,
+          payload?: Record<string, unknown>,
+        ) => Promise<unknown>;
+      }
+    ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+    if (!invoke) throw new Error("Mock Tauri invoke bridge is unavailable.");
+    await invoke("add_reaction", { eventId, emoji: "❤️" });
+  }, replyEvent.id);
+  await expect(selectedMessage.getByLabel("Toggle ❤️ reaction")).toBeVisible();
+
   await selectedMessage.hover();
-  await selectedMessage
-    .getByRole("button", { name: "React with :+1:" })
-    .click();
+  const actionBar = page.getByTestId(`message-action-bar-${replyEvent.id}`);
+  const [actionBarBox, selectedMessageBox] = await Promise.all([
+    actionBar.boundingBox(),
+    selectedMessage.boundingBox(),
+  ]);
+  expect(actionBarBox).not.toBeNull();
+  expect(selectedMessageBox).not.toBeNull();
+  if (!actionBarBox || !selectedMessageBox) {
+    throw new Error("Inbox message action bar bounds were unavailable.");
+  }
+  expect(actionBarBox.y).toBeGreaterThanOrEqual(selectedMessageBox.y);
+
+  await actionBar.getByRole("button", { name: "Open reactions" }).click();
+  const picker = page.locator("em-emoji-picker");
+  await expect(picker).toBeVisible();
+  await picker.locator("input[type='search']").fill("thumbs up");
+  await picker.getByRole("button", { name: "👍" }).first().click();
 
   // The pill must appear AND persist: the post-toggle refetch replaces the
   // optimistic state with fetched reaction events. Give the refetch time to

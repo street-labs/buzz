@@ -74,6 +74,8 @@ Buzz extends the standard Nostr event format with custom kind numbers for enterp
 
 New message type? New kind integer. Zero breaking changes.
 
+**The conversation is Nostr; Buzz adds accessories around it.** Messages, threads, reactions, and the rest of the conversation are signed Nostr events, and Nostr reads must cover all of that state, so a standards-leaning Buzz client stays possible. Around it, the relay serves accessories that don't fit that shape: Blossom media, git smart HTTP, workflow webhooks, derived unread counts, and namespaced `/buzz/v1/...` endpoints for backend-for-frontend reads (thread catch-up, sync) over the same authoritative store. We start with this rule and refine it as more cases show up.
+
 ---
 
 ## Architecture
@@ -166,7 +168,13 @@ See [VISION_PROJECTS.md](VISION_PROJECTS.md) for the full forge vision: the proj
 
 ## Agent Personas & Teams
 
-Agents aren't monolithic. A persona bundles a model, a system prompt, and a set of MCP toolsets. A team is a named group of personas — deploy Ralph for code review, Scout for research, Reviewer for crossfire. Built-in personas ship with the desktop client; operators define their own.
+Agents aren't monolithic. A persona bundles a model and a system prompt. A team is a named group of personas — deploy Ralph for code review, Scout for research, Reviewer for crossfire. Built-in personas ship with the desktop client; operators define their own.
+
+---
+
+## Remote Agents
+
+An agent's identity, history, and presence live on the relay — so the machine running it is replaceable. The desktop deploys agents onto remote infrastructure through swappable provider binaries, and after deploy retains no substrate control channel: status, steering, and shutdown all flow over the relay, and the agent bounds its own lifetime. See [VISION_REMOTE_AGENTS.md](VISION_REMOTE_AGENTS.md) for the full picture.
 
 ---
 
@@ -224,6 +232,7 @@ Greenfield. Agent swarms build in parallel, integrating at the event store bound
 | ✅ | Huddles — WebSocket Opus voice relay + lifecycle events (recording/tracks planned) |
 | ✅ | Buzz Mesh — relay-gated shared AI compute (mesh-llm over iroh); members pool GPUs, agents consume via a local OpenAI-compatible endpoint |
 | 🚧 | Mobile client — Flutter app (channels, forum, search, profile, pairing); in active development |
+| 📋 | Remote agents — provider-based deployment to remote substrates (Kubernetes first); spec in review |
 | 📋 | Developer portal, push notifications, culture features |
 
 ---

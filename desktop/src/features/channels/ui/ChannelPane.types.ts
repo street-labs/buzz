@@ -1,18 +1,19 @@
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
-import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
+import type { MessageComposerEditTarget } from "@/features/messages/ui/MessageComposer.types";
 import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { TypingIndicatorEntry } from "@/features/messages/useChannelTyping";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import type { useChannelFind } from "@/features/search/useChannelFind";
 import type {
   ProfilePanelTab,
   ProfilePanelView,
 } from "@/features/profile/ui/UserProfilePanel";
+import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import type { Channel } from "@/shared/api/types";
+import type { IdleAuxiliaryHeaderControls } from "./IdleAuxiliaryPanel";
 export type ChannelPaneProps = {
   activeChannel: Channel | null;
   activityAgents?: BotActivityAgent[];
@@ -34,25 +35,51 @@ export type ChannelPaneProps = {
    */
   onAutoSendComplete?: (() => void) | null;
   botTypingEntries: TypingIndicatorEntry[];
-  channelFind: ReturnType<typeof useChannelFind>;
   channelManagementOpen?: boolean;
   currentPubkey?: string;
-  editTarget?: {
-    author: string;
-    body: string;
-    id: string;
-    imetaMedia?: ImetaMedia[];
-  } | null;
+  editTarget?: MessageComposerEditTarget | null;
   fetchOlder?: () => Promise<void>;
   header?: React.ReactNode;
+  /**
+   * Idle-state body for the right auxiliary pane (project extras, etc.).
+   * Uses the same slot as thread, profile, agent-session, and management panels.
+   * By default it yields to those surfaces; callers may opt into thread override.
+   */
+  idleAuxiliaryPanel?: React.ReactNode;
+  idleAuxiliaryHeaderActions?: IdleAuxiliaryHeaderControls;
+  /** Show the idle auxiliary surface ahead of an already-open thread. */
+  idleAuxiliaryOverridesThread?: boolean;
+  idleAuxiliaryTitle?: string;
   hasOlderMessages?: boolean;
+  /** True when the loaded window provably starts at the channel's beginning. */
+  historyExhausted?: boolean;
   isFetchingOlder?: boolean;
+  /** A companion huddle window presents the channel only as a transcript. */
+  isHuddleTranscript?: boolean;
   isJoining?: boolean;
   isSinglePanelView?: boolean;
   isSending: boolean;
+  /** Terminal channel-history failure. Cached messages remain visible when present. */
+  isTimelineError?: boolean;
   isTimelineLoading: boolean;
+  onRetryTimeline?: () => void;
+  /** Newly-created message that should receive the one-shot conversation arrival motion. */
+  entranceMessageId?: string | null;
+  onEntranceMessageComplete?: (messageId: string) => void;
+  /** Welcome kickoff characters, rendered standing on the Welcome composer banner. */
+  welcomeKickoffStage?: React.ReactNode;
+  /** The kickoff is still setting up the team — the banner copy reads as setup status. */
+  welcomeKickoffSettingUp?: boolean;
   messages: TimelineMessage[];
   threadSummaries?: ReadonlyMap<string, ChannelWindowThreadSummary>;
+  /**
+   * A Huddle transcript flattens summarized reply subtrees into the chat
+   * timeline. When one of those subtree loads fails, this reports the aggregate
+   * failure so the transcript can surface a non-destructive retry alert instead
+   * of silently presenting a partial conversation as complete.
+   */
+  huddleThreadRepliesError?: boolean;
+  onRetryHuddleThreadReplies?: () => void;
   firstUnreadMessageId?: string | null;
   unreadCount?: number;
   canResetThreadPanelWidth: boolean;
@@ -67,13 +94,20 @@ export type ChannelPaneProps = {
   onCloseAgentSession: () => void;
   onCloseChannelManagement?: () => void;
   onChannelManagementDeleted?: () => void;
+  onCloseIdleAuxiliaryPanel?: () => void;
   onCloseProfilePanel: () => void;
-  onAddAgent?: () => void;
+  onAddAgent?: (options?: { beforeSend?: () => void }) => void;
+  onAddFiles?: () => void;
+  onBrowseChannels?: () => void;
   onCreateChannel?: () => void;
   onCloseThread: () => void;
   onDelete?: (message: TimelineMessage) => void;
   onEdit?: (message: TimelineMessage) => void;
-  onEditSave?: (content: string, mediaTags?: string[][]) => Promise<void>;
+  onEditSave?: (
+    content: string,
+    mediaTags?: string[][],
+    mentionPubkeys?: string[],
+  ) => Promise<void>;
   onMarkUnread?: (message: TimelineMessage) => void;
   onMarkRead?: (message: TimelineMessage) => void;
   onExpandThreadReplies: (message: TimelineMessage) => void;
@@ -81,7 +115,10 @@ export type ChannelPaneProps = {
   onOpenAgentSession: (pubkey: string, channelId?: string | null) => void;
   onOpenDm?: (pubkeys: string[]) => Promise<void> | void;
   onOpenMembers?: () => void;
-  onOpenProfilePanel: (pubkey: string) => void;
+  onOpenProfilePanel: (
+    pubkey: string,
+    options?: ProfilePanelOpenOptions,
+  ) => void;
   onOpenThread: (message: TimelineMessage) => void;
   onResetThreadPanelWidth: () => void;
   onSelectThreadReplyTarget: (message: TimelineMessage) => void;
@@ -90,6 +127,16 @@ export type ChannelPaneProps = {
     mentionPubkeys: string[],
     mediaTags?: string[][],
     channelId?: string | null,
+    threadContext?: {
+      parentEventId: string | null;
+      threadHeadId: string | null;
+    } | null,
+    forceRest?: boolean,
+  ) => Promise<void>;
+  onSendToChannel: (
+    message: TimelineMessage,
+    threadRoot: TimelineMessage,
+    channelId: string,
   ) => Promise<void>;
   onSendVideoReviewComment?: (
     message: TimelineMessage,
@@ -120,6 +167,7 @@ export type ChannelPaneProps = {
   ) => void;
   personaLookup?: Map<string, string>;
   profiles?: UserProfileLookup;
+  ownerProfiles?: UserProfileLookup;
   openThreadHeadId: string | null;
   shouldShowThreadSkeleton: boolean;
   openAgentSessionChannelId: string | null;
@@ -136,7 +184,11 @@ export type ChannelPaneProps = {
   profilePanelTab: ProfilePanelTab;
   profilePanelView: ProfilePanelView;
   threadHeadMessage: TimelineMessage | null;
+  threadAllMessages: TimelineMessage[];
   threadMessages: MainTimelineEntry[];
+  threadMessagesPending?: boolean;
+  threadMessagesError?: boolean;
+  onRetryThreadReplies?: () => void;
   threadPanelWidthPx: number;
   threadTypingPubkeys: string[];
   threadReplyTargetMessage: TimelineMessage | null;
@@ -145,6 +197,10 @@ export type ChannelPaneProps = {
   threadReplyUnreadCounts?: ReadonlyMap<string, number>;
   threadFirstUnreadReplyId?: string | null;
   targetMessageId: string | null;
+  /** Exact clicked result id, including a reply routed into the thread panel. */
+  targetSearchMessageId?: string | null;
+  /** Search text to highlight within the clicked result. */
+  targetSearchQuery?: string;
   typingPubkeys: string[];
   isFollowingThread?: boolean;
   onFollowThread?: () => void;

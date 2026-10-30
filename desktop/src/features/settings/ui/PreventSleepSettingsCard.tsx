@@ -1,20 +1,17 @@
 import { usePreventSleepContext } from "@/features/agents/usePreventSleep";
 import { Switch } from "@/shared/ui/switch";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
-import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
 export function PreventSleepSettingsCard() {
   const { enabled, setEnabled, hasRunningAgents, expired, clearExpired } =
     usePreventSleepContext();
 
   return (
-    <section className="min-w-0" data-testid="settings-agents">
-      <SettingsSectionHeader
-        title="Agents"
-        description="Settings that affect how local managed agents run on this machine."
-      />
-
-      <SettingsOptionGroup>
+    <div className="min-w-0 space-y-3">
+      <SettingsOptionGroup
+        data-testid="agents-preferences-card"
+        title="Preferences"
+      >
         <SettingsOptionRow>
           <div className="min-w-0">
             <label
@@ -23,7 +20,10 @@ export function PreventSleepSettingsCard() {
             >
               Keep awake while agents are active
             </label>
-            <p className="text-sm font-normal text-muted-foreground">
+            <p
+              className="text-sm font-normal text-muted-foreground/70"
+              data-settings-subcopy
+            >
               Prevents your computer from sleeping while local agents are
               running. Automatically releases when all agents stop or after 1
               hour without agent activity.
@@ -56,6 +56,6 @@ export function PreventSleepSettingsCard() {
           now.
         </p>
       )}
-    </section>
+    </div>
   );
 }

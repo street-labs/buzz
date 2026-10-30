@@ -56,7 +56,7 @@ test("buildCompactToolSummary treats buzz messages send commands as messages", (
   assert.equal(summary.presentation, "message");
 });
 
-test("buildCompactToolSummary extracts simple piped buzz message content", () => {
+test("buildCompactToolSummary returns null preview for piped stdin sends", () => {
   const summary = buildCompactToolSummary(
     makeTool({
       toolName: "shell",
@@ -68,7 +68,7 @@ test("buildCompactToolSummary extracts simple piped buzz message content", () =>
   );
 
   assert.equal(summary.label, "Send Message");
-  assert.equal(summary.preview, "hello from stdin");
+  assert.equal(summary.preview, null);
   assert.equal(summary.presentation, "message");
 });
 
@@ -88,7 +88,7 @@ test("buildCompactToolSummary formats shell command preview", () => {
 
 test("buildCompactToolSummary formats view_image thumbnail source", () => {
   const source =
-    "https://sprout-oss.stage.blox.sqprod.co/media/ffd1b2721f2d52e19f0ca2be9aa7842cdec5b4e0215aaab2a67c26a2a76a6a83.png";
+    "https://media.example.com/media/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.png";
   const summary = buildCompactToolSummary(
     makeTool({
       toolName: "buzz-dev-mcp__view_image",

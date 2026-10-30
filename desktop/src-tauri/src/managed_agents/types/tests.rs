@@ -1,9 +1,10 @@
-use super::{ManagedAgentRecord, PersonaRecord};
+use super::{AgentDefinition, CatalogSource, ManagedAgentRecord};
+use crate::managed_agents::AcpSessionPolicy;
 use std::path::PathBuf;
 
 #[test]
 fn persona_record_defaults_active_when_field_is_missing() {
-    let record: PersonaRecord = serde_json::from_str(
+    let record: AgentDefinition = serde_json::from_str(
         r#"{
             "id": "builtin:fizz",
             "display_name": "Fizz",
@@ -291,7 +292,7 @@ fn relay_mesh_config_round_trips_snake_case() {
 
 #[test]
 fn persona_record_deserializes_old_source_pack_fields_via_alias() {
-    let record: PersonaRecord = serde_json::from_str(
+    let record: AgentDefinition = serde_json::from_str(
         r#"{
             "id": "persona-1",
             "display_name": "Test",
@@ -314,7 +315,7 @@ fn persona_record_deserializes_old_source_pack_fields_via_alias() {
 
 #[test]
 fn persona_record_serializes_new_field_names() {
-    let record: PersonaRecord = serde_json::from_str(
+    let record: AgentDefinition = serde_json::from_str(
         r#"{
             "id": "persona-1",
             "display_name": "Test",
@@ -442,6 +443,34 @@ fn managed_agent_record_without_key_deserializes_empty() {
     .expect("keyring-backed record without inline key should deserialize");
 
     assert_eq!(record.private_key_nsec, "");
+    assert!(
+        !record.provider_policy_pending,
+        "pre-pending stores must deserialize as acknowledged"
+    );
+}
+
+#[test]
+fn pending_provider_policy_round_trips() {
+    let mut record = sample_agent_record();
+    record.provider_policy_pending = true;
+
+    let json = serde_json::to_string(&record).expect("serialize pending policy");
+    let reloaded: ManagedAgentRecord = serde_json::from_str(&json).expect("reload pending policy");
+
+    assert!(reloaded.provider_policy_pending);
+}
+
+#[test]
+fn stored_record_unknown_or_null_session_policy_degrades_to_channel() {
+    for session_policy in [serde_json::json!("future"), serde_json::Value::Null] {
+        let mut value = serde_json::to_value(sample_agent_record()).expect("serialize fixture");
+        value["session_policy"] = session_policy;
+        let records: Vec<ManagedAgentRecord> = serde_json::from_value(serde_json::json!([value]))
+            .unwrap_or_else(|error| panic!("one policy must not drop the agent store: {error}"));
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_policy, AcpSessionPolicy::Channel);
+    }
 }
 
 fn sample_agent_record() -> ManagedAgentRecord {
@@ -468,30 +497,78 @@ fn sample_agent_record() -> ManagedAgentRecord {
     .expect("sample record")
 }
 
-// ── PersonaRecord ↔ AgentRecord fold mapping (Phase 1A) ─────────────────────
+// ── AgentDefinition ↔ ManagedAgentRecord fold mapping (Phase 1A) ─────────────────────
 
-fn sample_persona() -> PersonaRecord {
-    PersonaRecord {
+fn sample_persona() -> AgentDefinition {
+    AgentDefinition {
+        session_policy: Default::default(),
+        description: None,
         id: "custom:helper".to_string(),
         display_name: "Helper".to_string(),
         avatar_url: Some("https://example.com/a.png".to_string()),
         system_prompt: "You help.".to_string(),
+        acp_command: None,
         runtime: Some("goose".to_string()),
         model: Some("gpt-x".to_string()),
         provider: Some("openai".to_string()),
         name_pool: vec!["Nimble".to_string()],
         is_builtin: false,
         is_active: true,
+        shared: false,
         source_team: Some("team-1".to_string()),
         source_team_persona_slug: Some("helper".to_string()),
+        catalog_source: None,
+        team_catalog_source: None,
         env_vars: [("K".to_string(), "v".to_string())].into_iter().collect(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
-        mcp_toolsets: None,
         parallelism: None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-02T00:00:00Z".to_string(),
     }
+}
+
+#[test]
+fn persona_record_without_catalog_source_deserializes_and_omits_it() {
+    // Every persona already on disk predates the field — an old record must
+    // load as "not a catalog copy" and must not gain a null key on save.
+    let record: AgentDefinition = serde_json::from_str(
+        r#"{
+            "id": "persona-1",
+            "display_name": "Test",
+            "avatar_url": null,
+            "system_prompt": "Prompt",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#,
+    )
+    .expect("pre-catalog-source persona should deserialize");
+
+    assert_eq!(record.catalog_source, None);
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(
+        !json.contains("catalog_source"),
+        "absent provenance must stay absent on disk: {json}"
+    );
+}
+
+#[test]
+fn persona_catalog_source_survives_the_agent_store_fold() {
+    // Provenance is only useful if it is still there on the next launch, and
+    // `save_personas` funnels every definition through `into_agent_record`.
+    let mut persona = sample_persona();
+    persona.catalog_source = Some(CatalogSource {
+        owner_pubkey: "a".repeat(64),
+        persona_id: "helper".to_string(),
+    });
+
+    let view = persona
+        .clone()
+        .into_agent_record()
+        .to_definition_view()
+        .expect("slugged record must present a persona view");
+
+    assert_eq!(view.catalog_source, persona.catalog_source);
 }
 
 #[test]
@@ -508,12 +585,26 @@ fn persona_into_agent_record_is_keyless_and_slugged() {
 }
 
 #[test]
+fn alternate_acp_command_survives_the_agent_store_fold() {
+    let mut persona = sample_persona();
+    persona.acp_command = Some("buzz-janet-acp".to_string());
+
+    let view = persona
+        .clone()
+        .into_agent_record()
+        .to_definition_view()
+        .expect("slugged record must present a persona view");
+
+    assert_eq!(view.acp_command, persona.acp_command);
+}
+
+#[test]
 fn persona_view_round_trips_through_agent_record() {
     let persona = sample_persona();
     let view = persona
         .clone()
         .into_agent_record()
-        .to_persona_view()
+        .to_definition_view()
         .expect("slugged record must present a persona view");
     assert_eq!(
         serde_json::to_value(&view).unwrap(),
@@ -527,7 +618,7 @@ fn keyed_record_without_slug_has_no_persona_view() {
     let mut record = sample_persona().into_agent_record();
     record.slug = None;
     assert!(
-        record.to_persona_view().is_none(),
+        record.to_definition_view().is_none(),
         "instances (no slug) are not definitions"
     );
 }
@@ -543,11 +634,10 @@ fn empty_prompt_folds_to_none() {
 
 use super::resolve_mint_behavioral_defaults;
 
-fn quad_definition(respond_to: &str, allowlist: Vec<&str>) -> PersonaRecord {
+fn quad_definition(respond_to: &str, allowlist: Vec<&str>) -> AgentDefinition {
     let mut persona = sample_persona();
     persona.respond_to = Some(respond_to.to_string());
     persona.respond_to_allowlist = allowlist.into_iter().map(str::to_string).collect();
-    persona.mcp_toolsets = Some("default,canvas".to_string());
     persona.parallelism = Some(8);
     persona
 }
@@ -558,13 +648,11 @@ fn mint_explicit_input_wins_over_definition() {
     let minted = resolve_mint_behavioral_defaults(
         Some(RespondTo::OwnerOnly),
         Vec::new(),
-        Some("default".to_string()),
         Some(2),
         Some(&definition),
     )
     .unwrap();
     assert_eq!(minted.respond_to, RespondTo::OwnerOnly);
-    assert_eq!(minted.mcp_toolsets.as_deref(), Some("default"));
     assert_eq!(minted.parallelism, Some(2));
 }
 
@@ -573,19 +661,17 @@ fn mint_copies_definition_quad_when_input_silent() {
     let allow = "a".repeat(64);
     let definition = quad_definition("allowlist", vec![&allow]);
     let minted =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, None, Some(&definition)).unwrap();
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
     assert_eq!(minted.respond_to, RespondTo::Allowlist);
     assert_eq!(minted.respond_to_allowlist, vec![allow]);
-    assert_eq!(minted.mcp_toolsets.as_deref(), Some("default,canvas"));
     assert_eq!(minted.parallelism, Some(8));
 }
 
 #[test]
 fn mint_without_definition_or_input_uses_client_defaults() {
-    let minted = resolve_mint_behavioral_defaults(None, Vec::new(), None, None, None).unwrap();
+    let minted = resolve_mint_behavioral_defaults(None, Vec::new(), None, None).unwrap();
     assert_eq!(minted.respond_to, RespondTo::default());
     assert!(minted.respond_to_allowlist.is_empty());
-    assert_eq!(minted.mcp_toolsets, None);
     assert_eq!(minted.parallelism, None);
 }
 
@@ -595,8 +681,8 @@ fn mint_fails_loudly_on_unknown_definition_respond_to() {
     // author intended SOMETHING, and guessing which thing is the one wrong
     // move. The error must carry the offending string.
     let definition = quad_definition("allowlst", vec![]);
-    let err = resolve_mint_behavioral_defaults(None, Vec::new(), None, None, Some(&definition))
-        .unwrap_err();
+    let err =
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap_err();
     assert!(
         err.contains("allowlst"),
         "error must name the bad mode: {err}"
@@ -608,8 +694,8 @@ fn mint_fails_loudly_on_empty_definition_allowlist() {
     // Inbound definitions bypass the dialog guard entirely — the mint
     // boundary is the backstop against a crash-looping instance.
     let definition = quad_definition("allowlist", vec![]);
-    let err = resolve_mint_behavioral_defaults(None, Vec::new(), None, None, Some(&definition))
-        .unwrap_err();
+    let err =
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap_err();
     assert!(
         err.contains("at least one pubkey"),
         "unexpected error: {err}"
@@ -620,8 +706,8 @@ fn mint_fails_loudly_on_empty_definition_allowlist() {
 fn mint_fails_loudly_on_out_of_range_definition_parallelism() {
     let mut definition = quad_definition("anyone", vec![]);
     definition.parallelism = Some(64);
-    let err = resolve_mint_behavioral_defaults(None, Vec::new(), None, None, Some(&definition))
-        .unwrap_err();
+    let err =
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap_err();
     assert!(err.contains("64"), "error must name the bad value: {err}");
 }
 
@@ -630,30 +716,17 @@ fn mint_normalizes_definition_allowlist_from_wire() {
     let upper = "A".repeat(64);
     let definition = quad_definition("allowlist", vec![&upper]);
     let minted =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, None, Some(&definition)).unwrap();
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
     assert_eq!(minted.respond_to_allowlist, vec!["a".repeat(64)]);
 }
 
 #[test]
-fn mint_resolves_each_quad_field_independently() {
+fn mint_resolves_each_behavioral_field_independently() {
     // PR #1667 review (convergent): the input-wins rule is per-FIELD, not
-    // all-or-nothing — explicit toolsets must not stop respond_to or
-    // parallelism from inheriting.
     let definition = quad_definition("anyone", vec![]);
-    let minted = resolve_mint_behavioral_defaults(
-        None,
-        Vec::new(),
-        Some("explicit-toolsets".to_string()),
-        None,
-        Some(&definition),
-    )
-    .unwrap();
+    let minted =
+        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
     assert_eq!(minted.respond_to, RespondTo::Anyone, "inherited");
-    assert_eq!(
-        minted.mcp_toolsets.as_deref(),
-        Some("explicit-toolsets"),
-        "explicit input wins"
-    );
     assert_eq!(minted.parallelism, Some(8), "inherited");
 }
 
@@ -661,10 +734,101 @@ fn mint_resolves_each_quad_field_independently() {
 fn mint_rejects_out_of_range_input_parallelism() {
     // The "validated when present" contract on MintBehavioralDefaults holds
     // for the INPUT branch too, not just definition values.
-    let err = resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(64), None).unwrap_err();
+    let err = resolve_mint_behavioral_defaults(None, Vec::new(), Some(64), None).unwrap_err();
     assert!(err.contains("64"), "error must name the bad value: {err}");
     assert!(
         !err.contains("definition"),
         "input-branch error must not blame the definition: {err}"
+    );
+}
+
+// ── Restart-diff wire shape ─────────────────────────────────────────────────
+
+fn summary_fixture(
+    restart_diff: Vec<crate::managed_agents::spawn_snapshot::RestartDiffEntry>,
+) -> super::ManagedAgentSummary {
+    super::ManagedAgentSummary {
+        session_policy: Default::default(),
+        pubkey: "aa".repeat(32),
+        name: "test".into(),
+        persona_id: None,
+        runtime: None,
+        team_id: None,
+        relay_url: String::new(),
+        acp_command: "buzz-acp".into(),
+        agent_command: "goose".into(),
+        agent_command_override: None,
+        agent_args: Vec::new(),
+        mcp_command: String::new(),
+        turn_timeout_seconds: 320,
+        idle_timeout_seconds: None,
+        max_turn_duration_seconds: None,
+        parallelism: 1,
+        system_prompt: None,
+        avatar_url: None,
+        model: None,
+        model_source: None,
+        provider: None,
+        persona_out_of_date: false,
+        persona_orphaned: false,
+        // Both fields derive from one vector in `build_managed_agent_summary`;
+        // the fixture reproduces that rule rather than letting them disagree.
+        needs_restart: !restart_diff.is_empty(),
+        restart_diff,
+        env_vars: Default::default(),
+        backend: super::BackendKind::Local,
+        backend_agent_id: None,
+        status: "running".into(),
+        pid: Some(4242),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        last_started_at: None,
+        last_stopped_at: None,
+        last_exit_code: None,
+        last_error: None,
+        last_error_code: None,
+        start_on_app_launch: false,
+        auto_restart_on_config_change: false,
+        log_path: String::new(),
+        respond_to: RespondTo::OwnerOnly,
+        respond_to_allowlist: Vec::new(),
+    }
+}
+
+#[test]
+fn summary_without_drift_omits_restart_diff_from_the_wire() {
+    // An adopted `runtime_pid`-only process is never stamped, so its summary
+    // carries an empty vector. `skip_serializing_if` must then drop the key
+    // entirely — the frontend normalizes omission to `[]`, and emitting an
+    // empty array on every stopped agent would bloat every list response.
+    let wire = serde_json::to_value(summary_fixture(Vec::new())).expect("summary serializes");
+    assert_eq!(wire.get("needs_restart"), Some(&serde_json::json!(false)));
+    assert!(
+        wire.get("restart_diff").is_none(),
+        "empty restart_diff must be omitted, got: {wire}"
+    );
+}
+
+#[test]
+fn summary_with_drift_serializes_restart_diff_entries() {
+    // The other side of the same rule: a present entry must reach the wire
+    // under its snake_case key with the tagged change payload intact.
+    let wire = serde_json::to_value(summary_fixture(vec![
+        crate::managed_agents::spawn_snapshot::RestartDiffEntry {
+            field: "model".into(),
+            change: crate::managed_agents::spawn_snapshot::diff::RestartChange::Value {
+                before: serde_json::json!("gpt-5"),
+                after: serde_json::json!("claude-4"),
+            },
+        },
+    ]))
+    .expect("summary serializes");
+    assert_eq!(wire.get("needs_restart"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        wire.get("restart_diff"),
+        Some(&serde_json::json!([{
+            "field": "model",
+            "change": { "kind": "value", "before": "gpt-5", "after": "claude-4" },
+        }]))
     );
 }

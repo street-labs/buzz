@@ -10,30 +10,38 @@ import {
   useTeamsQuery,
   useUpdateTeamMutation,
 } from "@/features/agents/hooks";
+import type { CatalogTeamShareLevel } from "@/features/agents/lib/teamCatalogRelay";
+import {
+  catalogTeamsFromPublications,
+  type CatalogTeam,
+} from "@/features/agents/lib/teamCatalogRelay";
+import {
+  useAddTeamFromCatalogMutation,
+  useSetTeamCatalogSharedMutation,
+  useTeamCatalogLiveUpdates,
+  useTeamCatalogQuery,
+} from "@/features/agents/lib/useTeamCatalogRelay";
+import { useCommunities } from "@/features/communities/useCommunities";
 import type { CreateChannelManagedAgentsResult } from "@/features/agents/channelAgents";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { deletePersona } from "@/shared/api/tauriPersonas";
 import {
-  type ParsedTeamPreview,
-  createTeam as createTeamApi,
-  exportTeamToJson,
-  installTeamFromDirectory,
-  parseTeamFile,
-  pickTeamDirectory,
-  syncTeamDirectory,
+  confirmTeamSnapshotImport,
+  exportTeamSnapshot,
+  previewTeamSnapshotImport,
+  type SnapshotFormat,
+  type SnapshotMemoryLevel,
+  type TeamSnapshotImportPreview,
+  type TeamSnapshotImportResult,
 } from "@/shared/api/tauriTeams";
-import {
-  createPersona,
-  deletePersona,
-  updatePersona,
-} from "@/shared/api/tauriPersonas";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
-  AgentPersona,
   AgentTeam,
   Channel,
   CreateTeamInput,
   UpdateTeamInput,
 } from "@/shared/api/types";
-import { buildTeamImportPlan } from "./teamImportPlan";
+import { deriveImportToast } from "./teamSnapshotImport.lib";
+import { teamShareNotice } from "./teamLibraryCopy";
 
 type TeamDialogState = {
   description: string;
@@ -52,28 +60,22 @@ type RefetchCallbacks = {
   refetchRelayAgents: () => void;
 };
 
-type TeamImportUpdateApplyInput = {
-  personas: AgentPersona[];
-  updateTeamInfo: boolean;
-  selectedUpdatedPersonaIds: string[];
-  selectedNewMemberIndexes: number[];
-  missingPersonaIdsToRemove: string[];
-  deleteRemovedAgents: boolean;
-};
-
 export function useTeamActions(
   actions: ActionMessages,
   refetch: RefetchCallbacks,
 ) {
   const queryClient = useQueryClient();
+  const { activeCommunity } = useCommunities();
+  const identityQuery = useIdentityQuery();
+  const communityId = activeCommunity?.id ?? null;
   const teamsQuery = useTeamsQuery();
+  const catalogQuery = useTeamCatalogQuery(communityId);
+  useTeamCatalogLiveUpdates(communityId);
+  const setCatalogSharedMutation = useSetTeamCatalogSharedMutation(communityId);
+  const addTeamFromCatalogMutation = useAddTeamFromCatalogMutation();
   const createTeamMutation = useCreateTeamMutation();
   const updateTeamMutation = useUpdateTeamMutation();
   const deleteTeamMutation = useDeleteTeamMutation();
-
-  const exportTeamJsonMutation = useMutation({
-    mutationFn: (id: string) => exportTeamToJson(id),
-  });
 
   const [teamDialogState, setTeamDialogState] =
     React.useState<TeamDialogState>(null);
@@ -82,20 +84,56 @@ export function useTeamActions(
   );
   const [teamToAddToChannel, setTeamToAddToChannel] =
     React.useState<AgentTeam | null>(null);
-  const [teamImportPreview, setTeamImportPreview] = React.useState<{
-    preview: ParsedTeamPreview;
+  const [teamToExport, setTeamToExport] = React.useState<AgentTeam | null>(
+    null,
+  );
+  const [teamToShare, setTeamToShare] = React.useState<AgentTeam | null>(null);
+  const [teamSnapshotImportState, setTeamSnapshotImportState] = React.useState<{
+    fileBytes: number[];
     fileName: string;
+    preview: TeamSnapshotImportPreview;
   } | null>(null);
-  const [teamImportTarget, setTeamImportTarget] =
-    React.useState<AgentTeam | null>(null);
-  const [teamImportTargetPreview, setTeamImportTargetPreview] = React.useState<{
-    preview: ParsedTeamPreview;
-    fileName: string;
-  } | null>(null);
-  const [isApplyingTeamImportUpdate, setIsApplyingTeamImportUpdate] =
-    React.useState(false);
+  const [teamSnapshotImportResult, setTeamSnapshotImportResult] =
+    React.useState<TeamSnapshotImportResult | null>(null);
+  const [teamSnapshotImportConfirmError, setTeamSnapshotImportConfirmError] =
+    React.useState<string | null>(null);
+
+  const exportTeamSnapshotMutation = useMutation({
+    mutationFn: async ({
+      id,
+      memoryLevel,
+      format,
+    }: {
+      id: string;
+      memoryLevel: SnapshotMemoryLevel;
+      format: SnapshotFormat;
+    }) => exportTeamSnapshot(id, memoryLevel, format),
+  });
+  const previewTeamSnapshotImportMutation = useMutation({
+    mutationFn: ({
+      fileBytes,
+      fileName,
+    }: {
+      fileBytes: number[];
+      fileName: string;
+    }) => previewTeamSnapshotImport(fileBytes, fileName),
+  });
+  const confirmTeamSnapshotImportMutation = useMutation({
+    mutationFn: (input: { fileBytes: number[]; keepAllowlist: boolean }) =>
+      confirmTeamSnapshotImport(input),
+  });
 
   const teams = teamsQuery.data ?? [];
+  const publications = catalogQuery.data ?? [];
+  const catalogTeams = React.useMemo(
+    () =>
+      catalogTeamsFromPublications(
+        publications,
+        teams,
+        identityQuery.data?.pubkey,
+      ),
+    [identityQuery.data?.pubkey, publications, teams],
+  );
 
   async function handleTeamSubmit(input: CreateTeamInput | UpdateTeamInput) {
     actions.setActionNoticeMessage(null);
@@ -183,323 +221,6 @@ export function useTeamActions(
     });
   }
 
-  function handleExportTeam(team: AgentTeam) {
-    exportTeamJsonMutation.mutate(team.id, {
-      onSuccess: (saved) => {
-        if (saved) {
-          actions.setActionNoticeMessage(`Exported team "${team.name}".`);
-        }
-      },
-      onError: (err) => {
-        actions.setActionErrorMessage(
-          err instanceof Error ? err.message : "Failed to export team.",
-        );
-      },
-    });
-  }
-
-  async function handleImportFile(fileBytes: number[], fileName: string) {
-    actions.setActionNoticeMessage(null);
-    actions.setActionErrorMessage(null);
-    try {
-      const preview = await parseTeamFile(fileBytes, fileName);
-      setTeamImportPreview({ preview, fileName });
-    } catch (err) {
-      actions.setActionErrorMessage(
-        err instanceof Error ? err.message : "Failed to parse team file.",
-      );
-    }
-  }
-
-  async function handleInstallFromDirectory() {
-    actions.setActionNoticeMessage(null);
-    actions.setActionErrorMessage(null);
-    try {
-      const path = await pickTeamDirectory();
-      if (!path) return;
-      const team = await installTeamFromDirectory(path, true);
-      actions.setActionNoticeMessage(
-        `Installed team "${team.name}" from directory.`,
-      );
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: teamsQueryKey }),
-        queryClient.invalidateQueries({ queryKey: personasQueryKey }),
-        queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
-      ]);
-      setTeamDialogState(null);
-    } catch (err) {
-      actions.setActionErrorMessage(
-        err instanceof Error
-          ? err.message
-          : "Failed to install team from directory.",
-      );
-    }
-  }
-
-  async function handleSyncTeam(team: AgentTeam) {
-    actions.setActionNoticeMessage(null);
-    actions.setActionErrorMessage(null);
-    try {
-      const result = await syncTeamDirectory(team.id);
-      const changes = [
-        result.personas_added.length > 0 &&
-          `${result.personas_added.length} added`,
-        result.personas_updated.length > 0 &&
-          `${result.personas_updated.length} updated`,
-        result.personas_removed.length > 0 &&
-          `${result.personas_removed.length} removed`,
-      ].filter(Boolean);
-      const summary =
-        changes.length > 0 ? changes.join(", ") : "already up to date";
-      actions.setActionNoticeMessage(`Synced "${team.name}": ${summary}.`);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: teamsQueryKey }),
-        queryClient.invalidateQueries({ queryKey: personasQueryKey }),
-        queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
-      ]);
-    } catch (err) {
-      actions.setActionErrorMessage(
-        err instanceof Error ? err.message : "Failed to sync team directory.",
-      );
-    }
-  }
-
-  function handleRevealInFinder(team: AgentTeam) {
-    if (!team.sourceDir) return;
-    void revealItemInDir(team.sourceDir);
-  }
-
-  async function handleEditDialogImportUpdateFile(
-    teamId: string,
-    fileBytes: number[],
-    fileName: string,
-  ) {
-    actions.setActionNoticeMessage(null);
-    actions.setActionErrorMessage(null);
-
-    const team = teams.find((candidate) => candidate.id === teamId);
-    if (!team) {
-      const message = "Team not found. Refresh and try again.";
-      actions.setActionErrorMessage(message);
-      throw new Error(message);
-    }
-
-    try {
-      const preview = await parseTeamFile(fileBytes, fileName);
-      setTeamImportTarget(team);
-      setTeamImportTargetPreview({ preview, fileName });
-      setTeamDialogState(null);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to parse team file.";
-      actions.setActionErrorMessage(message);
-      throw err instanceof Error ? err : new Error(message);
-    }
-  }
-
-  function closeImportUpdateDialog() {
-    setTeamImportTarget(null);
-    setTeamImportTargetPreview(null);
-    setIsApplyingTeamImportUpdate(false);
-  }
-
-  function clearImportUpdateAndReturnToEdit() {
-    if (!teamImportTarget) {
-      closeImportUpdateDialog();
-      return;
-    }
-
-    const team = teamImportTarget;
-    closeImportUpdateDialog();
-    openEditDialog(team);
-  }
-
-  async function handleTeamImportUpdateApply({
-    personas,
-    updateTeamInfo,
-    selectedUpdatedPersonaIds,
-    selectedNewMemberIndexes,
-    missingPersonaIdsToRemove,
-    deleteRemovedAgents,
-  }: TeamImportUpdateApplyInput) {
-    if (!teamImportTarget || !teamImportTargetPreview) {
-      throw new Error("No team import update is currently open.");
-    }
-
-    actions.setActionNoticeMessage(null);
-    actions.setActionErrorMessage(null);
-    setIsApplyingTeamImportUpdate(true);
-
-    const plan = buildTeamImportPlan({
-      team: teamImportTarget,
-      personas,
-      preview: teamImportTargetPreview.preview,
-    });
-    const selectedUpdatedPersonaIdSet = new Set(selectedUpdatedPersonaIds);
-    const selectedNewMemberIndexSet = new Set(selectedNewMemberIndexes);
-    const removePersonaIdSet = new Set(missingPersonaIdsToRemove);
-
-    try {
-      let updatedMembersCount = 0;
-      for (const member of plan.membersToUpdate) {
-        if (!selectedUpdatedPersonaIdSet.has(member.existing.id)) {
-          continue;
-        }
-        await updatePersona({
-          id: member.existing.id,
-          displayName: member.imported.display_name,
-          systemPrompt: member.imported.system_prompt,
-          avatarUrl: member.imported.avatar_url ?? undefined,
-          runtime: member.existing.runtime ?? undefined,
-          model: member.existing.model ?? undefined,
-          namePool: [...member.existing.namePool],
-        });
-        updatedMembersCount += 1;
-      }
-
-      const createdPersonaIdsByImportedIndex = new Map<number, string>();
-      for (const member of plan.newMembers) {
-        if (!selectedNewMemberIndexSet.has(member.importedIndex)) {
-          continue;
-        }
-        const created = await createPersona({
-          displayName: member.imported.display_name,
-          systemPrompt: member.imported.system_prompt,
-          avatarUrl: member.imported.avatar_url ?? undefined,
-        });
-        createdPersonaIdsByImportedIndex.set(member.importedIndex, created.id);
-      }
-
-      const matchedPersonaIdsByImportedIndex = new Map<number, string>();
-      for (const member of plan.matchedMembers) {
-        matchedPersonaIdsByImportedIndex.set(
-          member.importedIndex,
-          member.existing.id,
-        );
-      }
-
-      const nextPersonaIds: string[] = [];
-      for (
-        let importedIndex = 0;
-        importedIndex < teamImportTargetPreview.preview.personas.length;
-        importedIndex += 1
-      ) {
-        const matchedId = matchedPersonaIdsByImportedIndex.get(importedIndex);
-        if (matchedId) {
-          nextPersonaIds.push(matchedId);
-          continue;
-        }
-
-        const createdId = createdPersonaIdsByImportedIndex.get(importedIndex);
-        if (createdId) {
-          nextPersonaIds.push(createdId);
-        }
-      }
-
-      const removedMembers = plan.missingMembers.filter((member) =>
-        removePersonaIdSet.has(member.existing.id),
-      );
-      const keptMissingMembers = plan.missingMembers.filter(
-        (member) => !removePersonaIdSet.has(member.existing.id),
-      );
-      for (const member of keptMissingMembers) {
-        nextPersonaIds.push(member.existing.id);
-      }
-
-      const nextTeamName = updateTeamInfo
-        ? teamImportTargetPreview.preview.name
-        : teamImportTarget.name;
-      const nextTeamDescription = updateTeamInfo
-        ? (teamImportTargetPreview.preview.description ?? undefined)
-        : (teamImportTarget.description ?? undefined);
-
-      await updateTeamMutation.mutateAsync({
-        id: teamImportTarget.id,
-        name: nextTeamName,
-        description: nextTeamDescription,
-        personaIds: nextPersonaIds,
-      });
-
-      let deletedAgentsCount = 0;
-      const deleteFailures: string[] = [];
-      const addedMembersCount = createdPersonaIdsByImportedIndex.size;
-      if (deleteRemovedAgents && removedMembers.length > 0) {
-        for (const member of removedMembers) {
-          try {
-            await deletePersona(member.existing.id);
-            deletedAgentsCount += 1;
-          } catch (error) {
-            const reason =
-              error instanceof Error ? error.message : String(error);
-            deleteFailures.push(`${member.existing.displayName}: ${reason}`);
-          }
-        }
-      }
-
-      actions.setActionNoticeMessage(
-        `Updated "${nextTeamName}" from import. ${updatedMembersCount} member${updatedMembersCount === 1 ? "" : "s"} updated, ${addedMembersCount} added, ${removedMembers.length} removed from the team${deleteRemovedAgents ? `, and ${deletedAgentsCount} removed from My Agents` : ""}.`,
-      );
-
-      if (deleteFailures.length > 0) {
-        actions.setActionErrorMessage(
-          `Team updated, but ${deleteFailures.length} agent${deleteFailures.length === 1 ? "" : "s"} could not be removed: ${deleteFailures.join("; ")}`,
-        );
-      }
-
-      closeImportUpdateDialog();
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: personasQueryKey }),
-        queryClient.invalidateQueries({ queryKey: teamsQueryKey }),
-        queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
-      ]);
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Failed to apply imported team update.";
-      actions.setActionErrorMessage(message);
-      throw error instanceof Error ? error : new Error(message);
-    } finally {
-      setIsApplyingTeamImportUpdate(false);
-    }
-  }
-
-  function handleTeamImportComplete(
-    teamName: string,
-    teamDescription: string | null,
-    personaIds: string[],
-  ) {
-    setTeamImportPreview(null);
-    void (async () => {
-      const teamInput = {
-        name: teamName,
-        description: teamDescription ?? undefined,
-        personaIds,
-      };
-
-      // Try creating the team, retry once on failure.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          await createTeamApi(teamInput);
-          actions.setActionNoticeMessage(
-            `Imported team "${teamName}" with ${personaIds.length} agent${personaIds.length !== 1 ? "s" : ""}.`,
-          );
-          void queryClient.invalidateQueries({ queryKey: personasQueryKey });
-          void queryClient.invalidateQueries({ queryKey: teamsQueryKey });
-          return;
-        } catch {
-          if (attempt === 0) continue;
-        }
-      }
-
-      // Both attempts failed — personas exist but team doesn't.
-      actions.setActionErrorMessage(
-        `Imported ${personaIds.length} agent${personaIds.length !== 1 ? "s" : ""} but failed to create team "${teamName}". The agents are saved — create a team manually to group them.`,
-      );
-      void queryClient.invalidateQueries({ queryKey: personasQueryKey });
-    })();
-  }
-
   async function handleDeleteRemovedPersonas(personaIds: string[]) {
     for (const id of personaIds) {
       try {
@@ -525,45 +246,212 @@ export function useTeamActions(
         id: team.id,
         name: team.name,
         description: team.description ?? "",
+        instructions: team.instructions ?? undefined,
         personaIds: [...team.personaIds],
       },
     });
   }
 
+  function openExportSnapshot(team: AgentTeam) {
+    actions.setActionNoticeMessage(null);
+    actions.setActionErrorMessage(null);
+    setTeamToExport(team);
+  }
+
+  function openShare(team: AgentTeam) {
+    actions.setActionNoticeMessage(null);
+    actions.setActionErrorMessage(null);
+    setTeamToShare(team);
+  }
+
+  function getTeamCatalogShareLevel(team: AgentTeam): CatalogTeamShareLevel {
+    return team.shared ? "none" : "not-shared";
+  }
+
+  async function setTeamCatalogShareLevel(
+    team: AgentTeam,
+    shareLevel: CatalogTeamShareLevel,
+  ): Promise<void> {
+    if (team.isBuiltin) return;
+
+    actions.setActionNoticeMessage(null);
+    actions.setActionErrorMessage(null);
+    const shared = shareLevel !== "not-shared";
+    try {
+      const result = await setCatalogSharedMutation.mutateAsync({
+        id: team.id,
+        shared,
+      });
+      // The open dialog holds its own copy of the team, so re-point it at the
+      // returned record — otherwise the toggle snaps back to its old value.
+      setTeamToShare((current) =>
+        current?.id === result.team.id ? result.team : current,
+      );
+      actions.setActionNoticeMessage(
+        teamShareNotice(team.name, shared, result.publicationStatus),
+      );
+    } catch (error) {
+      actions.setActionErrorMessage(
+        error instanceof Error
+          ? error.message
+          : `Failed to ${shared ? "share" : "unshare"} team.`,
+      );
+    }
+  }
+
+  /**
+   * Add a published team.
+   *
+   * Only the coordinate is sent; the backend re-verifies the head, so an entry
+   * retracted or republished while the dialog sat open fails loudly here
+   * rather than copying a stale projection.
+   */
+  async function handleAddTeamFromCatalog(
+    team: CatalogTeam,
+    onSuccess?: () => void,
+  ): Promise<void> {
+    actions.setActionNoticeMessage(null);
+    actions.setActionErrorMessage(null);
+    try {
+      const result = await addTeamFromCatalogMutation.mutateAsync({
+        ownerPubkey: team.ownerPubkey,
+        teamDTag: team.teamDTag,
+        eventId: team.eventId,
+      });
+      actions.setActionNoticeMessage(
+        result.alreadyPresent
+          ? `${result.team.name} is already in your teams.`
+          : `Added ${result.team.name} to your teams.`,
+      );
+      onSuccess?.();
+    } catch (error) {
+      actions.setActionErrorMessage(
+        error instanceof Error ? error.message : "Failed to add team.",
+      );
+    }
+  }
+
+  function handleExportTeamSnapshot(
+    team: AgentTeam,
+    memoryLevel: SnapshotMemoryLevel,
+    format: SnapshotFormat,
+  ) {
+    setTeamToExport(null);
+    exportTeamSnapshotMutation.mutate(
+      { id: team.id, memoryLevel, format },
+      {
+        onSuccess: (saved) => {
+          if (saved) {
+            actions.setActionNoticeMessage(`Exported ${team.name}.`);
+          }
+        },
+        onError: (error) => {
+          actions.setActionErrorMessage(
+            error instanceof Error
+              ? error.message
+              : "Failed to export team snapshot.",
+          );
+        },
+      },
+    );
+  }
+
+  async function handleImportTeamSnapshotFile(
+    fileBytes: number[],
+    fileName: string,
+  ) {
+    actions.setActionNoticeMessage(null);
+    actions.setActionErrorMessage(null);
+    try {
+      const preview = await previewTeamSnapshotImportMutation.mutateAsync({
+        fileBytes,
+        fileName,
+      });
+      setTeamSnapshotImportState({ fileBytes, fileName, preview });
+      setTeamSnapshotImportResult(null);
+      setTeamSnapshotImportConfirmError(null);
+    } catch (err) {
+      actions.setActionErrorMessage(
+        err instanceof Error
+          ? err.message
+          : "Failed to read team snapshot file.",
+      );
+    }
+  }
+
+  async function handleConfirmTeamSnapshotImport(keepAllowlist: boolean) {
+    if (!teamSnapshotImportState) {
+      return;
+    }
+    setTeamSnapshotImportConfirmError(null);
+    try {
+      const result = await confirmTeamSnapshotImportMutation.mutateAsync({
+        fileBytes: teamSnapshotImportState.fileBytes,
+        keepAllowlist,
+      });
+      setTeamSnapshotImportResult(result);
+      void queryClient.invalidateQueries({ queryKey: personasQueryKey });
+      void queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey });
+      void queryClient.invalidateQueries({ queryKey: teamsQueryKey });
+      const toast = deriveImportToast(result);
+      if (toast.type === "error") {
+        actions.setActionErrorMessage(toast.message);
+      } else {
+        actions.setActionNoticeMessage(toast.message);
+      }
+    } catch (err) {
+      setTeamSnapshotImportConfirmError(
+        err instanceof Error ? err.message : "Failed to import team snapshot.",
+      );
+    }
+  }
+
+  function closeTeamSnapshotImportDialog() {
+    setTeamSnapshotImportState(null);
+    setTeamSnapshotImportResult(null);
+    setTeamSnapshotImportConfirmError(null);
+  }
+
   return {
     teams,
     teamsQuery,
+    catalogQuery,
+    catalogTeams,
+    isAddingFromCatalog: addTeamFromCatalogMutation.isPending,
+    isCatalogSharePending: setCatalogSharedMutation.isPending,
     createTeamMutation,
     updateTeamMutation,
     deleteTeamMutation,
-    exportTeamJsonMutation,
     teamDialogState,
     setTeamDialogState,
     teamToDelete,
     setTeamToDelete,
     teamToAddToChannel,
     setTeamToAddToChannel,
-    teamImportPreview,
-    setTeamImportPreview,
-    teamImportTarget,
-    teamImportTargetPreview,
-    isApplyingTeamImportUpdate,
+    teamToExport,
+    setTeamToExport,
+    teamToShare,
+    setTeamToShare,
+    teamSnapshotImportState,
+    teamSnapshotImportResult,
+    teamSnapshotImportConfirmError,
+    isTeamSnapshotImportConfirming: confirmTeamSnapshotImportMutation.isPending,
+    exportTeamSnapshotMutation,
     handleTeamSubmit,
     handleDeleteRemovedPersonas,
     handleDeleteTeam,
     handleTeamDeployed,
-    handleExportTeam,
-    handleImportFile,
-    handleInstallFromDirectory,
-    handleSyncTeam,
-    handleRevealInFinder,
-    handleEditDialogImportUpdateFile,
-    handleTeamImportComplete,
-    handleTeamImportUpdateApply,
-    closeImportUpdateDialog,
-    clearImportUpdateAndReturnToEdit,
     openCreateDialog,
     openDuplicateDialog,
     openEditDialog,
+    openExportSnapshot,
+    openShare,
+    getTeamCatalogShareLevel,
+    setTeamCatalogShareLevel,
+    handleAddTeamFromCatalog,
+    handleExportTeamSnapshot,
+    handleImportTeamSnapshotFile,
+    handleConfirmTeamSnapshotImport,
+    closeTeamSnapshotImportDialog,
   };
 }

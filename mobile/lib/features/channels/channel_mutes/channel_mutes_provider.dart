@@ -1,9 +1,9 @@
+import 'package:flutter/widgets.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
 import '../../../shared/relay/relay.dart';
 import '../../../shared/theme/theme_provider.dart';
-import '../../../shared/workspace/workspace_provider.dart';
+import '../../../shared/community/community_provider.dart';
 import 'channel_mutes_manager.dart';
 import 'channel_mutes_storage.dart';
 
@@ -23,31 +23,27 @@ class ChannelMutesState {
 
 class ChannelMutesNotifier extends Notifier<ChannelMutesState> {
   ChannelMutesManager? _manager;
+  bool _isInitialized = false;
 
   @override
   ChannelMutesState build() {
     _manager?.dispose(flushPending: false);
     _manager = null;
+    _isInitialized = false;
 
     final relayConfig = ref.watch(relayConfigProvider);
     final sessionState = ref.watch(relaySessionProvider);
-    // Rebuild when the active workspace changes (pubkey may differ).
-    ref.watch(activeWorkspaceProvider);
+    // Rebuild when the active community changes (pubkey may differ).
+    ref.watch(activeCommunityProvider);
 
     final nsec = relayConfig.nsec?.trim();
     if (nsec == null || nsec.isEmpty) {
       return const ChannelMutesState();
     }
 
-    final pubkey = _safePubkeyFromNsec(nsec);
-    if (pubkey == null || pubkey.isEmpty) {
-      return const ChannelMutesState();
-    }
-
-    final ChannelMutesCrypto crypto;
-    try {
-      crypto = ChannelMutesCrypto(nsec, pubkey);
-    } catch (_) {
+    final pubkey = ref.watch(myPubkeyProvider);
+    final crypto = ref.watch(channelMutesCryptoProvider);
+    if (pubkey == null || crypto == null) {
       return const ChannelMutesState();
     }
 
@@ -60,6 +56,7 @@ class ChannelMutesNotifier extends Notifier<ChannelMutesState> {
     late final ChannelMutesManager manager;
     manager = ChannelMutesManager(
       pubkey: pubkey,
+      relayUrl: relayConfig.baseUrl,
       prefs: prefs,
       crypto: crypto,
       relaySession: ref.read(relaySessionProvider.notifier),
@@ -68,6 +65,11 @@ class ChannelMutesNotifier extends Notifier<ChannelMutesState> {
       onChanged: () => _emitManagerState(manager),
     );
     _manager = manager;
+
+    // Resume re-read catches an EVENT a healthy socket never delivered.
+    ref.listen(appLifecycleProvider, (_, next) {
+      if (next == AppLifecycleState.resumed) manager.refreshFromRelay();
+    });
 
     ref.onDispose(() {
       manager.dispose();
@@ -79,6 +81,7 @@ class ChannelMutesNotifier extends Notifier<ChannelMutesState> {
     Future.microtask(() async {
       await manager.initialize();
       if (_manager != manager) return;
+      _isInitialized = true;
       _emitManagerState(manager);
     });
 
@@ -92,7 +95,7 @@ class ChannelMutesNotifier extends Notifier<ChannelMutesState> {
   void _emitManagerState(ChannelMutesManager manager) {
     if (_manager != manager) return;
     state = ChannelMutesState(
-      isReady: true,
+      isReady: _isInitialized,
       store: manager.store,
       version: state.version + 1,
     );
@@ -104,12 +107,16 @@ final channelMutesProvider =
       ChannelMutesNotifier.new,
     );
 
-String? _safePubkeyFromNsec(String nsec) {
+/// Identity-scoped crypto survives connection status changes. A community or
+/// signing-key change replaces it through [relayConfigProvider].
+final channelMutesCryptoProvider = Provider<ChannelMutesCrypto?>((ref) {
+  final config = ref.watch(relayConfigProvider);
+  final pubkey = ref.watch(myPubkeyProvider);
+  final nsec = config.nsec?.trim();
+  if (nsec == null || nsec.isEmpty || pubkey == null) return null;
   try {
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    if (privkeyHex.isEmpty) return null;
-    return nostr.Keys(privkeyHex).public;
+    return ChannelMutesCrypto(nsec, pubkey);
   } catch (_) {
     return null;
   }
-}
+});

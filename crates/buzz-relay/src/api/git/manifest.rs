@@ -37,6 +37,12 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// Hydration indexes packs one at a time, but an unbounded pack list still
 /// turns one request into unbounded object-store and git subprocess work.
 pub const MAX_MANIFEST_PACKS: usize = 128;
+/// Pack count that triggers proactive consolidation during the next accepted push.
+///
+/// Keeping one quarter of the manifest capacity in reserve prevents a hot
+/// repository from reaching the hard limit while a prior compaction attempt
+/// falls back to the normal delta-pack path.
+pub const PACK_COMPACTION_THRESHOLD: usize = MAX_MANIFEST_PACKS * 3 / 4;
 /// Maximum number of refs one manifest may advertise.
 pub const MAX_MANIFEST_REFS: usize = 10_000;
 
@@ -466,6 +472,17 @@ mod tests {
         let mut m = sample();
         m.parent = None;
         m.validate().expect("no parent is fine (first push)");
+    }
+
+    #[test]
+    fn pointer_writer_is_covered_by_deletion_taxonomy() {
+        let community = CommunityId::from_uuid(uuid::Uuid::from_u128(1));
+        let owner = "a".repeat(64);
+        let key = pointer_key(community, &owner, "repo");
+        let prefixes = buzz_media::tenant_prefixes(*community.as_uuid());
+
+        assert!(prefixes.iter().any(|prefix| key.starts_with(prefix)));
+        assert!(buzz_media::is_tenant_owned_key(*community.as_uuid(), &key));
     }
 
     #[test]

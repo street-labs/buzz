@@ -13,11 +13,21 @@ pub enum BackendKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersonaRecord {
+pub struct AgentDefinition {
     pub id: String,
     pub display_name: String,
     pub avatar_url: Option<String>,
+    /// Optional short, PUBLIC description (max 280 chars), shown on the
+    /// agent's card/profile and carried on the public kind:30175 persona
+    /// event. EXCLUDED from `persona_content_hash` (no restart badge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub system_prompt: String,
+    /// ACP transport command selected alongside the runtime before deployment.
+    /// `None` preserves legacy definitions that predate persona-owned ACP
+    /// selection; linked instances then fall back to their stored command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_command: Option<String>,
     /// Preferred ACP runtime ID (e.g., 'goose', 'claude', 'codex'). Determines which agent binary
     /// Buzz spawns. When deploying from this persona, this runtime is pre-selected in the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +50,13 @@ pub struct PersonaRecord {
     pub is_builtin: bool,
     #[serde(default = "default_record_active")]
     pub is_active: bool,
+    /// Whether this persona is discoverable in the currently active community.
+    ///
+    /// This is a command/view projection only. Durable share state lives in
+    /// the relay+owner-scoped retention head so one workspace's choice cannot
+    /// leak into another workspace's definition record.
+    #[serde(default)]
+    pub shared: bool,
     /// Team ID if this persona was imported from a team directory.
     /// Team personas are non-editable (system_prompt, model locked).
     #[serde(
@@ -57,6 +74,19 @@ pub struct PersonaRecord {
         alias = "source_pack_persona_slug"
     )]
     pub source_team_persona_slug: Option<String>,
+    /// Provenance of a persona copied from another owner's shared catalog.
+    ///
+    /// Set only on the copy, never on the original. It is what makes
+    /// "already added" answerable for a foreign catalog entry: the copy carries
+    /// a new local id, so the only link back to the publication is this pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_source: Option<CatalogSource>,
+    /// Provenance of a persona copied out of another owner's shared TEAM
+    /// publication, as opposed to their persona catalog. Distinct from
+    /// `catalog_source` because a 30178 member is not addressable as a 30175
+    /// coordinate — see [`TeamMemberCatalogSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_catalog_source: Option<TeamMemberCatalogSource>,
     /// Harness-level configuration passed to the agent subprocess as environment variables.
     /// Opaque to Buzz — keys and values are runtime-specific.
     ///
@@ -73,17 +103,20 @@ pub struct PersonaRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub respond_to_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_toolsets: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<u32>,
+    /// ACP conversation boundary for instances launched from this definition.
+    /// Channel preserves the historical behavior for definitions written by
+    /// older clients and is omitted from storage/public events for stable bytes.
+    #[serde(default, skip_serializing_if = "super::AcpSessionPolicy::is_channel")]
+    pub session_policy: super::AcpSessionPolicy,
     pub created_at: String,
     pub updated_at: String,
 }
 
-impl PersonaRecord {
+impl AgentDefinition {
     /// Project this persona onto a key-less unified [`ManagedAgentRecord`]
     /// (Phase 1A store fold). Identity fields stay empty — keys are minted on
-    /// first start. `PersonaRecord.id` becomes `slug`, preserving the 30175
+    /// first start. `AgentDefinition.id` becomes `slug`, preserving the 30175
     /// event coordinate (`d_tag = slug`) across the fold.
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
@@ -94,7 +127,9 @@ impl PersonaRecord {
             auth_tag: None,
             relay_url: String::new(),
             avatar_url: self.avatar_url,
-            acp_command: DEFAULT_ACP_COMMAND.to_string(),
+            acp_command: self
+                .acp_command
+                .unwrap_or_else(|| DEFAULT_ACP_COMMAND.to_string()),
             agent_command: String::new(),
             agent_command_override: None,
             agent_args: Vec::new(),
@@ -103,18 +138,20 @@ impl PersonaRecord {
             idle_timeout_seconds: None,
             max_turn_duration_seconds: None,
             parallelism: default_agent_parallelism(),
+            session_policy: self.session_policy,
             system_prompt: (!self.system_prompt.is_empty()).then_some(self.system_prompt),
             model: self.model,
             provider: self.provider,
             persona_source_version: None,
-            mcp_toolsets: None,
             env_vars: self.env_vars,
             start_on_app_launch: false,
             auto_restart_on_config_change: true,
             runtime_pid: None,
             backend: BackendKind::default(),
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
+            team_id: None,
             persona_team_dir: None,
             persona_name_in_team: None,
             created_at: self.created_at,
@@ -127,50 +164,62 @@ impl PersonaRecord {
             respond_to: RespondTo::default(),
             respond_to_allowlist: Vec::new(),
             display_name: Some(self.display_name),
+            description: self.description,
             slug: Some(self.id),
             runtime: self.runtime,
             name_pool: self.name_pool,
             is_builtin: self.is_builtin,
             is_active: self.is_active,
+            // Catalog visibility is relay+owner scoped, not definition-global.
+            shared: false,
             source_team: self.source_team,
             source_team_persona_slug: self.source_team_persona_slug,
+            catalog_source: self.catalog_source,
+            team_catalog_source: self.team_catalog_source,
             definition_respond_to: self.respond_to,
             definition_respond_to_allowlist: self.respond_to_allowlist,
-            definition_mcp_toolsets: self.mcp_toolsets,
             definition_parallelism: self.parallelism,
             relay_mesh: None,
+            effort_level: None,
         }
     }
 }
 
 impl ManagedAgentRecord {
     /// Present a key-less definition record back in the legacy
-    /// [`PersonaRecord`] shape — the compatibility view the persona command
+    /// [`AgentDefinition`] shape — the compatibility view the persona command
     /// surface serves until Phase 1B unifies the UI. Inverse of
-    /// [`PersonaRecord::into_agent_record`] for the fields personas carry.
-    pub fn to_persona_view(&self) -> Option<PersonaRecord> {
+    /// [`AgentDefinition::into_agent_record`] for the fields personas carry.
+    pub fn to_definition_view(&self) -> Option<AgentDefinition> {
         let slug = self.slug.clone()?;
-        Some(PersonaRecord {
+        Some(AgentDefinition {
             id: slug,
             display_name: self
                 .display_name
                 .clone()
                 .unwrap_or_else(|| self.name.clone()),
             avatar_url: self.avatar_url.clone(),
+            description: self.description.clone(),
             system_prompt: self.system_prompt.clone().unwrap_or_default(),
+            acp_command: (self.acp_command != DEFAULT_ACP_COMMAND)
+                .then(|| self.acp_command.clone()),
             runtime: self.runtime.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
             name_pool: self.name_pool.clone(),
             is_builtin: self.is_builtin,
             is_active: self.is_active,
+            // Projected by `list_personas` from the active retention scope.
+            shared: false,
             source_team: self.source_team.clone(),
             source_team_persona_slug: self.source_team_persona_slug.clone(),
+            catalog_source: self.catalog_source.clone(),
+            team_catalog_source: self.team_catalog_source.clone(),
             env_vars: self.env_vars.clone(),
             respond_to: self.definition_respond_to.clone(),
             respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
-            mcp_toolsets: self.definition_mcp_toolsets.clone(),
             parallelism: self.definition_parallelism,
+            session_policy: self.session_policy,
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         })
@@ -180,6 +229,8 @@ impl ManagedAgentRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
+    #[serde(default)]
+    pub owner_pubkey: Option<String>,
     pub name: String,
     pub agent_type: String,
     pub channels: Vec<String>,
@@ -192,12 +243,15 @@ pub struct RelayAgentInfo {
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManagedAgentRecord {
     pub pubkey: String,
     pub name: String,
     #[serde(default)]
     pub persona_id: Option<String>,
+    /// Team this instance was deployed from. Resolves runtime team instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
     /// nsec private key. Held in memory but persisted to the OS keyring (keyed
     /// by `pubkey`) rather than serialized to `managed-agents.json`. The
     /// storage layer blanks this before writing JSON once the key is safely in
@@ -226,13 +280,9 @@ pub struct ManagedAgentRecord {
     pub avatar_url: Option<String>,
     pub acp_command: String,
     pub agent_command: String,
-    /// Explicit per-instance harness pin. `None` (the default) means inherit
-    /// the harness from the linked persona's `runtime`, so persona harness
-    /// edits propagate on the next spawn — mirroring the opt-in `model`
-    /// override. `Some` is set only when the user deliberately picks a harness
-    /// that diverges from the persona. Resolved via `effective_agent_command`;
-    /// `agent_command` above is the create-time snapshot kept for avatar/legacy
-    /// derivations and is not authoritative for spawn.
+    /// Explicit per-instance harness pin; `None` inherits the persona runtime.
+    /// The effective command is resolved at spawn; `agent_command` is a legacy
+    /// create-time snapshot.
     #[serde(default)]
     pub agent_command_override: Option<String>,
     pub agent_args: Vec<String>,
@@ -256,17 +306,28 @@ pub struct ManagedAgentRecord {
     pub max_turn_duration_seconds: Option<u64>,
     #[serde(default = "default_agent_parallelism")]
     pub parallelism: u32,
+    /// ACP conversation boundary last applied to this record. Linked agents
+    /// are re-pinned from their definition at restart; definition records use
+    /// this same field as their durable value.
+    #[serde(default, skip_serializing_if = "super::AcpSessionPolicy::is_channel")]
+    pub session_policy: super::AcpSessionPolicy,
     pub system_prompt: Option<String>,
     /// Desired LLM model ID. Matches AgentModelInfo.id from discovery.
     /// The harness re-discovers the correct ACP switching metadata at session
     /// creation by matching this ID against the fresh session/new response.
+    /// For a linked instance this is a legacy/display snapshot only — spawn
+    /// and deploy resolve the effective model from the definition, never
+    /// from this field (see `effective_config::resolve_effective_config`).
+    /// For a definition-less instance this field is authoritative.
     #[serde(default)]
     pub model: Option<String>,
-    /// LLM inference provider snapshotted from the persona at create time
-    /// (e.g. 'databricks', 'anthropic'). Spawn and deploy read this, never the
-    /// live persona — so the agent stays pinned to the provider it was created
-    /// with across restarts. `#[serde(default)]` so pre-existing records
-    /// deserialize as `None` and get backfilled on first load.
+    /// LLM inference provider. For a linked instance this is a legacy/display
+    /// snapshot only — spawn and deploy resolve the effective provider from
+    /// the definition, never from this field (see
+    /// `effective_config::resolve_effective_config`). For a definition-less
+    /// instance this field is authoritative. `#[serde(default)]` so
+    /// pre-existing records deserialize as `None` and get backfilled on
+    /// first load.
     #[serde(default)]
     pub provider: Option<String>,
     /// Content hash of the persona at the time this agent was created — the
@@ -276,10 +337,6 @@ pub struct ManagedAgentRecord {
     /// for non-persona agents and for pre-existing records pending backfill.
     #[serde(default)]
     pub persona_source_version: Option<String>,
-    /// Comma-separated toolset string forwarded as BUZZ_TOOLSETS to the MCP subprocess.
-    /// When None, the MCP server uses its own default ("default" toolset).
-    #[serde(default)]
-    pub mcp_toolsets: Option<String>,
     /// Environment variables injected at spawn time. Layered as: desktop
     /// parent env < persona `env_vars` < this agent's `env_vars` (last wins).
     ///
@@ -299,6 +356,8 @@ pub struct ManagedAgentRecord {
     pub backend: BackendKind,
     #[serde(default)]
     pub backend_agent_id: Option<String>,
+    #[serde(default)]
+    pub provider_policy_pending: bool,
     #[serde(default)]
     pub provider_binary_path: Option<String>,
     /// Installed team directory path (absolute). Set when agent was created from a team persona.
@@ -332,16 +391,23 @@ pub struct ManagedAgentRecord {
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
     /// Optional display name distinct from the unique `name` handle. Absorbed
-    /// from `PersonaRecord.display_name` (unified agent model, Phase 1A).
+    /// from `AgentDefinition.display_name` (unified agent model, Phase 1A).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Stable definition slug — the former `PersonaRecord.id`. Key-less
+    /// Optional short, PUBLIC agent description. Keyless definition records
+    /// carry the authored value; persona-linked instances leave it absent and
+    /// resolve through their definition so a second copy cannot drift.
+    /// Display metadata only (never spawn-relevant, never part of the persona
+    /// content hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Stable definition slug — the former `AgentDefinition.id`. Key-less
     /// records (definitions not yet instantiated) publish kind:30175 at
     /// `d_tag = slug`, preserving the pre-merge event coordinates. `None` for
     /// agents created directly (never persona-backed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
-    /// Absorbed from `PersonaRecord.runtime` — the preferred ACP runtime ID
+    /// Absorbed from `AgentDefinition.runtime` — the preferred ACP runtime ID
     /// (e.g. 'goose', 'claude'). Record-first command resolution reads this
     /// before falling back to legacy persona lookup; populated by the store
     /// migration and at create time, and re-mirrored from the linked
@@ -357,28 +423,43 @@ pub struct ManagedAgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
     /// Pool of short thematic names for clones of this agent. Absorbed from
-    /// `PersonaRecord.name_pool`; feeds clone naming.
+    /// `AgentDefinition.name_pool`; feeds clone naming.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub name_pool: Vec<String>,
-    /// Absorbed from `PersonaRecord.is_builtin`.
+    /// Absorbed from `AgentDefinition.is_builtin`.
     #[serde(default)]
     pub is_builtin: bool,
-    /// Absorbed from `PersonaRecord.is_active` — `false` means an archived
+    /// Absorbed from `AgentDefinition.is_active` — `false` means an archived
     /// definition hidden from pickers. Defaults `true` for existing records.
     #[serde(default = "default_record_active")]
     pub is_active: bool,
-    /// Absorbed from `PersonaRecord.source_team` — team ID when this
+    /// Legacy process-global catalog visibility field.
+    ///
+    /// New writes omit it and definition views ignore it. It remains
+    /// deserializable for branch-era stores, but active visibility is projected
+    /// from the relay+owner-scoped retention database instead.
+    #[serde(default, skip_serializing)]
+    pub shared: bool,
+    /// Absorbed from `AgentDefinition.source_team` — team ID when this
     /// definition was imported from a team directory (team definitions are
     /// non-editable). Distinct from `persona_team_dir`/`persona_name_in_team`,
     /// which are the instance-side spawn plumbing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_team: Option<String>,
-    /// Absorbed from `PersonaRecord.source_team_persona_slug` — the
+    /// Absorbed from `AgentDefinition.source_team_persona_slug` — the
     /// definition's slug within its source team.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_team_persona_slug: Option<String>,
+    /// Absorbed from `AgentDefinition.catalog_source` — the publication this
+    /// definition was copied from, when it came from another owner's catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_source: Option<CatalogSource>,
+    /// Absorbed from `AgentDefinition.team_catalog_source` — the team
+    /// publication and member this definition was copied out of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_catalog_source: Option<TeamMemberCatalogSource>,
     /// NIP-AP definition-level behavioral defaults, absorbed from
-    /// `PersonaRecord` in WIRE shape (kebab-case string / optional u32),
+    /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/
     /// `parallelism` fields above: these are what a *definition* advertises
     /// and are copied onto instances at mint time only. Wire shape (not the
@@ -390,52 +471,58 @@ pub struct ManagedAgentRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub definition_respond_to_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub definition_mcp_toolsets: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_parallelism: Option<u32>,
     /// Typed marker for relay-mesh agents. `Some(_)` means this agent runs its
     /// inference through Buzz's relay-mesh local endpoint; the `model_ref` is
     /// the served model id to route to. `None` is a normal agent.
     ///
-    /// This is the source of truth for "is this a mesh agent + which model" —
-    /// replacing the old practice of sniffing it back out of `env_vars`
-    /// (`relay_mesh_config`). Spawn-time env vars are *derived from* this, not
-    /// the other way around. `#[serde(default)]` so pre-existing saved records
-    /// deserialize as `None` and are resolved via the env-var fallback until
-    /// they are rewritten with this field.
+    /// Not the source of truth. `provider == "relay-mesh"` is, resolved through
+    /// `effective_config::resolve_effective_config`; spawn-time env vars are
+    /// derived from that resolution. This field is retained solely as a
+    /// backward-compatibility signal for records written before the record had
+    /// a `provider` field, and is consulted only for definition-less records
+    /// that carry no provider — after which the env-var preset is the last
+    /// fallback. A linked instance's marker is never read: its definition is
+    /// authoritative. `#[serde(default)]` so records predating the field
+    /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
-}
-
-/// Typed relay-mesh configuration carried on a [`ManagedAgentRecord`].
-///
-/// Feature-independent on purpose: the field is always present in the record
-/// schema so saved agents round-trip identically whether or not the `mesh-llm`
-/// feature is compiled in.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RelayMeshConfig {
-    /// The served model id this agent routes to (e.g. "Qwen3").
-    ///
-    /// `alias` because this struct crosses two boundaries with different
-    /// casing conventions: the TS create request sends camelCase
-    /// (`relayMesh: { modelRef }` — `rename_all` on the request does not
-    /// recurse into nested structs), while persisted records use snake_case.
-    /// Serialization stays `model_ref` so saved records are stable.
-    #[serde(alias = "modelRef")]
-    pub model_ref: String,
+    /// Canonical, harness-agnostic startup effort level. This is the single
+    /// persisted effort authority: at spawn the launch projection
+    /// (`config_bridge::effort`) resolves the effective value over this column
+    /// and all env tiers, then emits it under the destination runtime's native
+    /// key — `GOOSE_THINKING_EFFORT` for Goose, `BUZZ_AGENT_THINKING_EFFORT` for
+    /// buzz-agent, or the `BUZZ_ACP_EFFORT_LEVEL` startup sentinel for
+    /// Claude/Codex and keyless/unknown adapters. Preserved across runtime
+    /// switches (invalid values skip-as-absent at projection time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct ManagedAgentProcess {
     pub child: Child,
     pub log_path: PathBuf,
-    /// Digest of the effective spawn config at launch (see
-    /// `spawn_hash::spawn_config_hash`). Runtime-only — never persisted. The
-    /// summary builder recomputes the hash from current disk state and flags
-    /// `needs_restart` on mismatch. Agents adopted via a persisted
-    /// `runtime_pid` have no `ManagedAgentProcess` entry, so their spawn
-    /// config is unknown and the badge stays off.
-    pub spawn_config_hash: u64,
+    /// The effective spawn config this process was launched with (see
+    /// `spawn_snapshot::SpawnConfigSnapshot`). Runtime-only — never persisted.
+    /// The summary builder recomputes a prospective snapshot and reports
+    /// differing fields via `ManagedAgentSummary::restart_diff`. Agents
+    /// adopted via `runtime_pid` have none; their config is unknown.
+    pub spawn_config: super::spawn_snapshot::SpawnConfigSnapshot,
+    /// Whether this process was spawned in setup-listener mode (i.e.
+    /// `BUZZ_ACP_SETUP_PAYLOAD` was set at launch because the agent was
+    /// `NotReady`). Runtime-only — never persisted. Used by
+    /// `install_acp_runtime` to target only stuck agents for auto-restart,
+    /// excluding healthy in-pool agents.
+    pub setup_mode: bool,
+    /// Adapter availability status stamped at spawn time for runtimes with a
+    /// version gate (currently codex only; `None` for all others). Runtime-only
+    /// — never persisted. The summary builder compares this against the current
+    /// cached availability and sets `needs_restart` on drift, catching out-of-
+    /// band adapter changes that Phase-1 auto-restart doesn't cover.
+    pub adapter_availability: Option<AcpAvailabilityStatus>,
+    /// Unpredictable identity shared only with this harness generation.
+    pub start_nonce: String,
     /// Win32 Job Object owning the harness + its entire process tree. Closing
     /// the handle (via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) kills the whole
     /// tree — the Windows mirror of the Unix process-group teardown. `None`
@@ -449,6 +536,11 @@ pub struct ManagedAgentSummary {
     pub pubkey: String,
     pub name: String,
     pub persona_id: Option<String>,
+    /// The record's harness/runtime id (mirror of `ManagedAgentRecord.runtime`).
+    /// Lets the UI count agents referencing a harness definition (e.g. in the
+    /// delete-confirmation flow). `None` = inherit from the linked persona.
+    pub runtime: Option<String>,
+    pub team_id: Option<String>,
     pub relay_url: String,
     pub acp_command: String,
     pub agent_command: String,
@@ -467,10 +559,16 @@ pub struct ManagedAgentSummary {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: u32,
+    /// Effective definition-owned ACP conversation boundary.
+    pub session_policy: super::AcpSessionPolicy,
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub model: Option<String>,
-    /// LLM inference provider, from the agent's pinned record snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<super::effective_config::ConfigSource>,
+    /// LLM inference provider, resolved the same way as `model`/`model_source`
+    /// (definition → global for linked instances; instance → global for
+    /// definition-less instances). `None` for an orphaned instance.
     pub provider: Option<String>,
     /// `true` when the linked persona has been edited since this agent was
     /// created — the running agent uses the older pinned snapshot. The UI
@@ -479,18 +577,20 @@ pub struct ManagedAgentSummary {
     /// persona is gone, so there is nothing newer to drift toward).
     pub persona_out_of_date: bool,
     /// `true` when the agent was created from a persona that no longer exists.
-    /// Distinct from out-of-date: there is no current persona to respawn into,
-    /// so the UI should not prompt a respawn — the pinned snapshot is all the
-    /// config that remains.
+    /// Distinct from out-of-date: there is no current persona to respawn into.
+    /// An orphaned agent also cannot be (re)started — `spawn_agent_child`
+    /// refuses it (see `effective_config::resolve_effective_config`'s
+    /// `OrphanedInstance` arm via `require_resolved`) — so the UI
+    /// should surface that it's stuck, not merely stale.
     pub persona_orphaned: bool,
-    /// `true` when the running process was spawned with a config that no
-    /// longer matches what a spawn would use today — a plain restart would
-    /// change what runs. Complements `persona_out_of_date`: the badge means
-    /// "a restart would change what runs"; out-of-date means "a respawn
-    /// would." Always `false` for stopped agents and for processes adopted
-    /// via a persisted `runtime_pid` (their spawn config is unknown).
+    /// `true` when the running process's spawn config no longer matches
+    /// what a spawn would use today. Derived from `restart_diff` — lit
+    /// exactly when there is something to show. Always `false` for stopped,
+    /// orphaned, or `runtime_pid`-adopted agents.
     pub needs_restart: bool,
-    pub mcp_toolsets: Option<String>,
+    /// Fields that drifted since launch, redacted for display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_diff: Vec<super::spawn_snapshot::RestartDiffEntry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_vars: BTreeMap<String, String>,
     pub backend: BackendKind,
@@ -530,8 +630,43 @@ pub struct ManagedAgentLogResponse {
 pub enum AcpAvailabilityStatus {
     Available,
     AdapterMissing,
+    /// Adapter binary is present but unsupported — either the deprecated
+    /// package or a version below the supported floor. Reinstall required.
+    AdapterOutdated,
     CliMissing,
     NotInstalled,
+}
+
+/// Authentication/login status for a CLI-based ACP runtime. Serializes as a tagged union
+/// `{ status: "...", diagnostic?: "..." }` so the TypeScript side can exhaustively switch on `status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum AuthStatus {
+    /// The CLI reported a successful login.
+    LoggedIn,
+    /// The CLI exited non-zero without a config-parse signal.
+    LoggedOut,
+    /// The CLI exited non-zero and its stderr contains a config-parse error.
+    ConfigInvalid {
+        /// Trimmed excerpt of the stderr message.
+        diagnostic: String,
+    },
+    /// This runtime does not have a login step (e.g. goose, buzz-agent).
+    NotApplicable,
+    /// Probe was not attempted (runtime unavailable or probe timed out).
+    Unknown,
+}
+
+/// Origin of an ACP runtime catalog entry. Serializes as a lowercase string so the TypeScript consumer can switch on it without numeric comparisons.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessSource {
+    /// Compiled into the app — one of the four first-class runtimes.
+    Builtin,
+    /// Static preset entry with bundled logo, PATH-probed, not editable/deletable.
+    Preset,
+    /// Loaded at runtime from the user's `custom_harnesses/` directory.
+    Custom,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -544,11 +679,53 @@ pub struct AcpRuntimeCatalogEntry {
     pub binary_path: Option<String>,
     pub default_args: Vec<String>,
     pub mcp_command: Option<String>,
+    /// Environment variable used to apply the initial model, when supported.
+    pub model_env_var: Option<String>,
+    /// Environment variable used to apply the selected LLM provider, when supported.
+    pub provider_env_var: Option<String>,
+    /// Environment variable used to apply thinking effort, when supported.
+    pub thinking_env_var: Option<String>,
+    /// Canonical accepted effort values for this runtime, in display order.
+    /// Serialized from `KnownAcpRuntime::effort_normalization.canonical` for
+    /// runtimes with a static finite vocabulary (e.g. Goose). `None` for
+    /// runtimes with no canonicalization contract (buzz-agent uses a
+    /// provider/model catalog; Claude/Codex/unknown runtimes accept any string).
+    ///
+    /// The renderer uses this to drive choices and validation, replacing the
+    /// TS-side `GOOSE_EFFORT_CANONICAL_VALUES` duplicate. When non-null, the
+    /// `harnessNative` effort field uses this list exclusively — `off` and all
+    /// other valid Goose values are always present when this is Goose, so
+    /// `useEffortAutoClear` never incorrectly deletes a valid saved value.
+    pub effort_canonical_values: Option<Vec<String>>,
+    pub max_tokens_env_var: Option<String>,
+    pub context_limit_env_var: Option<String>,
+    pub max_rounds_env_var: Option<String>,
     pub install_hint: String,
     pub install_instructions_url: String,
     /// true when at least one automated install step is available
     pub can_auto_install: bool,
+    /// true when this runtime depends on a separately installed vendor CLI.
+    pub requires_external_cli: bool,
     pub underlying_cli_path: Option<String>,
+    /// true when an npm adapter step is pending but Node.js / npm is absent.
+    /// The UI hides the Install button and shows a Node.js install callout.
+    pub node_required: bool,
+    /// Login/authentication status for CLI-based runtimes.
+    pub auth_status: AuthStatus,
+    /// Hint for completing authentication, shown when `auth_status` is not `logged_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_hint: Option<String>,
+    /// Whether this entry came from the compiled-in catalog or a user-supplied
+    /// JSON file in `custom_harnesses/`. The UI uses this to decide editability.
+    pub source: HarnessSource,
+    /// Definition-level env vars for `source: custom` entries; populated from
+    /// `HarnessDefinition.env` so saves don't silently erase existing vars.
+    /// Absent for builtin/preset entries. Skipped when empty in serialization.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub definition_env: BTreeMap<String, String>,
+    /// Spawn-time parallelism cap; absent for uncapped harnesses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_parallelism: Option<u32>,
 }
 
 /// Result of a single install step (CLI or adapter).
@@ -561,7 +738,7 @@ pub struct InstallStepResult {
     pub stderr: String,
     pub exit_code: Option<i32>,
     /// Actionable guidance shown in the UI when this step failed due to a
-    /// recognized condition (e.g. EACCES on a root-owned npm global prefix).
+    /// recognized condition (e.g. EACCES writing Buzz's private npm prefix).
     /// `None` when the step succeeded or no pattern matched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -572,6 +749,16 @@ pub struct InstallStepResult {
 pub struct InstallRuntimeResult {
     pub success: bool,
     pub steps: Vec<InstallStepResult>,
+    /// Number of local agents successfully stopped and restarted after a
+    /// successful install. Mirrors `GlobalAgentConfigSaveResult.restarted_count`.
+    pub restarted_count: u32,
+    /// Number of agents whose stop succeeded but respawn failed.
+    /// Mirrors `GlobalAgentConfigSaveResult.failed_restart_count`.
+    pub failed_restart_count: u32,
+    /// Install log file for this run, when one was written. The UI surfaces it
+    /// on failure so a user can read the full retry history instead of only the
+    /// last step's truncated output. `None` when no log could be opened.
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -626,76 +813,10 @@ pub struct AgentModelInfo {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamRecord {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub persona_ids: Vec<String>,
-    #[serde(default)]
-    pub is_builtin: bool,
-    /// Absolute path to the team's backing directory (if directory-backed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_dir: Option<PathBuf>,
-    /// Whether `source_dir` is a symlink to an external directory.
-    #[serde(default)]
-    pub is_symlink: bool,
-    /// Resolved symlink target path (for display). Only set when `is_symlink` is true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symlink_target: Option<String>,
-    /// Version from the team's `plugin.json` manifest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTeamRequest {
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub persona_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateTeamRequest {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub persona_ids: Vec<String>,
-}
-
-/// Result of syncing a directory-backed team with its backing directory.
-#[derive(Debug, Clone, Serialize)]
-pub struct SyncResult {
-    pub personas_added: Vec<String>,
-    pub personas_removed: Vec<String>,
-    pub personas_updated: Vec<String>,
-    pub metadata_changed: bool,
-}
-
-/// Report from the one-time packs→teams migration.
-#[derive(Debug, Clone, Serialize)]
-pub struct MigrationReport {
-    pub packs_migrated: usize,
-    pub personas_updated: usize,
-    pub agents_updated: usize,
-    pub errors: Vec<String>,
-}
-
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 /// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
-/// 1 hour — absolute wall-clock safety cap per turn.
-pub const DEFAULT_AGENT_MAX_TURN_DURATION_SECONDS: u64 = 3600;
-pub const DEFAULT_AGENT_PARALLELISM: u32 = 24;
-/// Toolsets injected as `BUZZ_TOOLSETS` when the record doesn't pin its own —
-/// single source of truth for the spawn env and the spawn-config hash.
-pub const DEFAULT_MCP_TOOLSETS: &str = "default,canvas,forums,dms,media";
+pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
 
 fn default_agent_parallelism() -> u32 {
     DEFAULT_AGENT_PARALLELISM
@@ -796,7 +917,6 @@ pub fn validate_respond_to_allowlist(input: &[String]) -> Result<Vec<String>, St
 pub struct MintBehavioralDefaults {
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
-    pub mcp_toolsets: Option<String>,
     /// Validated (1..=32) when present; caller applies its own default.
     pub parallelism: Option<u32>,
 }
@@ -816,9 +936,8 @@ pub struct MintBehavioralDefaults {
 pub fn resolve_mint_behavioral_defaults(
     input_respond_to: Option<RespondTo>,
     input_allowlist: Vec<String>,
-    input_mcp_toolsets: Option<String>,
     input_parallelism: Option<u32>,
-    definition: Option<&PersonaRecord>,
+    definition: Option<&AgentDefinition>,
 ) -> Result<MintBehavioralDefaults, String> {
     let (respond_to, respond_to_allowlist) = match input_respond_to {
         // Explicit instance-level choice: the definition default is ignored
@@ -848,10 +967,6 @@ pub fn resolve_mint_behavioral_defaults(
         );
     }
 
-    let non_blank = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
-    let mcp_toolsets = non_blank(input_mcp_toolsets)
-        .or_else(|| non_blank(definition.and_then(|d| d.mcp_toolsets.clone())));
-
     let parallelism = match input_parallelism {
         // Explicit input is validated here too (not just at the command
         // call sites) so the "validated when present" contract on
@@ -876,13 +991,20 @@ pub fn resolve_mint_behavioral_defaults(
     Ok(MintBehavioralDefaults {
         respond_to,
         respond_to_allowlist,
-        mcp_toolsets,
         parallelism,
     })
 }
 
+mod catalog_source;
+pub use catalog_source::CatalogSource;
+mod relay_mesh;
+pub use relay_mesh::RelayMeshConfig;
 mod requests;
 pub use requests::*;
+mod team_catalog_source;
+pub use team_catalog_source::{TeamCatalogSource, TeamMemberCatalogSource};
+mod teams;
+pub use teams::{CreateTeamRequest, TeamRecord, UpdateTeamRequest};
 
 #[cfg(test)]
 mod tests;

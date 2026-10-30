@@ -30,6 +30,14 @@ type AuxiliaryPanelHeaderGroupProps = Omit<
   align?: "center" | "start";
   backButtonAriaLabel?: string;
   backButtonTestId?: string;
+  /**
+   * Panel-specific control rendered ahead of the title, after any back button.
+   *
+   * A slot rather than a header-level feature because this header is shared by
+   * every auxiliary panel and the controls that belong here are not: only the
+   * thread has view modes. Each panel passes what it owns.
+   */
+  leading?: React.ReactNode;
   mode?: AuxiliaryPanelMode;
   onBack?: () => void;
 };
@@ -47,6 +55,8 @@ type AuxiliaryPanelTitleContentProps = React.ComponentProps<"h2">;
 type AuxiliaryPanelSurface = "default" | "soft" | "transparent";
 
 const AUXILIARY_PANEL_HEADER_HEIGHT_CLASS = "pt-13";
+export const AUXILIARY_PANEL_DEFAULT_SURFACE_CLASS =
+  "bg-background/80 backdrop-blur-md supports-[backdrop-filter]:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-[backdrop-filter]:bg-background/55";
 const AUXILIARY_PANEL_CLOSE_LABEL = "Close panel";
 const AUXILIARY_PANEL_CLOSE_TEST_ID = "auxiliary-panel-close";
 const AUXILIARY_PANEL_RESIZE_BORDER_CLASS =
@@ -72,7 +82,7 @@ function getAuxiliaryPanelSurfaceClass(surface: AuxiliaryPanelSurface) {
     return "bg-background/75 backdrop-blur-md supports-[backdrop-filter]:bg-background/65 dark:bg-background/45 dark:backdrop-blur-xl dark:supports-[backdrop-filter]:bg-background/35";
   }
 
-  return "bg-background/80 backdrop-blur-md supports-[backdrop-filter]:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-[backdrop-filter]:bg-background/55";
+  return AUXILIARY_PANEL_DEFAULT_SURFACE_CLASS;
 }
 
 type AuxiliaryPanelHeaderBackdropProps = {
@@ -89,6 +99,7 @@ function AuxiliaryPanelHeaderBackdrop({
         "pointer-events-none absolute inset-x-0 top-0 z-40 h-13",
         getAuxiliaryPanelSurfaceClass(surface),
       )}
+      data-testid="auxiliary-panel-header-backdrop"
     />
   );
 }
@@ -156,25 +167,30 @@ export function AuxiliaryPanelHeader({
   }
 
   return (
-    <div
-      className={cn(
-        "pointer-events-none relative z-40 overflow-visible",
-        getAuxiliaryPanelSurfaceClass(
-          resolvedTransparent ? "transparent" : surface,
-        ),
-        channelChrome.negativeMargin,
-      )}
-      {...props}
-    >
+    <>
+      {backdrop && backdropSurface !== "transparent" ? (
+        <AuxiliaryPanelHeaderBackdrop surface={backdropSurface} />
+      ) : null}
       <div
-        className="pointer-events-auto relative z-40 shrink-0 cursor-default select-none py-2 pl-5 pr-3"
-        data-tauri-drag-region
+        className={cn(
+          "pointer-events-none relative z-40 overflow-visible",
+          getAuxiliaryPanelSurfaceClass(
+            resolvedTransparent ? "transparent" : surface,
+          ),
+          channelChrome.negativeMargin,
+        )}
+        {...props}
       >
-        <div className="flex h-9 min-w-0 items-center gap-2.5">
-          {renderAuxiliaryPanelHeaderContent(children)}
+        <div
+          className="pointer-events-auto relative z-40 shrink-0 cursor-default select-none py-2 pl-5 pr-3"
+          data-tauri-drag-region
+        >
+          <div className="flex h-9 min-w-0 items-center gap-2.5">
+            {renderAuxiliaryPanelHeaderContent(children)}
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -248,6 +264,7 @@ export function AuxiliaryPanelHeaderGroup({
   align = "center",
   backButtonAriaLabel = "Back",
   backButtonTestId,
+  leading,
   mode,
   children,
   onBack,
@@ -280,6 +297,15 @@ export function AuxiliaryPanelHeaderGroup({
         >
           <ArrowLeft />
         </Button>
+      ) : null}
+      {/*
+       * Sits inside the header's normal inset rather than pulled flush like the
+       * back button: a back button is chrome and belongs on the panel edge, but
+       * this is a control acting on the panel's own content, so it reads as part
+       * of the title row and lets the title shift right off it.
+       */}
+      {leading ? (
+        <div className="flex shrink-0 items-center">{leading}</div>
       ) : null}
       {children}
     </div>

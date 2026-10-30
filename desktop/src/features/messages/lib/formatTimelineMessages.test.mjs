@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 
 import {
+  collectMessageAuthorPubkeys,
   collectReactionActorPubkeys,
   countTopLevelTimelineRows,
   formatTimelineMessages,
@@ -22,6 +24,8 @@ const PUBKEY_A =
   "1111111111111111111111111111111111111111111111111111111111111111";
 const PUBKEY_B =
   "2222222222222222222222222222222222222222222222222222222222222222";
+const RELAY_SECRET = new Uint8Array(32).fill(3);
+const RELAY_PUBKEY = getPublicKey(RELAY_SECRET);
 const CHANNEL_ID = "36411e44-0e2d-4cfe-bd6e-567eb169db9f";
 
 function streamMessage(overrides = {}) {
@@ -169,6 +173,109 @@ test("non-deletion event kinds do NOT hide the target message", () => {
   assert.equal(out.length, 1, "the kind:9 message should still be visible");
 });
 
+test("user-signed actor tag does not affect timeline identity or profile loading", () => {
+  const events = [
+    streamMessage({
+      tags: [
+        ["h", CHANNEL_ID],
+        ["actor", PUBKEY_B],
+      ],
+    }),
+  ];
+
+  const profiles = {
+    [PUBKEY_A]: {
+      displayName: "Real signer",
+      avatarUrl: "https://example.test/signer.png",
+      nip05Handle: null,
+      ownerPubkey: null,
+    },
+    [PUBKEY_B]: {
+      displayName: "Spoofed admin",
+      avatarUrl: "https://example.test/admin.png",
+      nip05Handle: null,
+      ownerPubkey: null,
+    },
+  };
+  const members = [
+    {
+      pubkey: PUBKEY_A,
+      role: "member",
+      isAgent: false,
+      joinedAt: "2026-01-01T00:00:00Z",
+      displayName: "Real signer",
+    },
+    {
+      pubkey: PUBKEY_B,
+      role: "owner",
+      isAgent: false,
+      joinedAt: "2026-01-01T00:00:00Z",
+      displayName: "Spoofed admin",
+    },
+  ];
+
+  assert.deepEqual(collectMessageAuthorPubkeys(events, RELAY_PUBKEY), [
+    PUBKEY_A,
+  ]);
+
+  const [message] = formatTimelineMessages(
+    events,
+    null,
+    undefined,
+    null,
+    profiles,
+    members,
+    undefined,
+    undefined,
+    RELAY_PUBKEY,
+  );
+
+  assert.equal(message.pubkey, PUBKEY_A);
+  assert.equal(message.signerPubkey, PUBKEY_A);
+  assert.equal(message.author, "Real signer");
+  assert.equal(message.avatarUrl, "https://example.test/signer.png");
+  assert.equal(message.role, "member");
+});
+
+test("relay-signed actor tag resolves the delegated timeline author", () => {
+  const event = finalizeEvent(
+    {
+      kind: 9,
+      created_at: 1_700_000_000,
+      content: "hello world",
+      tags: [
+        ["h", CHANNEL_ID],
+        ["actor", PUBKEY_B],
+      ],
+    },
+    RELAY_SECRET,
+  );
+  const profiles = {
+    [PUBKEY_B]: {
+      displayName: "Delegated user",
+      avatarUrl: "https://example.test/delegated.png",
+      nip05Handle: null,
+      ownerPubkey: null,
+    },
+  };
+
+  const [message] = formatTimelineMessages(
+    [event],
+    null,
+    undefined,
+    null,
+    profiles,
+    undefined,
+    undefined,
+    undefined,
+    RELAY_PUBKEY,
+  );
+
+  assert.equal(message.pubkey, PUBKEY_B);
+  assert.equal(message.signerPubkey, RELAY_PUBKEY);
+  assert.equal(message.author, "Delegated user");
+});
+
 test("collectReactionActorPubkeys returns active kind:7 actors only", () => {
   const reactionId = `${"c".repeat(64)}`;
   const deletedReactionId = `${"d".repeat(64)}`;
@@ -217,7 +324,10 @@ test("collectReactionActorPubkeys returns active kind:7 actors only", () => {
     }),
   ];
 
-  assert.deepEqual(collectReactionActorPubkeys(events), [PUBKEY_B]);
+  assert.deepEqual(collectReactionActorPubkeys(events, RELAY_PUBKEY), [
+    PUBKEY_B,
+    PUBKEY_A,
+  ]);
 });
 
 test("huddle start renders as a timeline row", () => {
@@ -563,4 +673,103 @@ test("CHANNEL_TIMELINE_CONTENT_KINDS matches isTimelineContentEvent", () => {
       `aux kind ${kind} must not be a timeline content event`,
     );
   }
+});
+
+test("original message link-preview none marker suppresses all generated previews", () => {
+  const [message] = formatTimelineMessages(
+    [
+      streamMessage({
+        content: "https://one.example https://two.example",
+        tags: [
+          ["h", CHANNEL_ID],
+          ["link-preview", "none"],
+        ],
+      }),
+    ],
+    null,
+    undefined,
+    null,
+  );
+  assert.deepEqual(
+    message.tags.find((tag) => tag[0] === "link-preview"),
+    ["link-preview", "none"],
+  );
+});
+
+test("authorized suppression edit remains monotonic across later body edits", () => {
+  const suppress = streamEdit(
+    HEX64_A,
+    "https://one.example https://two.example",
+    {
+      created_at: 1_700_000_001,
+      tags: [
+        ["h", CHANNEL_ID],
+        ["e", HEX64_A],
+        ["link-preview", "none"],
+      ],
+    },
+  );
+  const later = streamEdit(HEX64_A, "later body", {
+    id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    created_at: 1_700_000_002,
+  });
+  const [message] = formatTimelineMessages(
+    [streamMessage(), suppress, later],
+    null,
+    undefined,
+    null,
+  );
+  assert.equal(message.body, "later body");
+  assert.equal(
+    message.tags.some((tag) => tag[0] === "link-preview" && tag[1] === "none"),
+    true,
+  );
+});
+
+test("spoofed suppression edit cannot hide another author's previews", () => {
+  const spoof = streamEdit(HEX64_A, "spoofed", {
+    pubkey: PUBKEY_B,
+    tags: [
+      ["h", CHANNEL_ID],
+      ["e", HEX64_A],
+      ["link-preview", "none"],
+    ],
+  });
+  const [message] = formatTimelineMessages(
+    [streamMessage(), spoof],
+    null,
+    undefined,
+    null,
+  );
+  assert.equal(message.body, "hello world");
+  assert.equal(
+    message.tags.some((tag) => tag[0] === "link-preview"),
+    false,
+  );
+});
+
+test("verified agent owner may publish a suppression edit", () => {
+  const ownerEdit = streamEdit(HEX64_A, "owner edit", {
+    pubkey: PUBKEY_B,
+    tags: [
+      ["h", CHANNEL_ID],
+      ["e", HEX64_A],
+      ["link-preview", "none"],
+    ],
+  });
+  const profiles = {
+    [PUBKEY_A]: { ownerPubkey: PUBKEY_B },
+  };
+  const [message] = formatTimelineMessages(
+    [streamMessage(), ownerEdit],
+    null,
+    undefined,
+    null,
+    profiles,
+  );
+  assert.equal(message.body, "owner edit");
+  assert.equal(
+    message.tags.some((tag) => tag[0] === "link-preview"),
+    true,
+  );
 });

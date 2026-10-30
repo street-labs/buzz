@@ -1,4 +1,3 @@
-import type { ParsedPersonaPreview } from "@/shared/api/tauriPersonas";
 import type {
   AgentPersona,
   CreatePersonaInput,
@@ -13,11 +12,6 @@ export type PersonaDialogState = {
   title: string;
 };
 
-type ImportedPersonaAvatarPreview = Pick<
-  ParsedPersonaPreview,
-  "avatarDataUrl" | "avatarRef"
->;
-
 /**
  * Whether the persona dialog's save action should be enabled.
  *
@@ -30,29 +24,6 @@ export function canSubmitPersonaDialog(args: {
   isPending: boolean;
 }): boolean {
   return args.displayName.trim().length > 0 && !args.isPending;
-}
-
-function isSafeImportedAvatarRef(
-  ref: string | null | undefined,
-): ref is string {
-  const trimmed = ref?.trim();
-  if (!trimmed) return false;
-
-  try {
-    const parsed = new URL(trimmed);
-    return (
-      parsed.protocol === "http:" ||
-      parsed.protocol === "https:" ||
-      (parsed.protocol === "data:" && trimmed.startsWith("data:image/"))
-    );
-  } catch {
-    return false;
-  }
-}
-
-export function importedAvatarUrl(persona: ImportedPersonaAvatarPreview) {
-  if (persona.avatarDataUrl) return persona.avatarDataUrl;
-  return isSafeImportedAvatarRef(persona.avatarRef) ? persona.avatarRef : "";
 }
 
 export function formatPersonaNamePoolText(namePool: string[] | undefined) {
@@ -75,6 +46,7 @@ export function createPersonaDialogState(): PersonaDialogState {
       displayName: "",
       avatarUrl: "",
       systemPrompt: "",
+      acpCommand: "buzz-acp",
       runtime: undefined,
       model: undefined,
     },
@@ -92,7 +64,9 @@ export function duplicatePersonaDialogState(
     initialValues: {
       displayName: `${persona.displayName} copy`,
       avatarUrl: persona.avatarUrl ?? "",
+      description: persona.description ?? undefined,
       systemPrompt: persona.systemPrompt,
+      acpCommand: persona.acpCommand || "buzz-acp",
       runtime: persona.runtime ?? undefined,
       model: persona.model ?? undefined,
       provider: persona.provider ?? undefined,
@@ -118,8 +92,8 @@ function behaviorEntry(
 ): { behavior: PersonaBehaviorInput } | Record<string, never> {
   if (
     persona.respondTo == null &&
-    persona.mcpToolsets == null &&
-    persona.parallelism == null
+    persona.parallelism == null &&
+    (persona.sessionPolicy ?? "channel") === "channel"
   ) {
     return {};
   }
@@ -130,15 +104,23 @@ function behaviorEntry(
         persona.respondTo === "allowlist"
           ? persona.respondToAllowlist
           : undefined,
-      mcpToolsets: persona.mcpToolsets ?? undefined,
       parallelism: persona.parallelism ?? undefined,
+      sessionPolicy: persona.sessionPolicy ?? "channel",
     },
   };
 }
 
 export function editPersonaDialogState(
   persona: AgentPersona,
+  accessSource?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
 ): PersonaDialogState {
+  const behaviorSource = accessSource
+    ? {
+        ...persona,
+        respondTo: accessSource.respondTo,
+        respondToAllowlist: accessSource.respondToAllowlist,
+      }
+    : persona;
   return {
     title: "Edit agent",
     description: "",
@@ -147,7 +129,9 @@ export function editPersonaDialogState(
       id: persona.id,
       displayName: persona.displayName,
       avatarUrl: persona.avatarUrl ?? "",
+      description: persona.description ?? undefined,
       systemPrompt: persona.systemPrompt,
+      acpCommand: persona.acpCommand || "buzz-acp",
       runtime: persona.runtime ?? undefined,
       model: persona.model ?? undefined,
       provider: persona.provider ?? undefined,
@@ -157,26 +141,7 @@ export function editPersonaDialogState(
       // the dialog must therefore round-trip the existing values.)
       namePool: persona.namePool ?? [],
       envVars: persona.envVars ?? {},
-      ...behaviorEntry(persona),
-    },
-  };
-}
-
-export function importPersonaDialogState(
-  persona: ParsedPersonaPreview,
-): PersonaDialogState {
-  return {
-    title: `Import ${persona.displayName}`,
-    description: "Review and create this imported agent.",
-    submitLabel: "Create agent",
-    initialValues: {
-      displayName: persona.displayName,
-      avatarUrl: importedAvatarUrl(persona),
-      systemPrompt: persona.systemPrompt,
-      runtime: persona.runtime ?? undefined,
-      model: persona.model ?? undefined,
-      provider: persona.provider ?? undefined,
-      ...(persona.namePool.length > 0 ? { namePool: persona.namePool } : {}),
+      ...behaviorEntry(behaviorSource),
     },
   };
 }

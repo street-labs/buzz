@@ -61,10 +61,11 @@ test("⌘K with caret inside an existing link opens the edit-link dialog", async
     "docs",
   );
 
-  // Click into the linked text to place the caret inside it, then re-trigger
-  // the shortcut. (The click also surfaces the composer link hover card —
-  // ⌘K must open the full dialog from that state.)
+  // Click into the linked text to place the caret inside it. This must not
+  // surface contextual controls; editing stays accessible through ⌘K.
   await input.locator('a[href="https://example.com"]').click();
+  await expect(page.getByRole("button", { name: "Edit link" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Unlink" })).toHaveCount(0);
   await page.keyboard.press("ControlOrMeta+k");
 
   const editDialog = page.getByRole("dialog", { name: "Edit link" });
@@ -124,6 +125,46 @@ test("macOS plain Ctrl+K still kill-lines in the composer", async ({
   await expect(input).not.toContainText("kill this line");
   await expect(page.getByRole("dialog", { name: "Add link" })).toHaveCount(0);
   await expect(page.getByTestId("search-dialog-input")).toHaveCount(0);
+});
+
+test("macOS Ctrl+A, Ctrl+E, and Ctrl+K stay within hard-break lines", async ({
+  page,
+}) => {
+  test.skip(process.platform !== "darwin", "mac-only Emacs bindings");
+
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "platform", { value: "MacIntel" });
+  });
+  await installMockBridge(page);
+  await openGeneral(page);
+
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await input.pressSequentially("first");
+  await input.press("Shift+Enter");
+  await input.pressSequentially("middle");
+  await input.press("Shift+Enter");
+  await input.pressSequentially("last");
+  await expect(input.locator("br")).toHaveCount(2);
+
+  // Start/end movement applies to the third visual line, not the whole editor.
+  await page.keyboard.press("Control+a");
+  await input.pressSequentially("[");
+  await page.keyboard.press("Control+e");
+  await input.pressSequentially("]");
+  await expect(input).toHaveText("firstmiddle[last]");
+
+  // Kill only to this line's end, preserving both preceding lines.
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+k");
+  await expect(input).toHaveText("firstmiddle");
+  await expect(input.locator("br")).toHaveCount(3);
+
+  // At end-of-line, kill the newline and join with the following line.
+  await page.keyboard.press("Control+b");
+  await page.keyboard.press("Control+k");
+  await expect(input).toHaveText("firstmiddle");
+  await expect(input.locator("br")).toHaveCount(1);
 });
 
 test("⌘K outside the composer opens quick search", async ({ page }) => {

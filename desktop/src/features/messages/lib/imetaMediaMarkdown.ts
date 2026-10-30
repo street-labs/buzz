@@ -26,9 +26,12 @@
  */
 
 import type { BlobDescriptor } from "@/shared/api/tauri";
-import { parseImetaTags } from "./parseImeta";
+import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 
-export type ImetaMedia = BlobDescriptor;
+export type ImetaMedia = BlobDescriptor & {
+  /** Composer-only label used for attachment links; not emitted in imeta. */
+  displayLabel?: string;
+};
 
 /**
  * Project a Nostr event's imeta tags into the `BlobDescriptor[]` shape the
@@ -76,29 +79,31 @@ export function imetaMediaFromTags(
  * Shared by the send path (initial post) and the edit path (full new tag set
  * on the edit event), so the two stay perfectly symmetric.
  *
- * `url` and `m` are always emitted (NIP-92's only de-facto required fields;
- * `m` carries a fallback in `imetaMediaFromTags`). All other fields are
- * conditional — including `x` and `size` — because legacy and cross-client
- * imeta entries can land without a sha256 or size, and our relay validator
- * rejects literal `"x "` / `"size 0"` empties. NIP-92 itself treats every
- * field except `url` as optional, so dropping them is spec-clean.
+ * `url`, `m`, and `x` are emitted for verified relay-hosted media. Entries
+ * without a hash represent external content (for example KLIPY GIFs); their
+ * markdown URL remains in the message body, but they are omitted from imeta
+ * because Buzz's relay validator requires a hash-backed local `/media/` path.
+ * Other fields remain conditional so legacy entries do not emit invalid
+ * literal `"size 0"` values.
  */
 export function buildImetaTags(
   imetaMedia: ReadonlyArray<ImetaMedia>,
 ): string[][] {
-  return imetaMedia.map((d) => [
-    "imeta",
-    `url ${d.url}`,
-    `m ${d.type}`,
-    ...(d.sha256 ? [`x ${d.sha256}`] : []),
-    ...(typeof d.size === "number" && d.size > 0 ? [`size ${d.size}`] : []),
-    ...(d.dim ? [`dim ${d.dim}`] : []),
-    ...(d.blurhash ? [`blurhash ${d.blurhash}`] : []),
-    ...(d.thumb ? [`thumb ${d.thumb}`] : []),
-    ...(d.duration != null ? [`duration ${d.duration}`] : []),
-    ...(d.image ? [`image ${d.image}`] : []),
-    ...(d.filename ? [`filename ${d.filename}`] : []),
-  ]);
+  return imetaMedia
+    .filter((d) => d.sha256.length > 0)
+    .map((d) => [
+      "imeta",
+      `url ${d.url}`,
+      `m ${d.type}`,
+      `x ${d.sha256}`,
+      ...(typeof d.size === "number" && d.size > 0 ? [`size ${d.size}`] : []),
+      ...(d.dim ? [`dim ${d.dim}`] : []),
+      ...(d.blurhash ? [`blurhash ${d.blurhash}`] : []),
+      ...(d.thumb ? [`thumb ${d.thumb}`] : []),
+      ...(d.duration != null ? [`duration ${d.duration}`] : []),
+      ...(d.image ? [`image ${d.image}`] : []),
+      ...(d.filename ? [`filename ${d.filename}`] : []),
+    ]);
 }
 
 const MEDIA_LINE_RE =
@@ -113,6 +118,42 @@ const BLOCK_SPOILER_DELIMITER_RE = /^\s*\|\|\s*$/;
  * file attachments from the body in edit mode.
  */
 const FILE_LINE_RE = /^\[(?:\\.|[^\]\\])*\]\(([^)\s]+)\)\s*$/;
+const LABELED_FILE_LINE_RE = /^\[((?:\\.|[^\]\\])*)\]\(([^)\s]+)\)\s*$/;
+
+function unescapeMarkdownLinkLabel(label: string): string {
+  return label.replace(/\\([\\[\]])/g, "$1");
+}
+
+/**
+ * Restore composer-only attachment labels from the durable markdown link in
+ * an existing message body. NIP-92 imeta tags preserve the attachment file
+ * metadata but not the visible link label, so edit mode must join the two
+ * representations before seeding pending attachments.
+ */
+export function restoreImetaMediaDisplayLabels(
+  body: string,
+  imetaMedia: ReadonlyArray<ImetaMedia>,
+): ImetaMedia[] {
+  if (imetaMedia.length === 0) return [];
+
+  const urls = new Set(imetaMedia.map((media) => media.url));
+  const labelsByUrl = new Map<string, string>();
+  const lines = body.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    const match = line.match(LABELED_FILE_LINE_RE);
+    const url = match?.[2];
+    if (!url || !urls.has(url) || labelsByUrl.has(url)) continue;
+
+    const label = unescapeMarkdownLinkLabel(match[1]).trim();
+    if (label) labelsByUrl.set(url, label);
+  }
+
+  return imetaMedia.map((media) => {
+    const displayLabel = labelsByUrl.get(media.url);
+    return displayLabel ? { ...media, displayLabel } : media;
+  });
+}
 
 function findTrailingBlockSpoilerMediaStart(
   lines: string[],
@@ -235,22 +276,35 @@ export function findSpoileredImetaMediaUrls(
  * Images and video use `![image|video](url)` so the renderer draws them inline.
  * Generic files use a plain `[filename](url)` link — the renderer recognises the
  * href as a local media blob with a non-media MIME and upgrades it to a file
- * card. Mime-driven so the form is correct regardless of URL suffix.
+ * card. Agent snapshot PNGs deliberately use the file-link form despite their
+ * image MIME so the renderer can upgrade them to the import/download card.
  */
 export function formatImetaMediaLine(
   { url, type, filename }: ImetaMedia,
-  options: { spoiler?: boolean } = {},
+  options: { label?: string; spoiler?: boolean } = {},
 ): string {
-  if (type.startsWith("video/")) {
+  // A PNG snapshot is image/png on the wire, but it is an importable file, not
+  // inline media. Keep it on the anchor renderer's snapshot-card path.
+  const lower = filename?.toLowerCase();
+  const isSnapshotPng =
+    lower?.endsWith(".agent.png") || lower?.endsWith(".team.png");
+  const isPackagedVoiceNote =
+    type.toLowerCase() === "video/mp4" &&
+    lower?.startsWith("voice-note-") &&
+    lower.endsWith(".mp4");
+  if (type.startsWith("video/") && !isPackagedVoiceNote) {
     const line = `![video](${url})`;
     return options.spoiler ? `\n||${line}||` : `\n${line}`;
   }
-  if (type.startsWith("image/")) {
+  if (type.startsWith("image/") && !isSnapshotPng) {
     const line = `![image](${url})`;
     return options.spoiler ? `\n||${line}||` : `\n${line}`;
   }
-  // Generic file: plain link, label is the original filename (fallback to url tail).
-  const label = filename || url.split("/").pop() || "file";
+  // Generic file: plain link, label is the caller-provided display label when
+  // available, otherwise the original filename (falling back to the URL tail).
+  // The filename remains in imeta for download/import integrity.
+  const label =
+    options.label?.trim() || filename || url.split("/").pop() || "file";
   // Escape markdown link-label metacharacters so filenames containing `[`, `]`,
   // or `\` (e.g. `a].pdf`) still render as a FileCard with the correct label
   // rather than breaking the link or mangling the visible text.
@@ -277,12 +331,15 @@ export function buildOutgoingMessage(
   let content = body;
   for (const d of pendingImeta) {
     content += formatImetaMediaLine(d, {
+      label: d.displayLabel,
       spoiler: spoileredMediaUrls.has(d.url),
     });
   }
-  const mediaTags =
-    pendingImeta.length > 0 ? buildImetaTags(pendingImeta) : undefined;
-  return { content, mediaTags };
+  const mediaTags = buildImetaTags(pendingImeta);
+  return {
+    content,
+    mediaTags: mediaTags.length > 0 ? mediaTags : undefined,
+  };
 }
 
 /**
@@ -310,18 +367,22 @@ export function splitOutgoingTags(tags: string[][] | undefined): {
   mediaTags: string[][];
   emojiTags: string[][];
   mentionTags: string[][];
+  linkPreviewTags: string[][];
 } {
   const mediaTags: string[][] = [];
   const emojiTags: string[][] = [];
   const mentionTags: string[][] = [];
+  const linkPreviewTags: string[][] = [];
   for (const tag of tags ?? []) {
     if (tag[0] === "emoji") {
       emojiTags.push(tag);
     } else if (tag[0] === "mention") {
       mentionTags.push(tag);
+    } else if (tag[0] === "link-preview") {
+      linkPreviewTags.push(tag);
     } else {
       mediaTags.push(tag);
     }
   }
-  return { mediaTags, emojiTags, mentionTags };
+  return { mediaTags, emojiTags, mentionTags, linkPreviewTags };
 }

@@ -1,6 +1,6 @@
 use super::backfill_standalone_agents_in_dir;
-use crate::managed_agents::spawn_hash::spawn_config_hash;
-use crate::managed_agents::{ManagedAgentRecord, PersonaRecord};
+use crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot;
+use crate::managed_agents::{AgentDefinition, ManagedAgentRecord};
 use crate::migration::test_support::{read_agents_json, write_agents_json};
 use std::path::Path;
 
@@ -77,7 +77,7 @@ fn backfill_links_standalone_agent_to_manufactured_definition() {
 
     // The recorded version matches the definition's actual content hash —
     // the drift badge starts clean.
-    let view = definition.to_persona_view().unwrap();
+    let view = definition.to_definition_view().unwrap();
     let expected = crate::managed_agents::persona_events::persona_content_hash(
         &crate::managed_agents::persona_events::persona_event_content(&view),
     );
@@ -91,7 +91,7 @@ fn backfill_links_standalone_agent_to_manufactured_definition() {
 fn backfilled_definition_carries_prompt_present_even_if_empty() {
     // LOAD-BEARING (B5 gates): old readers hard-fail on an absent prompt. A
     // prompt-less backfilled definition would leave a wiped old device with
-    // no heal source, permanently. `PersonaRecord.system_prompt` is a plain
+    // no heal source, permanently. `AgentDefinition.system_prompt` is a plain
     // String and the outbound projection wraps it in `Some` unconditionally
     // — this row pins that chain against refactors.
     let dir = tempfile::tempdir().unwrap();
@@ -105,7 +105,7 @@ fn backfilled_definition_carries_prompt_present_even_if_empty() {
 
     let records = load_typed(dir.path());
     let definition = records.iter().find(|r| r.pubkey.is_empty()).unwrap();
-    let view: PersonaRecord = definition.to_persona_view().unwrap();
+    let view: AgentDefinition = definition.to_definition_view().unwrap();
     assert_eq!(view.system_prompt, "", "empty, not absent");
     let content = crate::managed_agents::persona_events::persona_event_content(&view);
     assert_eq!(
@@ -116,11 +116,11 @@ fn backfilled_definition_carries_prompt_present_even_if_empty() {
 }
 
 #[test]
-fn backfill_of_promptless_record_keeps_spawn_hash_stable() {
-    // B5 hash row 2: pre-backfill the record hashes prompt None; post-backfill
+fn backfill_of_promptless_record_keeps_spawn_snapshot_stable() {
+    // B5 drift row 2: pre-backfill the record snapshots prompt None; post-backfill
     // the prospective re-snapshot pulls Some("") from the manufactured
     // definition. The spawn layer treats an empty prompt as no prompt (env
-    // absent either way), so the hash must not move — otherwise every
+    // absent either way), so the snapshot must not move — otherwise every
     // prompt-less standalone agent lights the restart badge on upgrade.
     let dir = tempfile::tempdir().unwrap();
     let pubkey = "c".repeat(64);
@@ -131,33 +131,43 @@ fn backfill_of_promptless_record_keeps_spawn_hash_stable() {
 
     let pre_records = load_typed(dir.path());
     let pre_instance = pre_records.iter().find(|r| !r.pubkey.is_empty()).unwrap();
-    let hash_before = spawn_config_hash(pre_instance, &[], "wss://ws.example", &Default::default());
+    let before = prospective_spawn_config_snapshot(
+        pre_instance,
+        &[],
+        &[],
+        "wss://ws.example",
+        &Default::default(),
+        false,
+    );
 
     backfill_standalone_agents_in_dir(&base(dir.path())).unwrap();
 
     let post_records = load_typed(dir.path());
     let post_instance = post_records.iter().find(|r| !r.pubkey.is_empty()).unwrap();
-    let personas: Vec<PersonaRecord> = post_records
+    let personas: Vec<AgentDefinition> = post_records
         .iter()
-        .filter_map(|r| r.to_persona_view())
+        .filter_map(|r| r.to_definition_view())
         .collect();
-    let hash_after = spawn_config_hash(
+    let after = prospective_spawn_config_snapshot(
         post_instance,
         &personas,
+        &[],
         "wss://ws.example",
         &Default::default(),
+        false,
     );
 
     assert_eq!(
-        hash_before, hash_after,
+        before.canonical(),
+        after.canonical(),
         "backfill must not flip the restart badge for prompt-less agents"
     );
 }
 
 #[test]
-fn backfill_of_prompted_record_keeps_spawn_hash_stable() {
+fn backfill_of_prompted_record_keeps_spawn_snapshot_stable() {
     // The general no-behavior-change rail: a standalone agent WITH config
-    // must also hash identically across backfill (the definition snapshots
+    // must also snapshot identically across backfill (the definition snapshots
     // the record's own values, so the re-snapshot writes back what is
     // already there).
     let dir = tempfile::tempdir().unwrap();
@@ -173,24 +183,33 @@ fn backfill_of_prompted_record_keeps_spawn_hash_stable() {
 
     let pre_records = load_typed(dir.path());
     let pre_instance = pre_records.iter().find(|r| !r.pubkey.is_empty()).unwrap();
-    let hash_before = spawn_config_hash(pre_instance, &[], "wss://ws.example", &Default::default());
+    let before = prospective_spawn_config_snapshot(
+        pre_instance,
+        &[],
+        &[],
+        "wss://ws.example",
+        &Default::default(),
+        false,
+    );
 
     backfill_standalone_agents_in_dir(&base(dir.path())).unwrap();
 
     let post_records = load_typed(dir.path());
     let post_instance = post_records.iter().find(|r| !r.pubkey.is_empty()).unwrap();
-    let personas: Vec<PersonaRecord> = post_records
+    let personas: Vec<AgentDefinition> = post_records
         .iter()
-        .filter_map(|r| r.to_persona_view())
+        .filter_map(|r| r.to_definition_view())
         .collect();
-    let hash_after = spawn_config_hash(
+    let after = prospective_spawn_config_snapshot(
         post_instance,
         &personas,
+        &[],
         "wss://ws.example",
         &Default::default(),
+        false,
     );
 
-    assert_eq!(hash_before, hash_after);
+    assert_eq!(before.canonical(), after.canonical());
 }
 
 #[test]
@@ -284,4 +303,35 @@ fn slug_collision_fails_loudly_per_record_and_continues() {
     assert_eq!(collided.persona_id, None, "collided record left standalone");
     let clean_rec = records.iter().find(|r| r.pubkey == clean).unwrap();
     assert_eq!(clean_rec.persona_id.as_deref(), Some(clean.as_str()));
+}
+
+#[cfg(unix)]
+#[test]
+fn backfill_creates_the_backup_owner_only() {
+    // Same contract as the live store writer: this backup is a verbatim copy of
+    // a file that carries plaintext agent nsecs when the keyring is unreachable,
+    // so it is owner-only from the initial open rather than via a post-write
+    // chmod that would leave a umask window.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pubkey = "e".repeat(64);
+    let mut record = standalone_agent_json("Solo", &pubkey, Some("P"));
+    record["private_key_nsec"] = serde_json::json!("nsec1exampleplaintextkey");
+    write_agents_json(dir.path(), &serde_json::json!([record]));
+
+    assert_eq!(
+        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        1
+    );
+
+    let bak = base(dir.path()).join("managed-agents.json.pre-backfill.bak");
+    let mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "backup of an inline nsec must be owner-only");
+    assert!(
+        std::fs::read_to_string(&bak)
+            .unwrap()
+            .contains("nsec1exampleplaintextkey"),
+        "the fixture really did carry an inline key"
+    );
 }

@@ -4,24 +4,23 @@ export const personaLibraryCopy = {
     "The agents you have chosen for this app. Use them to create teams and launch agents.",
   chooseFromCatalog: "Choose from catalog",
   createNew: "New agent",
-  import: "Import",
+  import: "Import snapshot",
   emptyTitle: "No agents yet",
   emptyDescription:
     "Choose one from Agent Catalog, create your own, or import one to get started.",
   emptyImportHint:
-    "Or drop a .persona.md, .persona.json, .persona.png, or .zip file here to import.",
+    "Or drop an .agent.json or .agent.png snapshot here to import.",
 } as const;
 
 export const personaCatalogCopy = {
   title: "Agent Catalog",
-  description: "Browse built-in agents and add them to My Agents.",
-  dialogTitle: "Agent Catalog",
-  dialogDescription: "Browse built-in agents and add them to My Agents.",
+  description: "Browse agents shared to this relay.",
+  dialogTitle: "Add agent",
+  dialogDescription: "Browse agents shared to this relay.",
   emptyTitle: "You're all set",
   emptyDescription: "Everything in Agent Catalog is already in My Agents.",
-  emptyCatalogDescription:
-    "New agents will show up here when the app ships more options.",
-  emptyCatalogTitle: "No agents in the catalog yet",
+  emptyCatalogDescription: "Shared agents will appear here.",
+  emptyCatalogTitle: "No agents are being shared",
   detailsAction: "View details",
   selectAction: "Choose",
   deselectAction: "Deselect",

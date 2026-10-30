@@ -71,7 +71,7 @@ const EMOJI_MART_SHADOW_CSS = `
   }
 
   #root {
-    --padding: 16px;
+    --padding: var(--buzz-emoji-picker-padding, 16px);
     --sidebar-width: 0px;
     display: flex;
     flex-direction: column;
@@ -79,7 +79,25 @@ const EMOJI_MART_SHADOW_CSS = `
     max-height: 100%;
     min-height: 0;
     overflow: hidden;
+    position: relative;
     width: 100% !important;
+  }
+
+  #root::after {
+    background: linear-gradient(
+      to bottom,
+      rgba(var(--buzz-emoji-picker-rgb-background), 0),
+      rgba(var(--buzz-emoji-picker-rgb-background), 0.98)
+    );
+    bottom: calc(var(--buzz-emoji-picker-nav-button-size, 40px) + 24px);
+    content: "";
+    height: var(--buzz-emoji-picker-fade-height, 0px);
+    left: 0;
+    opacity: var(--buzz-emoji-picker-fade-opacity, 0);
+    pointer-events: none;
+    position: absolute;
+    right: 0;
+    z-index: 3;
   }
 
   .scroll {
@@ -88,7 +106,7 @@ const EMOJI_MART_SHADOW_CSS = `
     overflow-y: auto;
     padding-left: var(--padding);
     padding-right: var(--padding);
-    padding-top: 28px;
+    padding-top: var(--buzz-emoji-picker-scroll-padding-top, 28px);
     width: 100%;
   }
 
@@ -109,8 +127,94 @@ const EMOJI_MART_SHADOW_CSS = `
     display: none;
   }
 
+  :host([data-buzz-onboarding-inline]) .category .sticky {
+    background-color: rgb(var(--em-rgb-background));
+    display: block;
+    z-index: 5;
+  }
+
+  :host([data-buzz-onboarding-inline]) .scroll {
+    padding-top: 0;
+  }
+
+  /* Match the app's member-search controls: a distinct resting surface and
+   * border make both the emoji search and its adjacent skin-tone control easy
+   * to find before either receives focus. */
+  .search input[type="search"],
+  .search + .flex {
+    background-color: rgb(var(--em-rgb-input));
+    box-shadow: inset 0 0 0 1px rgba(var(--em-rgb-color), 0.16);
+  }
+
+  .search input[type="search"] {
+    border-radius: 8px;
+    height: var(--buzz-emoji-picker-search-control-height, 48px);
+    padding-bottom: 0;
+    padding-top: 0;
+  }
+
+  .search input[type="search"]:focus {
+    box-shadow: inset 0 0 0 1px rgb(var(--em-rgb-accent));
+  }
+
+  .search + .flex {
+    border-radius: 8px;
+    flex: 0 0 auto;
+    height: var(--buzz-emoji-picker-search-control-height, 48px) !important;
+    margin-left: 8px;
+    width: var(--buzz-emoji-picker-search-control-height, 48px) !important;
+  }
+
+  .skin-tone-button {
+    background-color: transparent !important;
+    border: 0 !important;
+    border-radius: 4px;
+    box-shadow: none !important;
+    height: calc(var(--buzz-emoji-picker-search-control-height, 48px) - 8px) !important;
+    width: calc(var(--buzz-emoji-picker-search-control-height, 48px) - 8px) !important;
+  }
+
+  :host([data-buzz-onboarding-inline]) #root > .padding-lr:not(.scroll) {
+    background-color: rgb(var(--em-rgb-background));
+    padding-bottom: 8px;
+    padding-top: 8px;
+    position: relative;
+    z-index: 6;
+  }
+
+  :host([data-buzz-onboarding-inline])
+    #root
+    > .padding-lr:not(.scroll)
+    > div
+    > .spacer {
+    display: none;
+  }
+
+  :host([data-buzz-onboarding-inline]) #nav {
+    display: none;
+  }
+
+  :host([data-buzz-onboarding-inline]) .menu {
+    background-color: rgb(var(--em-rgb-background));
+    z-index: 7;
+  }
+
+  .skin-tone-button[aria-selected] {
+    background-color: transparent !important;
+  }
+
   .category button .background {
-    background-color: rgba(255, 255, 255, 0.1);
+    background-color: transparent;
+    transition: background-color var(--duration) var(--easing);
+  }
+
+  .category button:hover .background,
+  .category button[data-buzz-selected="true"] .background {
+    background-color: rgba(var(--em-rgb-color), 0.14);
+  }
+
+  .category button[data-buzz-selected="true"] .background {
+    background-color: rgba(var(--em-rgb-color), 0.2);
   }
 
   .row {
@@ -122,7 +226,7 @@ const EMOJI_MART_SHADOW_CSS = `
     display: flex;
     flex: 0 0 auto;
     justify-content: space-between;
-    padding: 8px 24px 16px;
+    padding: 8px var(--buzz-emoji-picker-nav-padding-x, 24px) 16px;
   }
 
   #nav .bar {
@@ -139,14 +243,14 @@ const EMOJI_MART_SHADOW_CSS = `
     border-radius: 999px;
     color: rgba(var(--em-rgb-color), 0.58);
     display: flex;
-    flex: 0 0 40px;
-    height: 40px;
+    flex: 0 0 var(--buzz-emoji-picker-nav-button-size, 40px);
+    height: var(--buzz-emoji-picker-nav-button-size, 40px);
     justify-content: center;
     transition:
       background-color var(--duration) var(--easing),
       color var(--duration) var(--easing),
       transform var(--duration) var(--easing);
-    width: 40px;
+    width: var(--buzz-emoji-picker-nav-button-size, 40px);
   }
 
   #nav button:hover,
@@ -164,8 +268,8 @@ const EMOJI_MART_SHADOW_CSS = `
 
   #nav svg,
   #nav img {
-    height: 24px;
-    width: 24px;
+    height: var(--buzz-emoji-picker-category-icon-size, 24px);
+    width: var(--buzz-emoji-picker-category-icon-size, 24px);
   }
 `;
 
@@ -184,8 +288,28 @@ function unescapeSvgText(text: string) {
 }
 
 export function emojiAvatarDataUrl(emoji: string, color: string) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="256" fill="${color}"/><text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-size="${EMOJI_AVATAR_FONT_SIZE}">${escapeSvgText(emoji)}</text></svg>`;
+  // Persist uncropped artwork. The consuming surface owns the silhouette:
+  // human profiles clip this square to a circle, while agents clip it to the
+  // shared squircle. Source-level rounding cannot be recovered by an outer
+  // clip and made legacy emoji agents look circular inside their squircles.
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" fill="${color}"/><text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-size="${EMOJI_AVATAR_FONT_SIZE}">${escapeSvgText(emoji)}</text></svg>`;
   return `${EMOJI_AVATAR_DATA_URL_PREFIX}${encodeURIComponent(svg)}`;
+}
+
+export function squareEmojiAvatarDataUrl(avatarUrl: string) {
+  const descriptor = parseEmojiAvatarDataUrl(avatarUrl);
+  return descriptor
+    ? emojiAvatarDataUrl(descriptor.emoji, descriptor.color)
+    : avatarUrl;
+}
+
+export function avatarSourceUrlForShape(
+  avatarUrl: string | null,
+  shape: "circle" | "squircle",
+) {
+  return shape === "squircle" && avatarUrl
+    ? squareEmojiAvatarDataUrl(avatarUrl)
+    : avatarUrl;
 }
 
 export function parseEmojiAvatarDataUrl(
@@ -199,14 +323,15 @@ export function parseEmojiAvatarDataUrl(
     const svg = decodeURIComponent(
       avatarUrl.slice(EMOJI_AVATAR_DATA_URL_PREFIX.length),
     );
-    const color = svg.match(/<rect\b[^>]*\sfill="([^"]+)"/u)?.[1];
-    const emoji = svg.match(/<text\b[^>]*>(.*?)<\/text>/u)?.[1];
+    const match = svg.match(
+      /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512"(?: rx="(?:112|256)")? fill="([^"]+)"\/><text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-size="258">([^<>]*)<\/text><\/svg>$/u,
+    );
 
-    if (!color || !emoji) {
+    if (!match) {
       return null;
     }
 
-    return { color, emoji: unescapeSvgText(emoji) };
+    return { color: match[1], emoji: unescapeSvgText(match[2]) };
   } catch {
     return null;
   }
@@ -513,6 +638,7 @@ function installEmojiMartWheelScroll(shadowRoot: ShadowRoot) {
 export function useEmojiMartStyles(
   containerRef: React.RefObject<HTMLDivElement | null>,
   enabled: boolean,
+  onboardingInline = false,
 ) {
   React.useEffect(() => {
     if (!enabled) {
@@ -521,6 +647,7 @@ export function useEmojiMartStyles(
 
     let animationFrame = 0;
     let removeWheelScroll: (() => void) | null = null;
+    let styledHost: Element | null = null;
 
     const installEmojiMartStyles = () => {
       const host = containerRef.current?.querySelector("em-emoji-picker");
@@ -530,6 +657,9 @@ export function useEmojiMartStyles(
         animationFrame = window.requestAnimationFrame(installEmojiMartStyles);
         return;
       }
+
+      styledHost = host;
+      host.toggleAttribute("data-buzz-onboarding-inline", onboardingInline);
 
       if (!shadowRoot.querySelector("#buzz-emoji-mart-style")) {
         const style = document.createElement("style");
@@ -546,8 +676,9 @@ export function useEmojiMartStyles(
     return () => {
       window.cancelAnimationFrame(animationFrame);
       removeWheelScroll?.();
+      styledHost?.removeAttribute("data-buzz-onboarding-inline");
     };
-  }, [containerRef, enabled]);
+  }, [containerRef, enabled, onboardingInline]);
 }
 
 export function useEmojiMartThemeVars() {
@@ -560,14 +691,12 @@ export function useEmojiMartThemeVars() {
       const foreground = hslToRgbString(
         styles.getPropertyValue("--foreground"),
       );
-      const background = hslToRgbString(
-        styles.getPropertyValue("--background"),
-      );
+      const input = hslToRgbString(styles.getPropertyValue("--input"));
 
       setThemeVars({
         "--buzz-emoji-picker-rgb-background": muted ?? "54, 58, 79",
         "--buzz-emoji-picker-rgb-color": foreground ?? "245, 247, 255",
-        "--buzz-emoji-picker-rgb-input": background ?? "47, 51, 68",
+        "--buzz-emoji-picker-rgb-input": input ?? "47, 51, 68",
       } as React.CSSProperties);
     };
 

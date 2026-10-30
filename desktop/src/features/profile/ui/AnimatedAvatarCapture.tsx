@@ -1,5 +1,4 @@
-import { Camera, Video } from "lucide-react";
-import { motion } from "motion/react";
+import { Camera } from "lucide-react";
 import * as React from "react";
 import { createPortal } from "react-dom";
 
@@ -33,7 +32,8 @@ import {
   stopAvatarCamera,
 } from "@/features/profile/lib/animatedAvatarCapture";
 import { AnimatedAvatarBackdropPanel } from "@/features/profile/ui/AnimatedAvatarBackdropPanel";
-import { AnimatedAvatarCameraPicker } from "@/features/profile/ui/AnimatedAvatarCameraPicker";
+import type { AnimatedAvatarCaptureProps } from "@/features/profile/ui/AnimatedAvatarCapture.types";
+import { AnimatedAvatarCameraControls } from "@/features/profile/ui/AnimatedAvatarCameraControls";
 import {
   AvatarFilmstripPicker,
   AvatarFramingSlider,
@@ -47,11 +47,10 @@ import {
   clampFrameIndex,
   clampOffset,
   defaultPersonScaleForSource,
-  ENTRANCE_TRANSITION,
   PERSON_SIZE_TIP,
   preferredCameraDevice,
+  presentAnimatedAvatar,
   randomBackdropColor,
-  RECORD_SECONDS,
 } from "@/features/profile/ui/AnimatedAvatarCapture.helpers";
 import {
   AnimatedAvatarReviewNav,
@@ -65,36 +64,9 @@ import {
   normalizeHue,
 } from "@/features/profile/ui/ProfileAvatarEditor.utils";
 import { uploadMediaBytes } from "@/shared/api/tauri";
-import { buildAnimatedAvatarUrl } from "@/shared/lib/animatedAvatar";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Spinner } from "@/shared/ui/spinner";
-
-type AnimatedAvatarCaptureProps = {
-  disabled?: boolean;
-  testIdPrefix: string;
-  /** Receives the composed animated avatar URL after upload. */
-  onApply: (avatarUrl: string) => void;
-  /**
-   * Host element inside the page's main avatar preview. When provided, the
-   * camera feed, recording ring, and composed preview render there (via a
-   * portal) instead of inside the tab — so edits show exactly where the
-   * avatar will live. Pair with `onPreviewActiveChange` so the host can
-   * hide its regular preview while the capture content is showing.
-   */
-  previewContainer?: HTMLElement | null;
-  onPreviewActiveChange?: (active: boolean) => void;
-  onPreviewCaptionChange?: (caption: string | null) => void;
-  onApplyPendingChange?: (isPending: boolean) => void;
-  onCustomColorPickerOpenChange?: (isOpen: boolean) => void;
-  /**
-   * Receives the current apply function (or null when there is nothing to
-   * apply) so the host's Done button can upload-and-apply in one step.
-   */
-  registerApply?: (apply: (() => Promise<boolean>) | null) => void;
-  /** Show the in-tab "Use as avatar" button (hosts without a Done button). */
-  showApplyButton?: boolean;
-};
 
 export function AnimatedAvatarCapture({
   disabled = false,
@@ -107,6 +79,10 @@ export function AnimatedAvatarCapture({
   onPreviewCaptionChange,
   registerApply,
   showApplyButton = true,
+  autoStartCamera = false,
+  compactReview = false,
+  compactColorPicker = false,
+  stackCameraOptions = false,
 }: AnimatedAvatarCaptureProps) {
   const [phase, setPhase] = React.useState<CapturePhase>("idle");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
@@ -135,9 +111,10 @@ export function AnimatedAvatarCapture({
   const [personOutline, setPersonOutline] = React.useState(
     DEFAULT_PERSON_OUTLINE,
   );
+  const initialShapeOffsetY = compactReview ? -24 : DEFAULT_SHAPE_OFFSET_Y;
   const [shapeOffset, setShapeOffset] = React.useState({
     x: DEFAULT_SHAPE_OFFSET_X,
-    y: DEFAULT_SHAPE_OFFSET_Y,
+    y: initialShapeOffsetY,
   });
   const [shapeScale, setShapeScale] = React.useState(DEFAULT_SHAPE_SCALE);
   const [activeSection, setActiveSection] =
@@ -164,7 +141,7 @@ export function AnimatedAvatarCapture({
 
   const resetActiveFraming = React.useCallback(() => {
     if (activeSection === "shape") {
-      setShapeOffset({ x: DEFAULT_SHAPE_OFFSET_X, y: DEFAULT_SHAPE_OFFSET_Y });
+      setShapeOffset({ x: DEFAULT_SHAPE_OFFSET_X, y: initialShapeOffsetY });
       setShapeScale(DEFAULT_SHAPE_SCALE);
       return;
     }
@@ -173,7 +150,7 @@ export function AnimatedAvatarCapture({
       y: DEFAULT_PERSON_OFFSET_Y,
     });
     setPersonScale(DEFAULT_PERSON_SCALE);
-  }, [activeSection]);
+  }, [activeSection, initialShapeOffsetY]);
 
   const resetAllFraming = React.useCallback(() => {
     setPersonOffset({
@@ -181,9 +158,9 @@ export function AnimatedAvatarCapture({
       y: DEFAULT_PERSON_OFFSET_Y,
     });
     setPersonScale(DEFAULT_PERSON_SCALE);
-    setShapeOffset({ x: DEFAULT_SHAPE_OFFSET_X, y: DEFAULT_SHAPE_OFFSET_Y });
+    setShapeOffset({ x: DEFAULT_SHAPE_OFFSET_X, y: initialShapeOffsetY });
     setShapeScale(DEFAULT_SHAPE_SCALE);
-  }, []);
+  }, [initialShapeOffsetY]);
 
   // Custom backdrop color picker (shared HSV panel).
   const [isCustomPickerOpen, setIsCustomPickerOpen] = React.useState(false);
@@ -278,8 +255,6 @@ export function AnimatedAvatarCapture({
       releaseCamera();
     };
   }, [releaseCamera]);
-
-  // Close bitmaps on unmount only — phase changes manage them explicitly.
   React.useEffect(() => releaseBitmaps, [releaseBitmaps]);
 
   React.useEffect(() => {
@@ -435,6 +410,28 @@ export function AnimatedAvatarCapture({
     [cameraDevices, phase, startCamera],
   );
 
+  React.useEffect(() => {
+    if (!autoStartCamera || phase !== "idle" || selectedCameraSource) {
+      return;
+    }
+
+    const computerCamera = preferredCameraDevice(cameraDevices, "computer");
+    const iphoneCamera = preferredCameraDevice(cameraDevices, "iphone");
+    const source: CameraSource =
+      computerCamera || !iphoneCamera ? "computer" : "iphone";
+    const cameraId =
+      (source === "computer" ? computerCamera : iphoneCamera)?.deviceId ?? null;
+    setSelectedCameraSource(source);
+    setSelectedCameraId(cameraId);
+    void startCamera(cameraId, source);
+  }, [
+    autoStartCamera,
+    cameraDevices,
+    phase,
+    selectedCameraSource,
+    startCamera,
+  ]);
+
   const record = React.useCallback(async () => {
     const video = videoRef.current;
     if (!video || phase !== "live") {
@@ -524,7 +521,9 @@ export function AnimatedAvatarCapture({
         setErrorMessage("The relay rejected the recording. Try again.");
         return false;
       }
-      onApply(buildAnimatedAvatarUrl(posterUpload.url, animationUpload.url));
+      onApply(
+        presentAnimatedAvatar(posterUpload, animationUpload, posterBytes),
+      );
       return true;
     } catch (error) {
       setErrorMessage(
@@ -576,10 +575,6 @@ export function AnimatedAvatarCapture({
     );
   const isFramingSection =
     activeSection === "person" || activeSection === "shape";
-
-  // With a host preview container, the camera feed / recording ring /
-  // composed preview render inside the page's main avatar preview (via a
-  // portal) so edits show exactly where the avatar will live.
   const usePortal = previewContainer !== null;
   const reviewWarning =
     phase === "review" && recording && !recording.backgroundRemoved
@@ -608,7 +603,9 @@ export function AnimatedAvatarCapture({
       ? null
       : captureHelpText;
   const showCaptureCard = !usePortal && phase !== "review";
-  const showCameraPicker = ["idle", "starting", "live"].includes(phase);
+  const showInlineReviewStage = !usePortal && phase === "review";
+  const showCameraControls = ["idle", "starting", "live"].includes(phase);
+  const showCameraPicker = !autoStartCamera && showCameraControls;
 
   React.useEffect(() => {
     onPreviewActiveChange?.(usePortal);
@@ -635,7 +632,16 @@ export function AnimatedAvatarCapture({
   }, [isCustomPickerVisible, onCustomColorPickerOpenChange]);
 
   const stageContent = (
-    <div className={cn("relative", usePortal ? "h-full w-full" : "h-44 w-44")}>
+    <div
+      className={cn(
+        "relative",
+        usePortal
+          ? "h-full w-full"
+          : compactReview && phase === "review"
+            ? "h-36 w-36"
+            : "h-44 w-44",
+      )}
+    >
       {/* Live camera preview — kept mounted so the stream can attach. */}
       <div
         className={cn(
@@ -646,7 +652,7 @@ export function AnimatedAvatarCapture({
         <video
           autoPlay
           className={cn(
-            "h-full w-full -scale-x-100 object-cover",
+            "block h-full w-full -scale-x-100 object-cover object-center",
             !isCameraVisible && "opacity-0",
           )}
           data-testid={`${testIdPrefix}-animated-preview`}
@@ -793,16 +799,28 @@ export function AnimatedAvatarCapture({
   return (
     <div
       className={cn(
-        "relative grid content-start",
-        phase === "review" ? "gap-7 pb-9 pt-2" : "gap-4 pb-5",
-        phase === "review" && !showApplyButton && "mb-5",
-        isCustomPickerVisible && "min-h-[504px]",
+        "relative grid",
+        phase === "review"
+          ? compactReview
+            ? "content-start gap-4 pb-2 pt-0"
+            : "content-start gap-7 pb-9 pt-2"
+          : stackCameraOptions && showCameraControls
+            ? "h-full min-h-0 grid-rows-[minmax(0,1fr)] content-stretch gap-0 pb-0"
+            : "content-start gap-4 pb-5",
+        stackCameraOptions && "min-h-full",
+        phase === "review" && !showApplyButton && !compactReview && "mb-5",
+        isCustomPickerVisible &&
+          (compactColorPicker ? "min-h-[360px]" : "min-h-[504px]"),
       )}
       data-testid={`${testIdPrefix}-animated`}
     >
       {usePortal && previewContainer
         ? createPortal(stageContent, previewContainer)
         : null}
+
+      {showInlineReviewStage ? (
+        <div className="grid place-items-center">{stageContent}</div>
+      ) : null}
 
       {showCaptureCard ? (
         <div className="relative grid place-items-center rounded-xl bg-muted px-4 py-6">
@@ -845,7 +863,12 @@ export function AnimatedAvatarCapture({
       ) : null}
 
       {phase === "review" && isFramingSection ? (
-        <div className="flex items-start gap-2">
+        <div
+          className={cn(
+            "flex items-start gap-2",
+            compactReview && "mx-auto w-full max-w-[360px]",
+          )}
+        >
           <AvatarFramingSlider
             disabled={disabled || isSaving}
             max={Math.round(activeScaleMax * 100)}
@@ -877,6 +900,7 @@ export function AnimatedAvatarCapture({
       {phase === "review" && activeSection === "color" ? (
         <AnimatedAvatarBackdropPanel
           backdropColor={backdropColor}
+          compact={compactReview}
           disabled={disabled}
           isCustomBackdropSelected={isCustomBackdropSelected}
           isSaving={isSaving}
@@ -901,45 +925,29 @@ export function AnimatedAvatarCapture({
         />
       ) : null}
 
-      {showCameraPicker ? (
-        <div className="grid gap-4">
-          <AnimatedAvatarCameraPicker
-            activeCameraSource={activeCameraSource}
-            computerDisabled={cameraDevices.length > 0 && !computerCamera}
-            disabled={disabled || phase === "starting"}
-            iphoneDisabled={
-              cameraDevices.length > 0 && !iphoneCamera && hasCameraLabels
-            }
-            onSelectSource={selectCameraSource}
-            testIdPrefix={testIdPrefix}
-          />
-          {usePortal && inlineCaptureHelpText ? (
-            <p className="px-1 text-center text-sm text-muted-foreground">
-              {inlineCaptureHelpText}
-            </p>
-          ) : null}
-          <div className="h-14 pt-2">
-            {phase === "live" ? (
-              <Button
-                asChild
-                className="h-12 w-full rounded-xl"
-                data-testid={`${testIdPrefix}-animated-record`}
-                disabled={disabled}
-                onClick={() => void record()}
-                type="button"
-              >
-                <motion.button
-                  animate={{ opacity: 1 }}
-                  initial={{ opacity: 0 }}
-                  transition={ENTRANCE_TRANSITION}
-                >
-                  <Video aria-hidden="true" className="mr-2 h-4 w-4" />
-                  Record {RECORD_SECONDS} seconds
-                </motion.button>
-              </Button>
-            ) : null}
-          </div>
-        </div>
+      {showCameraControls ? (
+        <AnimatedAvatarCameraControls
+          activeCameraSource={activeCameraSource}
+          compact={compactReview}
+          computerDisabled={cameraDevices.length > 0 && !computerCamera}
+          disabled={disabled}
+          helpText={usePortal ? inlineCaptureHelpText : null}
+          iphoneDisabled={
+            cameraDevices.length > 0 && !iphoneCamera && hasCameraLabels
+          }
+          isLive={phase === "live"}
+          isStarting={phase === "starting"}
+          onRecord={() => void record()}
+          onRetry={
+            errorMessage && autoStartCamera && phase === "idle"
+              ? () => void startCamera(selectedCameraId, selectedCameraSource)
+              : undefined
+          }
+          onSelectSource={selectCameraSource}
+          showCameraPicker={showCameraPicker}
+          stackCameraOptions={stackCameraOptions}
+          testIdPrefix={testIdPrefix}
+        />
       ) : usePortal && inlineCaptureHelpText ? (
         <p className="px-1 text-center text-sm text-muted-foreground">
           {inlineCaptureHelpText}
@@ -988,7 +996,8 @@ export function AnimatedAvatarCapture({
           setCustomValue(nextValue);
         }}
         saturation={customSaturation}
-        className="h-[504px]"
+        className={compactColorPicker ? undefined : "h-[504px]"}
+        compact={compactColorPicker}
         testIdPrefix={`${testIdPrefix}-animated`}
         value={customValue}
         visible={isCustomPickerVisible}

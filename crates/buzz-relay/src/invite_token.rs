@@ -49,10 +49,10 @@ use buzz_core::tenant::CommunityId;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Default invite lifetime: 72 hours.
-pub const DEFAULT_INVITE_TTL_SECS: u64 = 72 * 60 * 60;
+pub use buzz_core::invite::DEFAULT_INVITE_TTL_SECS;
 
 /// Maximum invite lifetime a mint request may ask for: 30 days.
-pub const MAX_INVITE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+pub use buzz_core::invite::MAX_INVITE_TTL_SECS;
 
 /// Maximum accepted code length (defense against absurd inputs before any
 /// parsing work happens). A real code is ~200 bytes.
@@ -121,10 +121,11 @@ fn sign_payload(key: &[u8; 32], payload_bytes: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Mint an invite code for `community`, expiring `ttl_secs` from now.
+/// Mint a legacy v1 invite code for compatibility tests.
 ///
-/// The role is fixed to `"member"` — elevated roles are granted post-join via
-/// the existing kind:9032 change-role command, never via a bearer link.
+/// Production minting uses database-backed v2 codes. Remove this helper with
+/// v1 claim verification after the compatibility drain window.
+#[cfg(test)]
 pub fn mint_invite(key: &[u8; 32], community: CommunityId, ttl_secs: u64) -> (String, u64) {
     let ttl = ttl_secs.clamp(60, MAX_INVITE_TTL_SECS);
     let expires_at = now_unix() + ttl;
@@ -157,6 +158,27 @@ pub fn verify_invite(
     community: CommunityId,
     code: &str,
 ) -> Result<InvitePayload, InviteError> {
+    verify_invite_at(key, community, code, now_unix(), None)
+}
+
+/// Verify a legacy bearer with the configured absolute invalid-after time.
+/// v2 admission never calls this verifier.
+pub fn verify_invite_with_cutoff(
+    key: &[u8; 32],
+    community: CommunityId,
+    code: &str,
+    invalid_after: Option<u64>,
+) -> Result<InvitePayload, InviteError> {
+    verify_invite_at(key, community, code, now_unix(), invalid_after)
+}
+
+fn verify_invite_at(
+    key: &[u8; 32],
+    community: CommunityId,
+    code: &str,
+    now: u64,
+    invalid_after: Option<u64>,
+) -> Result<InvitePayload, InviteError> {
     if code.len() > MAX_CODE_LEN {
         return Err(InviteError::Malformed);
     }
@@ -177,7 +199,7 @@ pub fn verify_invite(
     let payload: InvitePayload =
         serde_json::from_slice(&payload_bytes).map_err(|_| InviteError::Malformed)?;
 
-    if payload.e < now_unix() {
+    if payload.e < now || invalid_after.is_some_and(|cutoff| now >= cutoff) {
         return Err(InviteError::Expired);
     }
     if payload.c != community.as_uuid().to_string() {
@@ -325,5 +347,119 @@ mod tests {
             URL_SAFE_NO_PAD.encode(mac)
         );
         assert_eq!(verify_invite(&key, c, &code), Err(InviteError::InvalidRole));
+    }
+}
+
+/// Short-lived proof that the browser accepted the configured join policy.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyAcceptancePayload {
+    /// SHA-256 of the invite code this acceptance is bound to.
+    pub c: String,
+    /// Configured policy version.
+    pub v: String,
+    /// Receipt expiry (unix seconds).
+    pub e: u64,
+}
+
+/// Mint a relay-authenticated, invite-bound policy acceptance receipt.
+pub fn mint_policy_acceptance(key: &[u8; 32], code: &str, version: &str) -> String {
+    let payload = PolicyAcceptancePayload {
+        c: hex::encode(Sha256::digest(code.as_bytes())),
+        v: version.to_string(),
+        e: now_unix() + 10 * 60,
+    };
+    let bytes = serde_json::to_vec(&payload).expect("policy acceptance serializes");
+    format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&bytes),
+        URL_SAFE_NO_PAD.encode(sign_payload(key, &bytes))
+    )
+}
+
+/// Verify a policy receipt and bind it to the submitted invite and current policy.
+pub fn verify_policy_acceptance(
+    key: &[u8; 32],
+    receipt: &str,
+    code: &str,
+    version: &str,
+) -> Result<PolicyAcceptancePayload, InviteError> {
+    if receipt.len() > 2048 {
+        return Err(InviteError::Malformed);
+    }
+    let (payload, signature) = receipt.split_once('.').ok_or(InviteError::Malformed)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| InviteError::Malformed)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| InviteError::Malformed)?;
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(&bytes);
+    mac.verify_slice(&signature)
+        .map_err(|_| InviteError::BadSignature)?;
+    let payload: PolicyAcceptancePayload =
+        serde_json::from_slice(&bytes).map_err(|_| InviteError::Malformed)?;
+    if payload.e < now_unix() {
+        return Err(InviteError::Expired);
+    }
+    let expected_code = hex::encode(Sha256::digest(code.as_bytes()));
+    if payload.c != expected_code || payload.v != version {
+        return Err(InviteError::Malformed);
+    }
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod policy_acceptance_tests {
+    use super::*;
+
+    #[test]
+    fn policy_receipt_is_bound_to_invite_and_version() {
+        let key = [7_u8; 32];
+        let receipt = mint_policy_acceptance(&key, "invite-a", "v1");
+        let payload =
+            verify_policy_acceptance(&key, &receipt, "invite-a", "v1").expect("valid receipt");
+        assert_eq!(payload.v, "v1");
+        assert!(verify_policy_acceptance(&key, &receipt, "invite-b", "v1").is_err());
+        assert!(verify_policy_acceptance(&key, &receipt, "invite-a", "v2").is_err());
+        assert!(verify_policy_acceptance(&[8_u8; 32], &receipt, "invite-a", "v1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cutoff_tests {
+    use super::*;
+
+    #[test]
+    fn cutoff_never_extends_expiry_and_rejects_at_boundary() {
+        let key = [42; 32];
+        let community = CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let payload = InvitePayload {
+            c: community.to_string(),
+            r: "member".into(),
+            e: 200,
+            n: "fixture".into(),
+        };
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let code = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&bytes),
+            URL_SAFE_NO_PAD.encode(sign_payload(&key, &bytes))
+        );
+        for (now, cutoff, allowed) in [
+            (100, None, true),
+            (199, None, true),
+            (201, None, false),
+            (99, Some(100), true),
+            (100, Some(100), false),
+            (101, Some(100), false),
+            (201, Some(300), false),
+        ] {
+            assert_eq!(
+                verify_invite_at(&key, community, &code, now, cutoff).is_ok(),
+                allowed,
+                "now={now} cutoff={cutoff:?}"
+            );
+        }
     }
 }

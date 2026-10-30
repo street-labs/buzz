@@ -1,13 +1,25 @@
 import * as React from "react";
-import { ChevronRight, Smile } from "lucide-react";
+import { Smile } from "lucide-react";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import {
+  MaskedAvatarBadgeFrame,
+  STATUS_DOT_MASK_CURVE,
+} from "@/features/profile/ui/MaskedAvatarBadgeFrame";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
-import { getPresenceLabel } from "@/features/presence/lib/presence";
+import {
+  getPresenceChipClassName,
+  getPresenceLabel,
+} from "@/features/presence/lib/presence";
 import { SetStatusDialog } from "@/features/user-status/ui/SetStatusDialog";
-import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
+import {
+  DEFAULT_USER_STATUS_EMOJI,
+  StatusEmoji,
+} from "@/features/user-status/ui/StatusEmoji";
+import type { UserStatusInput } from "@/features/user-status/types";
 import type { PresenceStatus } from "@/shared/api/types";
+import { cn } from "@/shared/lib/cn";
 import { isMacPlatform } from "@/shared/lib/platform";
 
 interface ProfilePopoverProps {
@@ -20,19 +32,21 @@ interface ProfilePopoverProps {
   isStatusPending?: boolean;
   userStatusText?: string;
   userStatusEmoji?: string;
+  userStatusExpiresAt?: number;
+  userStatusUpdatedAt?: number;
   onSetStatus: (status: PresenceStatus) => void;
-  onSetUserStatus: (text: string, emoji: string) => void;
+  onSetUserStatus: (status: UserStatusInput) => void;
   onClearUserStatus: () => void;
   onOpenSettings: (section?: "profile" | "appearance") => void;
+  onSendFeedback?: () => void;
   children: React.ReactNode;
   // Optional outer container whose clicks should NOT close the popover.
   // Used when auxiliary triggers (avatar, status text) live alongside the
   // primary PopoverTrigger and toggle the popover via controlled `open`.
   triggerContainerRef?: React.RefObject<HTMLElement | null>;
-  // Optional slot rendered between the identity block and the menu items.
-  // Used by the sidebar to surface the workspace/relay selector inside the
-  // profile menu instead of on the sidebar card.
-  workspaceSwitcherSlot?: React.ReactNode;
+  // Optional slot rendered before the profile actions. Used by the sidebar to
+  // surface active-community actions inside the profile menu.
+  communitySwitcherSlot?: React.ReactNode;
 }
 
 const MENU_ITEM_CLASS =
@@ -50,43 +64,21 @@ export function ProfilePopover({
   isStatusPending,
   userStatusText,
   userStatusEmoji,
+  userStatusExpiresAt,
+  userStatusUpdatedAt,
   onSetStatus,
   onSetUserStatus,
   onClearUserStatus,
   onOpenSettings,
+  onSendFeedback,
   children,
   triggerContainerRef,
-  workspaceSwitcherSlot,
+  communitySwitcherSlot,
 }: ProfilePopoverProps) {
   const [statusDialogOpen, setStatusDialogOpen] = React.useState(false);
   const [presenceMenuOpen, setPresenceMenuOpen] = React.useState(false);
-  const presenceHoverTimer = React.useRef<number | null>(null);
   const hasUserStatus = Boolean(userStatusText || userStatusEmoji);
   const settingsShortcutLabel = isMacPlatform() ? "⌘," : "Ctrl+,";
-
-  function clearPresenceHoverTimer() {
-    if (presenceHoverTimer.current !== null) {
-      window.clearTimeout(presenceHoverTimer.current);
-      presenceHoverTimer.current = null;
-    }
-  }
-
-  function schedulePresenceMenu(nextOpen: boolean) {
-    clearPresenceHoverTimer();
-    presenceHoverTimer.current = window.setTimeout(
-      () => setPresenceMenuOpen(nextOpen),
-      nextOpen ? 80 : 160,
-    );
-  }
-
-  React.useEffect(
-    () => () => {
-      if (presenceHoverTimer.current !== null) {
-        window.clearTimeout(presenceHoverTimer.current);
-      }
-    },
-    [],
-  );
 
   function handlePopoverOpenChange(nextOpen: boolean) {
     if (!nextOpen) {
@@ -96,7 +88,6 @@ export function ProfilePopover({
   }
 
   function closePopover() {
-    clearPresenceHoverTimer();
     setPresenceMenuOpen(false);
     onOpenChange(false);
   }
@@ -130,26 +121,86 @@ export function ProfilePopover({
           <div aria-label="Profile menu" role="menu">
             {/* ── Identity block ─────────────────────────────────── */}
             <div className="flex items-center gap-2 px-3 pt-2 pb-2">
-              <div className="relative shrink-0">
+              <MaskedAvatarBadgeFrame
+                badge={
+                  <span
+                    aria-label={getPresenceLabel(currentStatus)}
+                    className="flex h-3.5 w-3.5 items-center justify-center rounded-full"
+                    data-testid="profile-popover-current-status"
+                    role="img"
+                  >
+                    <PresenceDot className="h-2 w-2" status={currentStatus} />
+                  </span>
+                }
+                badgeBox={{ bottom: -2, height: 14, right: -2, width: 14 }}
+                className="h-8 w-8"
+                curve={STATUS_DOT_MASK_CURVE}
+                cutout={{ cx: 28, cy: 28, r: 7.5 }}
+                size={32}
+              >
                 <ProfileAvatar
                   avatarDataUrl={avatarDataUrl}
                   avatarUrl={avatarUrl}
-                  className="h-8 w-8 text-xs"
+                  className="h-full w-full text-xs"
                   iconClassName="h-4 w-4"
                   label={displayName}
                 />
-              </div>
+              </MaskedAvatarBadgeFrame>
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-semibold leading-tight text-popover-foreground">
                   {displayName}
                 </p>
-                <div
-                  className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
-                  data-testid="profile-popover-current-status"
+                {/* ── Presence chip (opens status chooser) ─────────── */}
+                <Popover
+                  onOpenChange={setPresenceMenuOpen}
+                  open={presenceMenuOpen}
                 >
-                  <PresenceDot status={currentStatus} />
-                  <span>{getPresenceLabel(currentStatus)}</span>
-                </div>
+                  <PopoverTrigger asChild>
+                    <button
+                      aria-expanded={presenceMenuOpen}
+                      aria-haspopup="menu"
+                      className={cn(
+                        "mt-0.5 inline-flex max-w-full items-center rounded-md px-2 py-0.5 text-xs font-medium outline-hidden transition-opacity hover:opacity-80 focus-visible:opacity-80 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
+                        getPresenceChipClassName(currentStatus),
+                      )}
+                      data-testid="profile-popover-presence-trigger"
+                      disabled={isStatusPending}
+                      onClick={() => setPresenceMenuOpen((prev) => !prev)}
+                      role="menuitem"
+                      type="button"
+                    >
+                      <span className="truncate">
+                        {getPresenceLabel(currentStatus)}
+                      </span>
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent
+                    align="start"
+                    className="w-52 p-1"
+                    side="bottom"
+                    sideOffset={4}
+                  >
+                    <div aria-label="Presence status" role="menu">
+                      {ALL_STATUSES.map((status) => (
+                        <button
+                          className={MENU_ITEM_CLASS}
+                          data-testid={`profile-popover-status-${status}`}
+                          disabled={isStatusPending}
+                          key={status}
+                          onClick={() => handlePresenceSelect(status)}
+                          role="menuitem"
+                          type="button"
+                        >
+                          <PresenceDot
+                            className="h-2.5 w-2.5"
+                            status={status}
+                          />
+                          <span>{getPresenceLabel(status)}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </PopoverContent>
+                </Popover>
               </div>
             </div>
 
@@ -167,15 +218,20 @@ export function ProfilePopover({
                 role="menuitem"
                 type="button"
               >
-                <Smile className="h-4 w-4 shrink-0 text-muted-foreground" />
+                {hasUserStatus ? (
+                  <StatusEmoji
+                    className="size-4 shrink-0 text-base"
+                    showTitle={false}
+                    value={userStatusEmoji || DEFAULT_USER_STATUS_EMOJI}
+                  />
+                ) : (
+                  <Smile
+                    aria-hidden="true"
+                    className="h-4 w-4 shrink-0 text-muted-foreground"
+                  />
+                )}
                 {hasUserStatus ? (
                   <span className="flex min-w-0 flex-1 items-center gap-1 truncate text-popover-foreground">
-                    {userStatusEmoji ? (
-                      <StatusEmoji
-                        className="w-5 shrink-0 text-base"
-                        value={userStatusEmoji}
-                      />
-                    ) : null}
                     <span className="truncate">{userStatusText}</span>
                   </span>
                 ) : (
@@ -186,59 +242,34 @@ export function ProfilePopover({
               </button>
             </div>
 
-            {/* ── Presence ────────────────────────────────────────── */}
-            <Popover onOpenChange={setPresenceMenuOpen} open={presenceMenuOpen}>
-              <PopoverTrigger asChild>
-                <button
-                  aria-expanded={presenceMenuOpen}
-                  aria-haspopup="menu"
-                  className={MENU_ITEM_CLASS}
-                  data-testid="profile-popover-presence-trigger"
-                  disabled={isStatusPending}
-                  onClick={() => {
-                    clearPresenceHoverTimer();
-                    setPresenceMenuOpen((prev) => !prev);
-                  }}
-                  onMouseEnter={() => schedulePresenceMenu(true)}
-                  onMouseLeave={() => schedulePresenceMenu(false)}
-                  role="menuitem"
-                  type="button"
-                >
-                  <PresenceDot className="h-2.5 w-2.5" status={currentStatus} />
-                  <span className="flex-1">
-                    {getPresenceLabel(currentStatus)}
-                  </span>
-                  <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                </button>
-              </PopoverTrigger>
-              <PopoverContent
-                align="start"
-                className="w-60 p-1"
-                onMouseEnter={() => schedulePresenceMenu(true)}
-                onMouseLeave={() => schedulePresenceMenu(false)}
-                side="right"
-                sideOffset={4}
-              >
-                <div aria-label="Presence status" role="menu">
-                  {ALL_STATUSES.map((status) => (
-                    <button
-                      className={MENU_ITEM_CLASS}
-                      data-testid={`profile-popover-status-${status}`}
-                      disabled={isStatusPending}
-                      key={status}
-                      onClick={() => handlePresenceSelect(status)}
-                      role="menuitem"
-                      type="button"
-                    >
-                      <PresenceDot className="h-2.5 w-2.5" status={status} />
-                      <span>{getPresenceLabel(status)}</span>
-                    </button>
-                  ))}
-                </div>
-              </PopoverContent>
-            </Popover>
+            <hr className="my-1 h-px border-0 bg-border/60" />
 
-            <hr className="my-1 h-px border-0 bg-border" />
+            {communitySwitcherSlot ? (
+              <>
+                {/* ── Community actions ──────────────────────────── */}
+                <div className="py-1" data-testid="profile-popover-community">
+                  {communitySwitcherSlot}
+                </div>
+                <hr className="my-1 h-px border-0 bg-border/60" />
+              </>
+            ) : null}
+
+            {onSendFeedback ? (
+              <button
+                className={MENU_ITEM_CLASS}
+                data-testid="profile-popover-send-feedback"
+                onClick={() => {
+                  closePopover();
+                  window.requestAnimationFrame(() => {
+                    onSendFeedback();
+                  });
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <span className="flex-1">Send feedback</span>
+              </button>
+            ) : null}
 
             {/* ── Settings ───────────────────────────────────────── */}
             <button
@@ -258,16 +289,6 @@ export function ProfilePopover({
                 {settingsShortcutLabel}
               </kbd>
             </button>
-
-            {workspaceSwitcherSlot ? (
-              <>
-                <hr className="my-1 h-px border-0 bg-border" />
-                {/* ── Workspace / relay selector ─────────────────── */}
-                <div data-testid="profile-popover-workspace">
-                  {workspaceSwitcherSlot}
-                </div>
-              </>
-            ) : null}
           </div>
         </PopoverContent>
       </Popover>
@@ -275,7 +296,9 @@ export function ProfilePopover({
       <SetStatusDialog
         hasExistingStatus={hasUserStatus}
         initialEmoji={userStatusEmoji}
+        initialExpiresAt={userStatusExpiresAt}
         initialText={userStatusText}
+        initialUpdatedAt={userStatusUpdatedAt}
         onClear={onClearUserStatus}
         onOpenChange={setStatusDialogOpen}
         onSave={onSetUserStatus}

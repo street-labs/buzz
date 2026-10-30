@@ -3,16 +3,18 @@ import { expect, type Page } from "@playwright/test";
 type SettingsSection =
   | "profile"
   | "notifications"
+  | "voice"
   | "agents"
   | "channel-templates"
   | "compute"
+  | "experimental"
   | "appearance"
   | "shortcuts"
+  | "hosted-communities"
   | "tokens"
-  | "relay-members"
+  | "community-members"
   | "mobile"
-  | "updates"
-  | "doctor";
+  | "updates";
 
 export async function openProfileMenu(page: Page) {
   await page.getByTestId("open-settings").click();

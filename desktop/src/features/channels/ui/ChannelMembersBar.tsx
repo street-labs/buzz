@@ -1,20 +1,29 @@
 import { EllipsisVertical, Settings2, Users } from "lucide-react";
 import * as React from "react";
+import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 import { useHuddle } from "@/features/huddle";
 import { HuddleIndicator } from "@/features/huddle/components/HuddleIndicator";
+import { formatHuddleActionError } from "@/features/huddle/lib/huddleError";
 import { buildHuddleChannelName } from "@/features/huddle/lib/huddleChannelName";
 import {
   useAvailableAcpRuntimes,
-  useBackendProvidersQuery,
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { mergeChannelKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
+import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
 import { useChannelMembersQuery } from "@/features/channels/hooks";
+import {
+  getDmHuddleMemberPubkeys,
+  hasOtherDmParticipant,
+} from "@/features/channels/lib/dmHuddleMembers";
 import { canStartHuddleInChannel } from "@/features/channels/lib/huddleAvailability";
+import { useUsersBatchQuery } from "@/features/profile/hooks";
 import type { Channel } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,6 +35,7 @@ import { AddChannelBotDialog } from "./AddChannelBotDialog";
 type ChannelMembersBarProps = {
   channel: Channel;
   currentPubkey?: string;
+  endActions?: React.ReactNode;
   isAddBotOpen?: boolean;
   onAddBotOpenChange?: (open: boolean) => void;
   onManageChannel: () => void;
@@ -36,6 +46,7 @@ type ChannelMembersBarProps = {
 export function ChannelMembersBar({
   channel,
   currentPubkey,
+  endActions,
   isAddBotOpen: isAddBotOpenProp,
   onAddBotOpenChange,
   onManageChannel,
@@ -56,12 +67,53 @@ export function ChannelMembersBar({
   );
   const { startHuddle, isStarting: isStartingHuddle } = useHuddle();
   const queryClient = useQueryClient();
-  const membersQuery = useChannelMembersQuery(channel.id);
+  // The roster is only needed for DM huddle composition (agent detection and
+  // participant naming). Streams/forums render the count from the channel
+  // summary and gate huddle access on `channel.isMember`, so mounting this
+  // bar must not put a full-roster fetch on the channel-switch path.
+  const membersQuery = useChannelMembersQuery(
+    channel.id,
+    channel.channelType === "dm",
+  );
   const providersQuery = useAvailableAcpRuntimes();
-  const backendProvidersQuery = useBackendProvidersQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
   const members = membersQuery.data ?? [];
+  const dmProfilesQuery = useUsersBatchQuery(
+    channel.channelType === "dm" ? channel.participantPubkeys : [],
+    { enabled: channel.channelType === "dm" },
+  );
+  const huddleAgentPubkeys = React.useMemo(() => {
+    const pubkeys = new Set(
+      mergeChannelKnownAgentPubkeys(
+        membersQuery.data,
+        managedAgentsQuery.data,
+        relayAgentsQuery.data,
+      ),
+    );
+    for (const [pubkey, profile] of Object.entries(
+      dmProfilesQuery.data?.profiles ?? {},
+    )) {
+      if (profile.isAgent) pubkeys.add(normalizePubkey(pubkey));
+    }
+    return pubkeys;
+  }, [
+    dmProfilesQuery.data?.profiles,
+    managedAgentsQuery.data,
+    membersQuery.data,
+    relayAgentsQuery.data,
+  ]);
+  const huddleMemberPubkeys = React.useMemo(
+    () => getDmHuddleMemberPubkeys(channel, huddleAgentPubkeys, currentPubkey),
+    [channel, currentPubkey, huddleAgentPubkeys],
+  );
+  const huddleMemberPubkeysPending =
+    hasOtherDmParticipant(channel, currentPubkey) &&
+    (membersQuery.isPending ||
+      managedAgentsQuery.isPending ||
+      relayAgentsQuery.isPending ||
+      dmProfilesQuery.isPending ||
+      dmProfilesQuery.isPlaceholderData);
   const memberCount = membersQuery.data?.length ?? channel.memberCount;
   const providers = React.useMemo(
     () =>
@@ -115,88 +167,106 @@ export function ChannelMembersBar({
         try {
           await startHuddle(
             channel.id,
-            [],
+            [...huddleMemberPubkeys],
             buildHuddleChannelName({
               channel,
               currentPubkey,
               members,
             }),
           );
-          // Refetch channels so the new ephemeral channel appears in the sidebar immediately
-          // (default poll interval is 60s — too slow for huddle UX).
+          // Keep the channel cache current so the ephemeral transcript is
+          // available immediately if the huddle returns to the in-app drawer.
           void queryClient.invalidateQueries({ queryKey: ["channels"] });
         } catch (e) {
           console.error("Failed to start huddle:", e);
+          toast.error(formatHuddleActionError(e, "start"));
         }
       }}
       renderMode={variant === "compact" ? "menu-item" : "button"}
-      startDisabled={!canStartHuddle || isStartingHuddle}
+      startDisabled={
+        !canStartHuddle || isStartingHuddle || huddleMemberPubkeysPending
+      }
     />
   );
 
   const controls =
     variant === "compact" ? (
-      <DropdownMenu modal={false}>
-        <DropdownMenuTrigger asChild>
-          <Button
-            aria-label="Channel actions"
-            data-testid="channel-actions-menu-trigger"
-            size="icon"
-            type="button"
-            variant="outline"
-          >
-            <EllipsisVertical />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-48" forceMount>
-          <DropdownMenuItem
-            data-testid="channel-members-trigger"
-            onSelect={onToggleMembers}
-          >
-            <Users />
-            <span>Members</span>
-            <span className="ml-auto text-xs text-muted-foreground">
-              {memberCount}
-            </span>
-          </DropdownMenuItem>
-          {huddleIndicator}
-          <DropdownMenuItem
-            data-testid="channel-management-trigger"
-            onSelect={onManageChannel}
-          >
-            <Settings2 />
-            <span>Manage channel</span>
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <div className="flex items-center gap-[6px]">
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              aria-label="Channel actions"
+              data-testid="channel-actions-menu-trigger"
+              size="icon"
+              type="button"
+              variant="outline"
+            >
+              <EllipsisVertical />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-48" forceMount>
+            <DropdownMenuItem
+              data-testid="channel-members-trigger"
+              onSelect={onToggleMembers}
+            >
+              <Users />
+              <span>Members</span>
+              <span className="ml-auto text-xs text-muted-foreground">
+                {memberCount}
+              </span>
+            </DropdownMenuItem>
+            {huddleIndicator}
+            <DropdownMenuItem
+              data-testid="channel-management-trigger"
+              onSelect={onManageChannel}
+            >
+              <Settings2 />
+              <span>Manage channel</span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {endActions}
+      </div>
     ) : (
       <div className="flex items-center gap-[6px]">
-        <Button
-          aria-label={`View channel members (${memberCount})`}
-          className="h-8 px-2.5"
-          data-testid="channel-members-trigger"
-          onClick={onToggleMembers}
-          type="button"
-          variant="outline"
-        >
-          <Users />
-          <span className="min-w-[1ch] text-sm font-medium tabular-nums">
-            {memberCount}
-          </span>
-        </Button>
+        <Tooltip disableHoverableContent>
+          <TooltipTrigger asChild>
+            <Button
+              aria-label={`View channel members (${memberCount})`}
+              className="h-8 px-2.5"
+              data-testid="channel-members-trigger"
+              onClick={onToggleMembers}
+              type="button"
+              variant="outline"
+            >
+              <Users />
+              <span className="min-w-[1ch] text-sm font-medium tabular-nums">
+                {memberCount}
+              </span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Channel members</TooltipContent>
+        </Tooltip>
 
         {huddleIndicator}
 
-        <Button
-          aria-label="Manage channel"
-          data-testid="channel-management-trigger"
-          onClick={onManageChannel}
-          size="icon"
-          type="button"
-          variant="outline"
-        >
-          <Settings2 />
-        </Button>
+        <Tooltip disableHoverableContent>
+          <TooltipTrigger asChild>
+            <Button
+              aria-label="Manage channel"
+              data-testid="channel-management-trigger"
+              onClick={onManageChannel}
+              size="icon"
+              type="button"
+              variant="outline"
+            >
+              <EllipsisVertical />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Channel settings</TooltipContent>
+        </Tooltip>
+
+        {endActions}
       </div>
     );
 
@@ -205,9 +275,13 @@ export function ChannelMembersBar({
       {controls}
 
       <AddChannelBotDialog
-        backendProviders={backendProvidersQuery.data ?? []}
-        backendProvidersLoading={backendProvidersQuery.isLoading}
         channelId={channel.id}
+        onCreateAgent={() => {
+          requestOpenCreateAgent({
+            channelId: channel.id,
+            channelName: channel.name,
+          });
+        }}
         onOpenChange={setIsAddBotOpen}
         open={isAddBotOpen}
         providers={providers}

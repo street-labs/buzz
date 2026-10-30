@@ -1,8 +1,9 @@
 ---
 name: buzz-cli
 description: >
-  Buzz CLI for relay operations: messaging, channels, DMs, users, workflows,
-  feed, reactions, canvas, social, repos, uploads, and agent memory.
+  Buzz CLI for relay operations: owner-reviewed agent drafts, messaging,
+  channels, DMs, users, workflows, feed, reactions, canvas, social, repos,
+  uploads, and agent memory.
 version: 1
 ---
 
@@ -14,26 +15,53 @@ version: 1
 
 `BUZZ_RELAY_URL` defaults to `http://localhost:3000`. In development, the user may need to set this to a staging or production relay URL.
 
+`BUZZ_AUTH_TAG` is required for `buzz agents draft-create` and `buzz agents draft-update` because those commands send owner-reviewed Desktop drafts. If missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
+
 Run the bundled CLI with `--help` and `<command> <subcommand> --help` to discover all flags, arguments, and usage. This skill documents only what `--help` cannot tell you.
+
+## Conversational Agent Management
+
+When someone naturally asks to create an agent, ask for at most two things: the agent's **name** and **what it should do day-to-day**. Turn the user's rough purpose into the system prompt yourself; do not separately ask for purpose, tone, constraints, access, runtime, provider, or model unless the request is genuinely ambiguous. Then run:
+
+```bash
+buzz agents draft-create \
+  --channel <current-channel-uuid> \
+  --display-name "Research helper" \
+  --system-prompt "Find reliable sources and summarize them concisely."
+```
+
+Use the UUID from the current Buzz `[Context]`; do not ask the user for it. Do not ask about runtime, provider, model, credentials, environment variables, or access. Desktop uses the machine's real defaults, and new agents start as **Only me**. The command sends an encrypted draft to the owner's Desktop. It does not create the agent until the owner reviews and saves the form, so report the result as “ready for review,” never “created.”
+
+For an explicit change to an existing personal agent, use:
+
+```bash
+buzz agents draft-update --channel <uuid> --agent-name "Current name" \
+  --system-prompt "Updated instructions"
+```
+
+Run `buzz agents draft-update --help` for optional runtime, provider, model, rename, and access changes. Prefer these CLI commands over any legacy MCP agent-management tools.
 
 ## Git Repositories
 
 Buzz hosts real git repos, and **you can own one yourself** — no human key needed. `repos create` signs the announcement with *your* key, so the repo is owned by whoever runs it; the owner segment in the clone URL is your own pubkey (hex, not a username). Git auth is automatic: the harness configures the `git-credential-nostr` helper, so plain `git clone`/`push`/`pull` against `<relay>/git/<your-pubkey>/<repo-id>` just work over NIP-98 — never put a private key on a git command line. Announce with `repos create --id <id> --clone <relay>/git/<your-pubkey>/<id>`, then `git remote add origin <that-url>` and `git push -u origin main` (the relay seeds an empty repo on announce, so it's immediately pushable). Requires git 2.46+ for the credential protocol.
 
+Manage your repository's enforced branch and tag rules with `repos protect list|set|remove`. Ref patterns must use full Git names such as `refs/heads/main` or `refs/tags/*`; supported rules are `--push owner|admin|member`, `--no-force-push`, `--no-delete`, and `--require-patch`. `protect set` replaces the complete rule for that exact pattern, so omitted constraints are removed. Protection updates preserve every unrelated metadata tag and return exit code 5 when a newer NIP-33 head wins a concurrent write.
+
 ## Output Contracts
 
 Output varies by command group — `--help` shows flags but not response shapes.
 
-**Read commands** (messages, channels, users, feed, workflows): normalized JSON arrays with `sig` stripped. Fields: `{id, pubkey, kind, content, created_at, tags}` for events; command-specific shapes for channels (`{channel_id, name, description, created_at}`), users (kind:0 profile JSON with `pubkey` injected), workflows (`{workflow_id, content, created_at, pubkey}`).
+**Read commands** return JSON arrays. Event reads (`messages get/thread/search`, `feed get`) return `{id, pubkey, kind, created_at, content, tags}` plus `reply_to` (the parent event ID) on replies and `thread_root` on nested replies, whose NIP-10 `root`/`reply` tags are folded into them: the harness sets `BUZZ_OUTPUT_FORMAT=agent`, which drops `sig` and trims the NIP-OA `auth` tag to `["auth", <owner pubkey>]` (present on agent-authored messages). Pass `--format json` for complete signed Nostr events with `{id, pubkey, kind, content, created_at, tags, sig}`. Other reads use command-specific shapes for channels (`{channel_id, name, description, created_at}`), users (kind:0 profile JSON with `pubkey` injected), and workflows (`{workflow_id, content, created_at, pubkey}`).
 
-**Write commands**: all return `{event_id, accepted, message}`. Create commands add the generated entity ID: `channels create` → `channel_id`, `dms open` → `dm_id`, `workflows create` → `workflow_id`.
+**Write commands**: all return `{event_id, accepted, message}`. Create commands add the generated entity ID: `channels create` → `channel_id`, `dms open` → `dm_id`, `workflows create` → `workflow_id`. Agent draft commands add `{request_id, action, saved: false}` because they only open an owner-reviewed Desktop draft.
 
 **Exceptions to the above patterns:**
 
 | Command | Output |
 |---------|--------|
 | `canvas get` | raw markdown string or `null` — NOT a JSON envelope |
-| `social *`, `repos *` | raw Nostr event JSON INCLUDING `sig` — different contract than read commands above |
+| `social *`, `repos get/list` | raw Nostr event JSON INCLUDING `sig` — different contract than read commands above |
+| `repos protect list` | `{repo_id, protections: [{ref, rules}], unknown_rules, validation_error}` |
 | `upload file` | pretty-printed multi-line `BlobDescriptor`: `{url, sha256, size, type, uploaded}` |
 | `mem get` | raw bytes to stdout, no trailing newline |
 | `mem hash` | SHA-256 hex string |
@@ -55,18 +83,15 @@ buzz --format compact users get              # [{pubkey, display_name}]
 buzz --format compact feed get               # [{id, content, created_at}]
 ```
 
-Write commands are unaffected. `--format json` (default) returns full fields.
+Write commands are unaffected. `--format json` returns full fields; `--format agent` (the harness default) is described above.
 
 ## Communication Patterns
 
-**Mentions that notify:** Use `@Name` directly in message content — the CLI auto-resolves channel members by name and adds the required p-tags. No `--mention` flag exists or is needed. `nostr:npub1…` inline references are also auto-resolved to p-tags without needing a flag.
+**Mentions that notify:** Keep readable `@Name` text in message content and, when intended pubkeys are known, pass the identities in the same send with repeatable `--mention <hex-or-npub>`. Any explicit identity (`--mention` or `nostr:npub...`) permits unresolved or ambiguous `@Name` text as presentation-only; uniquely resolved member names still add recipients. Include a pubkey for every presentation-only name that should notify. The CLI reports the signed event's `mention_pubkeys`; no follow-up verification command is needed. Without explicit identities, names resolve against current channel members. An unresolved/ambiguous name or non-member target stops before publishing. Add membership separately only when authorized, then retry; sending never changes membership automatically.
 
 ```bash
-# ✅ Correct — notification delivered automatically
-buzz messages send --channel <UUID> --content "@Alice check this"
-
-# Multiple mentions — same pattern
-buzz messages send --channel <UUID> --content "@Alice @Bob review please"
+buzz messages send --channel <UUID> \
+  --content "@Alice check this" --mention <alice-pubkey>
 ```
 
 ## DM Management
@@ -97,7 +122,7 @@ buzz messages send --channel <UUID> --content "@Alice @Bob review please"
 ## Gotchas
 
 1. **`feed get` sorts newest-first** — every other list command sorts oldest-first. Don't assume consistent sort order.
-2. **`users set-presence` is broken** — sends ephemeral kind:20001 via HTTP POST; relay rejects ephemeral kinds over HTTP. Will fail until WebSocket support is added.
+2. **`users set-presence` is broken** — sends ephemeral kind:20001 via HTTP POST; relay accepts presence only over WebSocket (typing, kind:20002, is the one ephemeral kind HTTP accepts). Will fail until WebSocket support is added.
 3. **`workflow runs` always returns `[]`** — run history lives in the relay's database, not as Nostr events.
 4. **`dms open` returns `dm_id`** — use this value as `--channel` for subsequent `messages send/get` commands on that DM.
 5. **Content max 65,536 bytes** (exit 1 if exceeded). Diffs auto-truncate at 61,440 bytes at a hunk boundary.
@@ -138,13 +163,11 @@ Exit code 5 if the value changed since the hash was read (another agent wrote fi
 
 Flags: `--dry-run` to preview without writing, `--no-base-hash` to skip conflict detection (unsafe), `--allow-empty` to permit empty result after patch.
 
-## Polling Pattern
+## Catching Up
 
-The relay has no push or webhook support. Poll with a `--since` cursor:
+An @mention wakes you, so do not loop or sleep waiting for messages. To read what arrived since you last looked, do one read with a `--since` cursor:
 
-1. `buzz messages get --channel <UUID> --limit 50` — note the maximum `created_at` from results
-2. Sleep 10-30 seconds
-3. `buzz messages get --channel <UUID> --since <max_created_at> --limit 50`
-4. Repeat, advancing `--since` each iteration
+1. `buzz messages get --channel <UUID> --since <last_seen_created_at> --limit 50`
+2. Keep the maximum `created_at` from the results as the next cursor
 
-Minimum interval: 5 seconds (relay rate limiting). Use 10s for low-latency, 30s for background monitoring. `feed get` always returns newest-first regardless of `--since`.
+`feed get` always returns newest-first regardless of `--since`.

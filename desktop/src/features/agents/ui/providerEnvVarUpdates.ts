@@ -1,5 +1,5 @@
 import type { EnvVarsValue } from "./EnvVarsEditor";
-import { getProviderApiKeyEnvVar } from "./personaDialogPickers";
+import { getProviderApiKeyEnvVar } from "./agentConfigOptions";
 
 /**
  * Pure env-var update helpers shared by the persona / create-agent /
@@ -18,6 +18,23 @@ export function envVarsWithoutKey(
 
   const next = { ...current };
   delete next[envKey];
+  return next;
+}
+
+/** Remove every case-insensitive (ASCII) match of `envKey` when present. */
+export function envVarsWithoutKeyCaseInsensitive(
+  current: EnvVarsValue,
+  envKey: string,
+): EnvVarsValue {
+  const lower = envKey.toLowerCase();
+  const matches = Object.keys(current).filter((k) => k.toLowerCase() === lower);
+  if (matches.length === 0) {
+    return current;
+  }
+  const next = { ...current };
+  for (const match of matches) {
+    delete next[match];
+  }
   return next;
 }
 

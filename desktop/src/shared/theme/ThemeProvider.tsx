@@ -8,12 +8,15 @@ import {
   useState,
 } from "react";
 import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invokeTauri } from "@/shared/api/tauri";
 import { isMacPlatform } from "@/shared/lib/platform";
+import { getStorageItem } from "@/shared/lib/safeStorage";
 import { createThemeVars, hexToHsl } from "./adaptive-theme";
 import {
   SYNTAX_THEMES,
   type SyntaxThemeName,
+  type ThemeInfo,
   extractThemeInfo,
   getThemePair,
   loadThemeData,
@@ -23,13 +26,20 @@ import {
 export const THEME_STORAGE_KEY = "buzz-theme";
 const CACHE_KEY = "buzz-theme-cache";
 export const ACCENT_STORAGE_KEY = "buzz-accent-color";
+export const GLASS_BACKGROUND_STORAGE_KEY = "buzz-glass-background";
+export const GLASS_OPACITY_STORAGE_KEY = "buzz-glass-opacity";
+export const PROMINENT_ACTIVE_TAB_STORAGE_KEY = "buzz-prominent-active-tab";
+export const GLASS_OPACITY_MIN = 30;
+export const GLASS_OPACITY_MAX = 90;
+export const DEFAULT_GLASS_OPACITY = 65;
+export const DEFAULT_PROMINENT_ACTIVE_TAB = false;
 export const NEUTRAL_ACCENT = "neutral";
 const FOLLOW_SYSTEM_KEY = "buzz-follow-system";
 const VIDEO_REVIEW_NEUTRAL_ACCENT = "0 0% 98%";
 const VIDEO_REVIEW_CHIP_SURFACE = "#161616";
 const VIDEO_REVIEW_TEXT_CONTRAST = 4.5;
 const VIDEO_REVIEW_CHIP_BACKGROUND_ALPHAS = [0.15, 0.3] as const;
-const BUZZ_VIBRANCY_MATERIAL = "sidebar";
+const GLASS_VIBRANCY_MATERIAL = "sidebar";
 
 export const ACCENT_COLORS = [
   { name: "Neutral", value: NEUTRAL_ACCENT },
@@ -42,7 +52,15 @@ export const ACCENT_COLORS = [
   { name: "Lilac", value: "#c0a2f1" },
   { name: "Purple", value: "#a855f7" },
   { name: "Indigo", value: "#6366f1" },
+  { name: "Chartreuse", value: "#d7d72e" },
 ] as const;
+
+/**
+ * Accents too light to read as `text-primary` on light themes. They darken
+ * there; the legacy accents keep their established rendering.
+ */
+const LIGHT_ONLY_ACCENTS = new Set<string>(["#d7d72e"]);
+const ACCENT_TEXT_CONTRAST = 4.5;
 
 const DEFAULT_ACCENT = "#3b82f6";
 
@@ -53,10 +71,23 @@ type ThemeContextValue = {
   isLoading: boolean;
   accentColor: string;
   followSystem: boolean;
+  glassBackground: boolean;
+  glassOpacity: number;
+  glassBackgroundSupported: boolean;
+  prominentActiveTab: boolean;
   hasPair: boolean;
+  terminalPalette: ThemeInfo["terminalPalette"] | null;
   setTheme: (name: string) => void;
   setAccentColor: (color: string) => void;
   setFollowSystem: (enabled: boolean) => void;
+  applyAppearance: (appearance: {
+    theme: SyntaxThemeName;
+    accent: string;
+    followSystem: boolean;
+  }) => void;
+  setGlassBackground: (enabled: boolean) => void;
+  setGlassOpacity: (opacity: number) => void;
+  setProminentActiveTab: (enabled: boolean) => void;
 };
 
 type ThemeProviderProps = {
@@ -72,7 +103,10 @@ function isValidThemeName(name: string): name is SyntaxThemeName {
 
 /** Read stored theme, migrating legacy "light"/"dark"/"system" values. */
 function readStoredTheme(fallback: SyntaxThemeName): SyntaxThemeName {
-  const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+  // block/buzz#5078 — WebKit throws SecurityError from getItem under a
+  // denied-storage origin; the throw-safe helper lets the provider degrade to
+  // the fallback instead of unmounting the root during first render.
+  const stored = getStorageItem(THEME_STORAGE_KEY);
   if (!stored) return fallback;
 
   // Migrate legacy values
@@ -169,6 +203,62 @@ function rgbToHex({ r, g, b }: Rgb): string {
     .join("")}`;
 }
 
+/** Parses a `--background`-style `H S% L%` triplet. */
+function hslTripletToRgb(value: string): Rgb | null {
+  const m = /^(-?[\d.]+)\s+([\d.]+)%\s+([\d.]+)%$/.exec(value.trim());
+  if (!m) return null;
+  const h = Number(m[1]) / 360;
+  const s = Number(m[2]) / 100;
+  const l = Number(m[3]) / 100;
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const channel = (offset: number) => {
+    const t = (((h + offset) % 1) + 1) % 1;
+    if (t < 1 / 6) return (p + (q - p) * 6 * t) * 255;
+    if (t < 1 / 2) return q * 255;
+    if (t < 2 / 3) return (p + (q - p) * (2 / 3 - t) * 6) * 255;
+    return p * 255;
+  };
+  return { r: channel(1 / 3), g: channel(0), b: channel(-1 / 3) };
+}
+
+/**
+ * The `--primary` fill and its ink for an accent on the theme `background`.
+ * `--primary` is also drawn directly as text, so a light-only accent darkens
+ * until it reads on that background.
+ */
+export function accentPrimary(
+  value: string,
+  background: string,
+): { fill: string; ink: string } {
+  const accent = hexToRgb(value);
+  const surface = hslTripletToRgb(background);
+  let fill = value;
+  if (
+    LIGHT_ONLY_ACCENTS.has(value) &&
+    surface &&
+    contrastRatio(accent, surface) < ACCENT_TEXT_CONTRAST
+  ) {
+    const black = { r: 0, g: 0, b: 0 };
+    // Search over rounded hex so the published fill itself meets the ratio.
+    const darken = (amount: number) => rgbToHex(mixRgb(accent, black, amount));
+    let low = 0;
+    let high = 1;
+    for (let i = 0; i < 20; i++) {
+      const mid = (low + high) / 2;
+      if (
+        contrastRatio(hexToRgb(darken(mid)), surface) >= ACCENT_TEXT_CONTRAST
+      ) {
+        high = mid;
+      } else {
+        low = mid;
+      }
+    }
+    fill = darken(high);
+  }
+  return { fill, ink: getContrastColor(fill) };
+}
+
 function applyAccentColor(value: string) {
   const root = document.documentElement;
   if (value === NEUTRAL_ACCENT) {
@@ -193,14 +283,18 @@ function applyAccentColor(value: string) {
     return;
   }
 
-  const hex = value;
-  const accentHsl = hexToHsl(hex);
-  const fgHsl = hexToHsl(getContrastColor(hex));
+  const { fill, ink } = accentPrimary(
+    value,
+    window.getComputedStyle(root).getPropertyValue("--background"),
+  );
+  const accentHsl = hexToHsl(fill);
+  const fgHsl = hexToHsl(ink);
   root.style.setProperty("--buzz-selected-accent", accentHsl);
-  root.style.setProperty("--buzz-video-review-accent", accentHsl);
+  // The review chip sits on its own dark surface, so it keeps the raw accent.
+  root.style.setProperty("--buzz-video-review-accent", hexToHsl(value));
   root.style.setProperty(
     "--buzz-video-review-accent-foreground",
-    getReviewAccentForeground(hex),
+    getReviewAccentForeground(value),
   );
   root.style.setProperty("--primary", accentHsl);
   root.style.setProperty("--primary-foreground", fgHsl);
@@ -210,51 +304,162 @@ function applyAccentColor(value: string) {
   root.style.setProperty("--sidebar-active-foreground", fgHsl);
 }
 
-function isBuzzTheme(themeName: string): boolean {
+/**
+ * The Buzz themes ship with a fixed neutral accent (the GitHub black/white
+ * foreground) rather than a user-selectable accent color. When a Buzz theme is
+ * active we force `NEUTRAL_ACCENT` regardless of the stored preference, and the
+ * appearance panel hides the accent picker. The user's chosen accent is left
+ * untouched in storage so it returns when they switch back to another theme.
+ */
+export function isBuzzTheme(themeName: string): boolean {
   return themeName === "buzz" || themeName === "buzz-dark";
 }
 
-/** Toggle the Buzz sidebar-gradient and translucency markers on the root. */
+/**
+ * Resolve the accent to actually apply for a theme: Buzz themes are pinned to
+ * the neutral accent; every other theme uses the stored/selected accent.
+ */
+function resolveEffectiveAccent(
+  themeName: string,
+  accentColor: string,
+): string {
+  return isBuzzTheme(themeName) ? NEUTRAL_ACCENT : accentColor;
+}
+
+/** Toggle the Buzz-specific gradient marker independently from glass. */
 function applyBuzzSidebar(themeName: string) {
   const root = document.documentElement;
   if (isBuzzTheme(themeName)) {
     root.setAttribute("data-buzz-sidebar", "");
-    // The translucent treatment (transparent root/body + semi-transparent
-    // sidebar gradient) relies on the native macOS `NSVisualEffectView`
-    // vibrancy layer painting behind the webview. On Windows/Linux
-    // `set_window_vibrancy` is a no-op, but the window is transparent
-    // globally (tauri.conf.json), so a transparent root would show raw
-    // desktop content through the UI. Gate the translucent marker and
-    // transparent root background to macOS; other platforms fall back to the
-    // opaque Buzz gradient (`data-buzz-sidebar` paints solid colors) with the
-    // normal `bg-background` body fill.
-    if (isMacPlatform()) {
-      root.setAttribute("data-buzz-translucent", "");
-      root.style.setProperty("background-color", "transparent");
-      root.style.setProperty("background-image", "none");
-    } else {
-      root.removeAttribute("data-buzz-translucent");
-      root.style.removeProperty("background-color");
-      root.style.removeProperty("background-image");
-    }
+    // Keep the concrete Buzz variant on the root as well as the generic
+    // marker. The gradient stylesheet matches this attribute directly, which
+    // makes WKWebView invalidate the painted background when light/dark mode
+    // changes instead of relying only on a custom-property dependency update.
+    root.setAttribute("data-buzz-theme", themeName);
   } else {
     root.removeAttribute("data-buzz-sidebar");
-    root.removeAttribute("data-buzz-translucent");
-    root.style.removeProperty("background-color");
-    root.style.removeProperty("background-image");
+    root.removeAttribute("data-buzz-theme");
   }
 }
 
-async function applyBuzzVibrancy(themeName: string) {
-  if (!isTauri()) return;
+/**
+ * Toggle the transparent CSS surfaces that reveal native macOS vibrancy behind
+ * the navigation and outer chrome. The center content panel remains opaque.
+ *
+ * IMPORTANT: enabling glass exposes whatever the compositor paints
+ * behind the webview. Only enable it once the native `NSVisualEffectView`
+ * vibrancy layer and the active theme colors are both ready.
+ */
+function setGlassBackgroundActive(enabled: boolean) {
+  const root = document.documentElement;
+  if (enabled) {
+    // WKWebView keeps its page canvas opaque unless the root background is an
+    // inline transparent value, even when the equivalent author rule wins in
+    // the stylesheet. Clear it before exposing the native vibrancy layer.
+    root.style.setProperty("background", "transparent");
+    root.setAttribute("data-glass-background", "");
+  } else {
+    root.removeAttribute("data-glass-background");
+    root.style.removeProperty("background");
+  }
+}
+
+/** Apply the optional higher-contrast selected navigation surface. */
+function setProminentActiveTabActive(enabled: boolean) {
+  document.documentElement.toggleAttribute(
+    "data-prominent-active-tab",
+    enabled,
+  );
+}
+
+function clampGlassOpacity(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_GLASS_OPACITY;
+  return Math.min(
+    GLASS_OPACITY_MAX,
+    Math.max(GLASS_OPACITY_MIN, Math.round(value)),
+  );
+}
+
+function readStoredGlassOpacity(): number {
+  const stored = getStorageItem(GLASS_OPACITY_STORAGE_KEY);
+  return stored === null
+    ? DEFAULT_GLASS_OPACITY
+    : clampGlassOpacity(Number(stored));
+}
+
+/** Set the tint opacity layered above native blur; lower values reveal more. */
+function applyGlassOpacity(value: number) {
+  document.documentElement.style.setProperty(
+    "--glass-background-opacity",
+    `${clampGlassOpacity(value)}%`,
+  );
+}
+
+/** Only the newest overlapping native glass request may update CSS state. */
+let glassVibrancyRequest = 0;
+
+/** Whether the native vibrancy layer is confirmed installed. */
+let glassVibrancyReady = false;
+
+/** The native layer does not need rebuilding when only the theme changes. */
+let glassVibrancyEnabled = false;
+
+/** Mirrors the current preference for the async theme/native handshake. */
+let glassBackgroundPreferenceEnabled = false;
+
+/** Theme colors must be installed before the transparent surface is exposed. */
+let glassThemeReady = false;
+
+/**
+ * Theme loading and native vibrancy can finish in either order. Whichever lands
+ * last reveals the glass once both prerequisites are ready.
+ */
+function maybeEnableGlassBackground(requestToken: number) {
+  if (requestToken !== glassVibrancyRequest) return;
+  if (!glassBackgroundPreferenceEnabled || !isMacPlatform()) return;
+  if (!glassVibrancyReady || !glassThemeReady) return;
+  setGlassBackgroundActive(true);
+}
+
+/**
+ * Install native vibrancy before making the webview transparent. Non-macOS and
+ * web builds retain the normal opaque theme surface.
+ */
+async function applyWindowGlass(enabled: boolean) {
+  glassBackgroundPreferenceEnabled = enabled;
+  const requestToken = ++glassVibrancyRequest;
+
+  if (!isTauri() || !isMacPlatform()) {
+    glassBackgroundPreferenceEnabled = false;
+    glassVibrancyEnabled = false;
+    glassVibrancyReady = false;
+    setGlassBackgroundActive(false);
+    return;
+  }
+
+  if (enabled && glassVibrancyEnabled && glassVibrancyReady) {
+    maybeEnableGlassBackground(requestToken);
+    return;
+  }
+
+  glassVibrancyReady = false;
 
   try {
     await invokeTauri<void>("set_window_vibrancy", {
-      enabled: isBuzzTheme(themeName),
-      material: BUZZ_VIBRANCY_MATERIAL,
+      enabled,
+      material: GLASS_VIBRANCY_MATERIAL,
     });
+    if (requestToken !== glassVibrancyRequest) return;
+    glassVibrancyEnabled = enabled;
+    if (enabled && isMacPlatform()) {
+      glassVibrancyReady = true;
+      maybeEnableGlassBackground(requestToken);
+    }
   } catch (error) {
     console.warn("set_window_vibrancy failed", error);
+    if (requestToken !== glassVibrancyRequest) return;
+    glassVibrancyEnabled = false;
+    setGlassBackgroundActive(false);
   }
 }
 
@@ -271,10 +476,13 @@ function applyCachedVars(): string | null {
     root.classList.remove("light", "dark");
     root.classList.add(isDark ? "dark" : "light");
     applyBuzzSidebar(themeName);
+    glassThemeReady = true;
 
-    const accent =
-      window.localStorage.getItem(ACCENT_STORAGE_KEY) ?? DEFAULT_ACCENT;
-    applyAccentColor(accent);
+    const accent = getStorageItem(ACCENT_STORAGE_KEY) ?? DEFAULT_ACCENT;
+    // Pin Buzz themes to the neutral accent here too, matching applyTheme.
+    // Otherwise a cached Buzz theme + non-neutral stored accent flashes the
+    // old accent on reload until the async applyTheme effect runs.
+    applyAccentColor(resolveEffectiveAccent(themeName, accent));
 
     return themeName;
   } catch {
@@ -282,9 +490,18 @@ function applyCachedVars(): string | null {
   }
 }
 
+/** The latest theme load is the only one allowed to write document styles. */
+let themeApplyRequest = 0;
+
 /** Apply a theme: load data, derive CSS vars, set them on :root. */
-async function applyTheme(name: SyntaxThemeName): Promise<{ isDark: boolean }> {
+async function applyTheme(name: SyntaxThemeName): Promise<{
+  isDark: boolean;
+  terminalPalette: ThemeInfo["terminalPalette"];
+} | null> {
+  const requestToken = ++themeApplyRequest;
   const themeData = await loadThemeData(name);
+  if (requestToken !== themeApplyRequest) return null;
+
   const info = extractThemeInfo(name, themeData);
   const { isDark, vars } = createThemeVars(info.bg, info.fg, info.comment, {
     added: info.added,
@@ -300,6 +517,20 @@ async function applyTheme(name: SyntaxThemeName): Promise<{ isDark: boolean }> {
   root.classList.remove("light", "dark");
   root.classList.add(isDark ? "dark" : "light");
   applyBuzzSidebar(name);
+  glassThemeReady = true;
+  maybeEnableGlassBackground(glassVibrancyRequest);
+
+  // Apply the accent synchronously in the same batch as the theme vars so the
+  // browser paints the new theme + accent together. Doing this in a later
+  // microtask (e.g. the caller's `.then`) let the previous accent flash on the
+  // new theme for a frame — the flicker seen when switching to Buzz. Buzz
+  // themes resolve to the neutral accent regardless of the stored value.
+  applyAccentColor(
+    resolveEffectiveAccent(
+      name,
+      getStorageItem(ACCENT_STORAGE_KEY) ?? DEFAULT_ACCENT,
+    ),
+  );
 
   // Cache for FOUC prevention
   try {
@@ -311,13 +542,15 @@ async function applyTheme(name: SyntaxThemeName): Promise<{ isDark: boolean }> {
     // Storage full — non-critical
   }
 
-  return { isDark };
+  return { isDark, terminalPalette: info.terminalPalette };
 }
 
 export function ThemeProvider({
   children,
-  defaultTheme = "houston",
+  defaultTheme = "buzz",
 }: ThemeProviderProps) {
+  const glassBackgroundSupported = isTauri() && isMacPlatform();
+
   // Apply cached vars synchronously before first render
   const [selectedTheme, setSelectedTheme] = useState<string>(() => {
     applyCachedVars();
@@ -327,12 +560,42 @@ export function ThemeProvider({
     return document.documentElement.classList.contains("dark");
   });
   const [isLoading, setIsLoading] = useState(true);
+  const [terminalPalette, setTerminalPalette] = useState<
+    ThemeInfo["terminalPalette"] | null
+  >(null);
   const loadingRef = useRef<string | null>(null);
   const [accentColor, setAccentColorState] = useState<string>(() => {
-    return window.localStorage.getItem(ACCENT_STORAGE_KEY) ?? DEFAULT_ACCENT;
+    // block/buzz#5078 — use the throw-safe accessor for init-time reads; a
+    // denied-storage origin would otherwise kill the root on first mount.
+    return getStorageItem(ACCENT_STORAGE_KEY) ?? DEFAULT_ACCENT;
   });
+  const [glassBackground, setGlassBackgroundState] = useState<boolean>(() => {
+    const stored = getStorageItem(GLASS_BACKGROUND_STORAGE_KEY);
+    // Glass is opt-in. Explicitly saved preferences remain intact, while a
+    // fresh profile starts with the normal opaque window treatment. Keep an
+    // unsupported platform opaque without erasing a preference saved on Mac.
+    const enabled = glassBackgroundSupported && stored === "true";
+    glassBackgroundPreferenceEnabled = enabled;
+    return enabled;
+  });
+  const [glassOpacity, setGlassOpacityState] = useState<number>(() => {
+    const opacity = readStoredGlassOpacity();
+    applyGlassOpacity(opacity);
+    return opacity;
+  });
+  const [prominentActiveTab, setProminentActiveTabState] = useState<boolean>(
+    () => {
+      const stored = getStorageItem(PROMINENT_ACTIVE_TAB_STORAGE_KEY);
+      return stored === null ? DEFAULT_PROMINENT_ACTIVE_TAB : stored === "true";
+    },
+  );
   const [followSystem, setFollowSystemState] = useState<boolean>(() => {
-    return window.localStorage.getItem(FOLLOW_SYSTEM_KEY) === "true";
+    const stored = getStorageItem(FOLLOW_SYSTEM_KEY);
+    if (stored !== null) return stored === "true";
+    // Fresh profiles (no saved theme) default to System mode so the Buzz
+    // default tracks the OS light/dark scheme. Profiles that picked a theme
+    // before this toggle existed keep their fixed theme until they opt in.
+    return getStorageItem(THEME_STORAGE_KEY) === null;
   });
   const [systemIsDark, setSystemIsDark] = useState<boolean>(() => {
     return window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -357,41 +620,86 @@ export function ThemeProvider({
     loadingRef.current = thisTheme;
     setIsLoading(true);
 
-    applyTheme(effectiveTheme as SyntaxThemeName).then(({ isDark: dark }) => {
-      // Only update if this is still the theme we want
+    applyTheme(effectiveTheme as SyntaxThemeName).then((result) => {
+      if (!result) return;
+      // Only update if this is still the theme we want. The accent is applied
+      // inside applyTheme (synchronously with the theme vars), so there's no
+      // separate re-application here — that avoided the switch-time flicker.
       if (loadingRef.current === thisTheme) {
-        setIsDark(dark);
+        setIsDark(result.isDark);
+        setTerminalPalette(result.terminalPalette);
         setIsLoading(false);
-        // Re-apply accent after theme load (theme vars don't include primary)
-        applyAccentColor(
-          window.localStorage.getItem(ACCENT_STORAGE_KEY) ?? DEFAULT_ACCENT,
-        );
       }
     });
   }, [effectiveTheme]);
 
   useEffect(() => {
-    if (!isValidThemeName(effectiveTheme)) return;
-    void applyBuzzVibrancy(effectiveTheme);
-  }, [effectiveTheme]);
+    // `initial-render-ready` fires from a layout effect, so it is already
+    // enqueued before this passive effect's IPC call is dispatched. The native
+    // reveal can in theory precede the transparency call; the Rust-side
+    // stable-geometry wait provides the gap in practice, and a brief opaque
+    // first frame is the accepted worst case for glass users.
+    void applyWindowGlass(glassBackground);
+  }, [glassBackground]);
+
+  // The stronger selected-row treatment belongs exclusively to Buzz. Keep
+  // the saved preference so it is restored when the user returns to Buzz,
+  // but remove the live marker for every other theme.
+  useEffect(() => {
+    setProminentActiveTabActive(
+      prominentActiveTab && isBuzzTheme(effectiveTheme),
+    );
+  }, [effectiveTheme, prominentActiveTab]);
 
   // Listen for system color scheme changes when followSystem is enabled
   useEffect(() => {
     if (!followSystem) return;
 
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (event: MediaQueryListEvent) => {
+    const handleMediaChange = (event: MediaQueryListEvent) => {
       setSystemIsDark(event.matches);
     };
+    let disposed = false;
+    let unlistenNativeTheme: (() => void) | undefined;
 
     setSystemIsDark(mq.matches);
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
+    mq.addEventListener("change", handleMediaChange);
+
+    // WKWebView can update the media query value without dispatching its
+    // change event until the page reloads. Tauri's native window event arrives
+    // immediately when macOS appearance changes, so use it as the reliable app
+    // signal while retaining matchMedia for the browser build.
+    if (isTauri()) {
+      void getCurrentWindow()
+        .onThemeChanged(({ payload }) => {
+          if (!disposed) setSystemIsDark(payload === "dark");
+        })
+        .then((unlisten) => {
+          if (disposed) {
+            unlisten();
+          } else {
+            unlistenNativeTheme = unlisten;
+          }
+        })
+        .catch((error) => {
+          console.warn("system theme listener unavailable", error);
+        });
+    }
+
+    return () => {
+      disposed = true;
+      mq.removeEventListener("change", handleMediaChange);
+      unlistenNativeTheme?.();
+    };
   }, [followSystem]);
 
+  // Re-apply the accent when the user picks a new swatch or the effective theme
+  // changes. applyTheme already applies the (Buzz-neutral-aware) accent in the
+  // same synchronous batch as the theme vars — the flicker fix — so this effect
+  // is idempotent on theme changes and simply covers accent-only changes.
   useEffect(() => {
-    applyAccentColor(accentColor);
-  }, [accentColor]);
+    applyAccentColor(resolveEffectiveAccent(effectiveTheme, accentColor));
+  }, [accentColor, effectiveTheme]);
 
   const setTheme = useCallback((name: string) => {
     if (!isValidThemeName(name)) return;
@@ -409,6 +717,68 @@ export function ThemeProvider({
     setFollowSystemState(enabled);
   }, []);
 
+  const applyAppearance = useCallback(
+    (appearance: {
+      theme: SyntaxThemeName;
+      accent: string;
+      followSystem: boolean;
+    }) => {
+      // Write the complete preference before updating state so applyTheme reads
+      // the target community's accent in the same batch, never the previous one.
+      try {
+        window.localStorage.setItem(THEME_STORAGE_KEY, appearance.theme);
+        window.localStorage.setItem(ACCENT_STORAGE_KEY, appearance.accent);
+        window.localStorage.setItem(
+          FOLLOW_SYSTEM_KEY,
+          appearance.followSystem ? "true" : "false",
+        );
+      } catch {
+        // Keep the active appearance responsive even if the local cache is full.
+      }
+      setSelectedTheme(appearance.theme);
+      setAccentColorState(appearance.accent);
+      setFollowSystemState(appearance.followSystem);
+    },
+    [],
+  );
+
+  const setGlassBackground = useCallback(
+    (enabled: boolean) => {
+      if (!glassBackgroundSupported) {
+        glassBackgroundPreferenceEnabled = false;
+        setGlassBackgroundActive(false);
+        setGlassBackgroundState(false);
+        return;
+      }
+
+      window.localStorage.setItem(
+        GLASS_BACKGROUND_STORAGE_KEY,
+        enabled ? "true" : "false",
+      );
+      glassBackgroundPreferenceEnabled = enabled;
+      if (!enabled) {
+        setGlassBackgroundActive(false);
+      }
+      setGlassBackgroundState(enabled);
+    },
+    [glassBackgroundSupported],
+  );
+
+  const setGlassOpacity = useCallback((opacity: number) => {
+    const nextOpacity = clampGlassOpacity(opacity);
+    window.localStorage.setItem(GLASS_OPACITY_STORAGE_KEY, String(nextOpacity));
+    applyGlassOpacity(nextOpacity);
+    setGlassOpacityState(nextOpacity);
+  }, []);
+
+  const setProminentActiveTab = useCallback((enabled: boolean) => {
+    window.localStorage.setItem(
+      PROMINENT_ACTIVE_TAB_STORAGE_KEY,
+      enabled ? "true" : "false",
+    );
+    setProminentActiveTabState(enabled);
+  }, []);
+
   const value: ThemeContextValue = {
     themeName: effectiveTheme,
     selectedThemeName: selectedTheme,
@@ -416,10 +786,19 @@ export function ThemeProvider({
     isLoading,
     accentColor,
     followSystem,
+    glassBackground,
+    glassOpacity,
+    glassBackgroundSupported,
+    prominentActiveTab,
     hasPair,
+    terminalPalette,
     setTheme,
     setAccentColor,
     setFollowSystem,
+    applyAppearance,
+    setGlassBackground,
+    setGlassOpacity,
+    setProminentActiveTab,
   };
 
   return (

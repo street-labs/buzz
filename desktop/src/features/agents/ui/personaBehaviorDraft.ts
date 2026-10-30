@@ -1,28 +1,32 @@
-import type { PersonaBehaviorInput, RespondToMode } from "@/shared/api/types";
+import type {
+  AcpSessionPolicy,
+  PersonaBehaviorInput,
+  RespondToMode,
+} from "@/shared/api/types";
 
 /**
- * Dialog-side draft of a definition's NIP-AP behavioral quad.
+ * Dialog-side draft of a definition's NIP-AP behavioral group.
  *
  * `respondTo: null` means "unset" — the definition carries no mode and the
  * harness default (owner-only) applies at mint. The distinction matters for
- * wire bytes, not semantics: a quad-less definition must stay quad-less
+ * wire bytes, not semantics: a definition without behavioral fields must
+ * stay without behavioral fields
  * through unrelated edits so its published content (and content hash) does
  * not move.
  */
 export type PersonaBehaviorDraft = {
   respondTo: RespondToMode | null;
   respondToAllowlist: string[];
-  /** Raw text; trimmed-empty means unset. */
-  mcpToolsets: string;
   /** Raw text; only `parseInt > 0` submits (legacy dialog parity). */
   parallelism: string;
+  sessionPolicy: AcpSessionPolicy;
 };
 
 export const emptyPersonaBehaviorDraft: PersonaBehaviorDraft = {
   respondTo: null,
   respondToAllowlist: [],
-  mcpToolsets: "",
   parallelism: "",
+  sessionPolicy: "channel",
 };
 
 /** Seed the draft from a dialog-state behavior group (edit/duplicate). */
@@ -32,9 +36,9 @@ export function draftFromBehavior(
   return {
     respondTo: behavior?.respondTo ?? null,
     respondToAllowlist: [...(behavior?.respondToAllowlist ?? [])],
-    mcpToolsets: behavior?.mcpToolsets ?? "",
     parallelism:
       behavior?.parallelism != null ? String(behavior.parallelism) : "",
+    sessionPolicy: behavior?.sessionPolicy ?? "channel",
   };
 }
 
@@ -48,9 +52,7 @@ export function personaBehaviorDraftValid(draft: PersonaBehaviorDraft) {
   return draft.respondTo !== "allowlist" || draft.respondToAllowlist.length > 0;
 }
 
-function behaviorFromDraft(
-  draft: PersonaBehaviorDraft,
-): PersonaBehaviorInput | undefined {
+function behaviorFromDraft(draft: PersonaBehaviorDraft): PersonaBehaviorInput {
   const parallelism = Number.parseInt(draft.parallelism, 10);
   const group: PersonaBehaviorInput = {
     respondTo: draft.respondTo ?? undefined,
@@ -58,31 +60,29 @@ function behaviorFromDraft(
     // stale data the author didn't choose (legacy dialog parity).
     respondToAllowlist:
       draft.respondTo === "allowlist" ? draft.respondToAllowlist : undefined,
-    mcpToolsets: draft.mcpToolsets.trim() || undefined,
     parallelism: parallelism > 0 ? parallelism : undefined,
+    sessionPolicy: draft.sessionPolicy,
   };
-  const isEmpty =
-    group.respondTo === undefined &&
-    group.mcpToolsets === undefined &&
-    group.parallelism === undefined;
-  return isEmpty ? undefined : group;
+  return group;
 }
 
 /**
  * Resolve the behavior group a persona submit should carry.
  *
- * Absent (`undefined`) means "don't touch the stored quad" server-side, so:
- * - a quad that is untouched relative to its seed submits nothing — an
+ * Absent (`undefined`) means "don't touch the stored behavior group"
+ * server-side, so:
+ * - a behavior group that is untouched relative to its seed submits nothing — an
  *   unrelated edit (rename, prompt tweak) must not rewrite the published
- *   definition's quad bytes or flip its content hash;
- * - an empty quad submits nothing — plain creates stay quad-less;
- * - any real change submits the full group (replace-all-four semantics);
- * - EXCEPT a full clear on edit: draft empty but seed non-empty submits an
- *   explicit empty group, because "submit nothing" would silently no-op the
- *   clear and the stored quad would resurrect on reopen.
+ *   definition's behavior bytes or flip its content hash;
+ * - creates always submit the selected session policy; the channel default is
+ *   omitted from durable/public JSON by the backend for wire compatibility;
+ * - any real change submits the full group (replace-as-a-unit semantics);
+ * - clearing the optional fields on edit still submits the channel default,
+ *   because "submit nothing" would silently no-op the clear.
  *
- * Duplicate flows pass the source persona's quad as `seed` but with
- * `isEdit: false`: a duplicate is a CREATE, so a non-empty inherited quad
+ * Duplicate flows pass the source persona's behavior group as `seed` but with
+ * `isEdit: false`: a duplicate is a CREATE, so a non-empty inherited
+ * behavior group
  * must be submitted even though it equals the seed.
  */
 export function behaviorForSubmit(
@@ -98,5 +98,5 @@ export function behaviorForSubmit(
   if (JSON.stringify(group) === JSON.stringify(seedGroup)) {
     return undefined;
   }
-  return group ?? {};
+  return group;
 }

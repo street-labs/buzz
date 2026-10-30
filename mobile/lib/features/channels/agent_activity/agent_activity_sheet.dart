@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../../shared/theme/theme.dart';
-import '../../profile/user_cache_provider.dart';
-import '../date_formatters.dart';
+import '../../../shared/widgets/buzz_loading_indicator.dart';
+import '../../../shared/profile/user_cache_provider.dart';
+import '../channel_identity_names_provider.dart';
 import 'observer_models.dart';
 import 'observer_subscription.dart';
 import 'transcript_item_widget.dart';
@@ -33,10 +34,7 @@ class AgentActivitySheet extends HookConsumerWidget {
     final connection = observerState.connection;
 
     // Resolve bot name.
-    final profile = ref.watch(
-      userCacheProvider.select((cache) => cache[agentPubkey.toLowerCase()]),
-    );
-    final botName = profile?.label ?? shortPubkey(agentPubkey);
+    final botName = watchChannelIdentityLabel(ref, channelId, agentPubkey);
 
     // Auto-scroll to bottom on new items.
     final sheetControllerRef = useRef<ScrollController?>(null);
@@ -86,7 +84,7 @@ class AgentActivitySheet extends HookConsumerWidget {
                   Row(
                     children: [
                       Icon(
-                        LucideIcons.bot,
+                        BuzzIcons.bot,
                         size: 18,
                         color: context.colors.onSurface,
                       ),
@@ -159,7 +157,7 @@ class _EmptyState extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(LucideIcons.circleX, size: 24, color: context.colors.error),
+            Icon(BuzzIcons.circleX, size: 24, color: context.colors.error),
             const SizedBox(height: Grid.xxs),
             Text(
               'Error: ${errorMessage ?? 'Unknown error'}',
@@ -189,13 +187,10 @@ class _EmptyState extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
-            width: 24,
-            height: 24,
-            child: CircularProgressIndicator(
-              strokeWidth: 2,
-              color: context.colors.onSurfaceVariant,
-            ),
+          BuzzLoadingIndicator(
+            size: 28,
+            color: context.colors.onSurfaceVariant,
+            semanticLabel: 'Waiting for agent activity',
           ),
           const SizedBox(height: Grid.xxs),
           Text(

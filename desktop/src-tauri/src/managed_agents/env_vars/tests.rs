@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    display_invalid_key, filter_derived_provider_model_env_vars, is_derived_provider_model_key,
-    is_reserved_env_key, is_well_formed_env_key, merged_user_env, validate_user_env_keys,
+    display_invalid_key, is_derived_provider_model_key, is_reserved_env_key,
+    is_well_formed_env_key, merged_user_env, validate_user_env_keys,
     DERIVED_PROVIDER_MODEL_ENV_KEYS, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, RESERVED_ENV_KEYS,
 };
 
@@ -133,7 +133,6 @@ fn is_reserved_recognises_full_list() {
     assert!(!is_reserved_env_key("GOOSE_MODE"));
     assert!(!is_reserved_env_key("ANTHROPIC_API_KEY"));
     assert!(!is_reserved_env_key("BUZZ_ACP_MODEL")); // behavior knob
-    assert!(!is_reserved_env_key("BUZZ_TOOLSETS"));
 }
 
 #[test]
@@ -151,12 +150,36 @@ fn reserved_keys_include_respond_to_gate() {
     // Respond-to mode + allowlist control who the agent answers.
     // Overriding via env_vars would let the running agent answer
     // anyone even when the UI/record says owner-only.
-    for key in ["BUZZ_ACP_RESPOND_TO", "BUZZ_ACP_RESPOND_TO_ALLOWLIST"] {
+    for key in [
+        "BUZZ_ACP_RESPOND_TO",
+        "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
+        "BUZZ_ACP_ALLOWED_RESPOND_TO",
+    ] {
         assert!(is_reserved_env_key(key), "{key} should be reserved");
         let agent = map(&[(key, "anyone")]);
         let merged = merged_user_env(&BTreeMap::new(), &agent);
         assert!(merged.is_empty(), "{key} should be stripped");
     }
+}
+
+#[test]
+fn reserved_keys_include_remote_lifetime_policy() {
+    for key in [
+        "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+        "BUZZ_ACP_IDLE_POOL_SLEEP",
+        "BUZZ_ACP_NO_PRESENCE",
+    ] {
+        assert!(is_reserved_env_key(key), "{key} should be reserved");
+        let agent = map(&[(key, "0")]);
+        assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
+    }
+}
+
+#[test]
+fn reserved_keys_include_desktop_acp_session_policy() {
+    assert!(is_reserved_env_key("BUZZ_ACP_SESSION_POLICY"));
+    let agent = map(&[("BUZZ_ACP_SESSION_POLICY", "thread")]);
+    assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
 }
 
 #[test]
@@ -167,6 +190,7 @@ fn reserved_keys_include_code_execution_surface() {
         "BUZZ_ACP_AGENT_COMMAND",
         "BUZZ_ACP_AGENT_ARGS",
         "BUZZ_ACP_MCP_COMMAND",
+        "BUZZ_ACP_LAUNCH_PREFIX",
     ] {
         assert!(is_reserved_env_key(key), "{key} should be reserved");
     }
@@ -180,6 +204,50 @@ fn reserved_keys_include_relay_url() {
     let agent = map(&[("BUZZ_RELAY_URL", "ws://attacker.example")]);
     let merged = merged_user_env(&BTreeMap::new(), &agent);
     assert!(merged.is_empty());
+}
+
+#[test]
+fn reserved_keys_include_git_config_family() {
+    // Buzz stages the relay credential helper and the agent identity/signing
+    // config into the child through the GIT_CONFIG_* indexed env family. A
+    // user override lands after the helper on the spawn command, so a single
+    // GIT_CONFIG_COUNT=0 (or any index collision) silently orphans it. The
+    // whole family — the bare name and every GIT_CONFIG_* var — must be
+    // stripped from persona/agent/global overrides.
+    for key in [
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        // Case-insensitive: the shape the child getenv resolves is uppercase,
+        // but the validator/filter must not be fooled by a lowercased key.
+        "git_config_count",
+    ] {
+        assert!(is_reserved_env_key(key), "{key} should be reserved");
+        let agent = map(&[(key, "0")]);
+        assert!(
+            merged_user_env(&BTreeMap::new(), &agent).is_empty(),
+            "{key} should be stripped from overrides"
+        );
+        assert!(
+            validate_user_env_keys(&map(&[(key, "0")])).is_err(),
+            "{key} should be rejected at save time"
+        );
+    }
+}
+
+#[test]
+fn git_config_reservation_does_not_catch_unrelated_names() {
+    // The prefix rule matches `GIT_CONFIG` and `GIT_CONFIG_*` only — a name
+    // that merely starts with those letters but is a distinct identifier
+    // (no underscore boundary) stays user-overridable.
+    for key in ["GIT_CONFIGURATION", "GIT_CONFIGX", "MY_GIT_CONFIG"] {
+        assert!(!is_reserved_env_key(key), "{key} must not be reserved");
+    }
 }
 
 // ── validate_user_env_keys ─────────────────────────────────────────
@@ -421,7 +489,7 @@ fn merged_env_drops_oversize_value() {
 //
 // Pack import must strip derived env keys (GOOSE_MODEL, GOOSE_PROVIDER,
 // BUZZ_AGENT_MODEL, BUZZ_AGENT_PROVIDER) so they don't shadow the
-// structured PersonaRecord.model / PersonaRecord.provider fields after
+// structured AgentDefinition.model / AgentDefinition.provider fields after
 // the user edits them in the UI.
 
 #[test]
@@ -450,85 +518,6 @@ fn is_derived_key_does_not_match_unrelated_keys() {
     assert!(!is_derived_provider_model_key("BUZZ_PRIVATE_KEY"));
     assert!(!is_derived_provider_model_key("MODEL"));
     assert!(!is_derived_provider_model_key("PROVIDER"));
-}
-
-#[test]
-fn filter_derived_strips_provider_model_keys_preserves_rest() {
-    let input = vec![
-        ("GOOSE_MODEL".to_string(), "old-model".to_string()),
-        ("GOOSE_PROVIDER".to_string(), "old-provider".to_string()),
-        ("BUZZ_AGENT_MODEL".to_string(), "gpt-4o".to_string()),
-        ("BUZZ_AGENT_PROVIDER".to_string(), "openai".to_string()),
-        ("GOOSE_TEMPERATURE".to_string(), "0.7".to_string()),
-        ("GOOSE_CONTEXT_LIMIT".to_string(), "128000".to_string()),
-        ("CUSTOM_KEY".to_string(), "custom-value".to_string()),
-    ];
-
-    let filtered = filter_derived_provider_model_env_vars(input);
-
-    // Derived keys must be gone.
-    assert!(!filtered.contains_key("GOOSE_MODEL"));
-    assert!(!filtered.contains_key("GOOSE_PROVIDER"));
-    assert!(!filtered.contains_key("BUZZ_AGENT_MODEL"));
-    assert!(!filtered.contains_key("BUZZ_AGENT_PROVIDER"));
-
-    // Non-derived keys must survive.
-    assert_eq!(
-        filtered.get("GOOSE_TEMPERATURE").map(String::as_str),
-        Some("0.7")
-    );
-    assert_eq!(
-        filtered.get("GOOSE_CONTEXT_LIMIT").map(String::as_str),
-        Some("128000")
-    );
-    assert_eq!(
-        filtered.get("CUSTOM_KEY").map(String::as_str),
-        Some("custom-value")
-    );
-}
-
-#[test]
-fn filter_derived_empty_input_returns_empty() {
-    let filtered = filter_derived_provider_model_env_vars(std::iter::empty());
-    assert!(filtered.is_empty());
-}
-
-#[test]
-fn stale_derived_env_does_not_override_structured_fields() {
-    // Scenario: A persona was imported WITH stale derived keys (pre-fix).
-    // At merge time, `merged_user_env` passes them through (it doesn't filter).
-    // The fix is at *import* time — this test documents that merged_user_env
-    // is transparent, and the import filter is the correct defense.
-    let stale_persona_env = map(&[
-        ("BUZZ_AGENT_MODEL", "stale-model"),
-        ("BUZZ_AGENT_PROVIDER", "stale-provider"),
-        ("GOOSE_TEMPERATURE", "0.5"),
-    ]);
-    let agent_env = BTreeMap::new();
-
-    let merged = merged_user_env(&stale_persona_env, &agent_env);
-
-    // merged_user_env is transparent — stale keys pass through.
-    assert_eq!(
-        merged.get("BUZZ_AGENT_MODEL").map(String::as_str),
-        Some("stale-model")
-    );
-    assert_eq!(
-        merged.get("BUZZ_AGENT_PROVIDER").map(String::as_str),
-        Some("stale-provider")
-    );
-
-    // But the import filter WOULD have caught them:
-    let would_be_filtered = filter_derived_provider_model_env_vars(stale_persona_env);
-    assert!(!would_be_filtered.contains_key("BUZZ_AGENT_MODEL"));
-    assert!(!would_be_filtered.contains_key("BUZZ_AGENT_PROVIDER"));
-    // Non-derived keys survive the filter.
-    assert_eq!(
-        would_be_filtered
-            .get("GOOSE_TEMPERATURE")
-            .map(String::as_str),
-        Some("0.5")
-    );
 }
 
 // ── deploy payload model precedence ────────────────────────────────
@@ -567,4 +556,20 @@ fn deploy_model_precedence_none_when_both_absent() {
 
     let effective = persona_model.clone().or(record_model.clone());
     assert_eq!(effective, None);
+}
+
+#[test]
+fn launch_prefix_cannot_be_saved_or_merged_from_user_environment() {
+    for key in [
+        "BUZZ_ACP_LAUNCH_PREFIX",
+        "buzz_acp_launch_prefix",
+        "Buzz_Acp_Launch_Prefix",
+    ] {
+        let env = map(&[(key, r#"["/usr/bin/env"]"#)]);
+        assert!(validate_user_env_keys(&env)
+            .unwrap_err()
+            .contains("reserved"));
+        assert!(merged_user_env(&env, &BTreeMap::new()).is_empty());
+        assert!(merged_user_env(&BTreeMap::new(), &env).is_empty());
+    }
 }

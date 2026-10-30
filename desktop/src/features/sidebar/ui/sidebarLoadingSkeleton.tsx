@@ -2,6 +2,7 @@ import * as React from "react";
 
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -36,6 +37,7 @@ type SidebarLoadingShape = {
 };
 
 type SidebarLoadingCachePayload = SidebarLoadingShape & {
+  updatedAt: number;
   version: 1;
 };
 
@@ -95,11 +97,11 @@ function hasSidebarLoadingRows(shape: SidebarLoadingShape) {
 }
 
 function sidebarSkeletonCacheKey(
-  workspaceId: string | null | undefined,
+  communityId: string | null | undefined,
   pubkey: string | undefined,
 ) {
-  if (!workspaceId) return null;
-  return `${SIDEBAR_SKELETON_CACHE_PREFIX}:${workspaceId}:${pubkey ?? "anonymous"}`;
+  if (!communityId) return null;
+  return `${SIDEBAR_SKELETON_CACHE_PREFIX}:${communityId}:${pubkey ?? "anonymous"}`;
 }
 
 function readSidebarLoadingShape(
@@ -130,11 +132,12 @@ function writeSidebarLoadingShape(
   const payload: SidebarLoadingCachePayload = {
     channels: shape.channels.slice(0, 3),
     directMessages: shape.directMessages.slice(0, 2),
+    updatedAt: Date.now(),
     version: 1,
   };
 
   try {
-    window.localStorage.setItem(cacheKey, JSON.stringify(payload));
+    setLocalStorageItemWithRecovery(cacheKey, JSON.stringify(payload));
   } catch {
     // localStorage can be unavailable or full in embedded webviews.
   }
@@ -174,14 +177,14 @@ function createSidebarLoadingShape({
 }
 
 export function useSidebarLoadingShape({
-  activeWorkspaceId,
+  activeCommunityId,
   directMessages,
   dmChannelLabels,
   isLoading,
   currentPubkey,
   streamChannels,
 }: {
-  activeWorkspaceId: string | null | undefined;
+  activeCommunityId: string | null | undefined;
   directMessages: Channel[];
   dmChannelLabels: Record<string, string>;
   isLoading: boolean;
@@ -189,8 +192,8 @@ export function useSidebarLoadingShape({
   streamChannels: Channel[];
 }) {
   const cacheKey = React.useMemo(
-    () => sidebarSkeletonCacheKey(activeWorkspaceId, currentPubkey),
-    [activeWorkspaceId, currentPubkey],
+    () => sidebarSkeletonCacheKey(activeCommunityId, currentPubkey),
+    [activeCommunityId, currentPubkey],
   );
   const liveShape = React.useMemo(
     () =>
