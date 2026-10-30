@@ -506,7 +506,9 @@ fn check_moov_before_mdat(path: &Path) -> Result<(), MediaError> {
 ///
 /// This is deliberately a structural allowlist rather than an EXIF-tag denylist:
 /// location can also live in XMP, comments, PNG text, ICC descriptions, or
-/// private chunks. Client encoders remove these before upload.
+/// private chunks. Metadata channels that real encoders emit are stripped
+/// server-side before storage (see [`crate::sanitize`]); these checks run on
+/// the sanitized payload.
 fn validate_image_metadata_free(bytes: &[u8], mime: &str) -> Result<(), MediaError> {
     match mime {
         "image/jpeg" => validate_jpeg_metadata_free(bytes),

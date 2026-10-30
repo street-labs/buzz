@@ -57,7 +57,7 @@ async fn process_buffered_upload<V, M, Fut>(
     prepare_metadata: M,
 ) -> Result<BlobDescriptor, MediaError>
 where
-    V: FnOnce(&Bytes, &MediaConfig) -> Result<(String, String), MediaError> + Send + 'static,
+    V: FnOnce(&Bytes, &MediaConfig) -> Result<(String, String, Bytes), MediaError> + Send + 'static,
     M: FnOnce(MetadataInput) -> Fut,
     Fut: std::future::Future<Output = Result<BlobMeta, MediaError>>,
 {
@@ -70,23 +70,30 @@ where
         attribution,
     } = input;
 
-    // CPU-bound: validate content, compute hash, verify auth.
+    // CPU-bound: verify the Blossom auth against the hash of the raw upload
+    // (possession of the exact uploaded bytes), then run the injected
+    // validate/sanitize step, whose returned bytes are what gets stored.
+    // Ordinary encoders emit EXIF/pHYs on nearly every image; the
+    // canonical-structure policy is enforced on the stored bytes, not used
+    // to reject the upload.
     let auth = auth_event.clone();
     let bytes = body.clone();
     let cfg = config.clone();
-    let (mime, sha256, ext) = tokio::task::spawn_blocking(move || -> Result<_, MediaError> {
-        let (mime, ext) = validate(&bytes, &cfg)?;
-        let sha256 = hex::encode(Sha256::digest(&bytes));
-        // Post-body hash check only: the full auth event verification
-        // (signature, kind, freshness, server, cardinality) was already
-        // applied at the pre-body gate in the relay handler.  Re-running the
-        // full verifier here would fail any upload that takes longer than the
-        // minted token's expiration window (60 s in Strict mode).
-        verify_upload_hash_only(&auth, &sha256)?;
-        Ok((mime, sha256, ext))
-    })
-    .await
-    .map_err(|_| MediaError::Internal)??;
+    let (mime, sha256, ext, stored) =
+        tokio::task::spawn_blocking(move || -> Result<_, MediaError> {
+            let raw_sha256 = hex::encode(Sha256::digest(&bytes));
+            // Post-body hash check only: the full auth event verification
+            // (signature, kind, freshness, server, cardinality) was already
+            // applied at the pre-body gate in the relay handler.  Re-running the
+            // full verifier here would fail any upload that takes longer than the
+            // minted token's expiration window (60 s in Strict mode).
+            verify_upload_hash_only(&auth, &raw_sha256)?;
+            let (mime, ext, stored) = validate(&bytes, &cfg)?;
+            let sha256 = hex::encode(Sha256::digest(&stored));
+            Ok((mime, sha256, ext, stored))
+        })
+        .await
+        .map_err(|_| MediaError::Internal)??;
 
     let key = format!("{sha256}.{ext}");
     let meta_key = MediaStorage::ctx_sidecar_key(ctx, &sha256);
@@ -111,7 +118,7 @@ where
                     sha256: &sha256,
                     ext: &ext,
                     mime: &mime,
-                    size: body.len() as u64,
+                    size: stored.len() as u64,
                     uploaded_at: chrono::Utc::now().timestamp(),
                 },
             )
@@ -122,7 +129,7 @@ where
             &sha256,
             &ext,
             &mime,
-            body.len() as u64,
+            stored.len() as u64,
             Some(&meta),
             meta.uploaded_at,
         ));
@@ -138,13 +145,13 @@ where
     // content-addressed and bounded by the upload size limit, so the storage
     // cost is negligible. A V2 background GC job can sweep blobs with no
     // matching sidecar after a grace period.
-    storage.put(&key, &body, &mime).await?;
+    storage.put(&key, &stored, &mime).await?;
 
     let meta = match prepare_metadata(MetadataInput {
         sha256: sha256.clone(),
         ext: ext.clone(),
         mime: mime.clone(),
-        body: body.clone(),
+        body: stored.clone(),
         uploaded_at,
     })
     .await
@@ -222,9 +229,17 @@ pub async fn process_upload(
             attribution,
         },
         |bytes, cfg| {
-            let mime = validate_content(bytes, cfg)?;
+            // Sniff the container, then strip metadata channels before the
+            // strict validation: the canonical-structure policy is enforced
+            // on the bytes we store, not used to reject uploads from
+            // ordinary encoders that embed EXIF/pHYs.
+            let sniffed = infer::get(bytes)
+                .map(|t| t.mime_type().to_string())
+                .ok_or(MediaError::UnknownContentType)?;
+            let stored = crate::sanitize::sanitize_image(bytes, &sniffed).into_owned();
+            let mime = validate_content(&stored, cfg)?;
             let ext = mime_to_ext(&mime).to_string();
-            Ok((mime, ext))
+            Ok((mime, ext, Bytes::from(stored)))
         },
         |input| async move { prepare_image_metadata(storage, config, input).await },
     )
@@ -259,7 +274,10 @@ pub async fn process_file_upload(
             body,
             attribution,
         },
-        |bytes, cfg| validate_file_content(bytes, cfg),
+        |bytes, cfg| {
+            let (mime, ext) = validate_file_content(bytes, cfg)?;
+            Ok((mime, ext, bytes.clone()))
+        },
         |input| async move {
             // Minimal sidecar — no thumbnail/dim/blurhash/duration for generic files.
             let meta = BlobMeta {
