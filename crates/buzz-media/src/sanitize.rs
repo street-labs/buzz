@@ -71,6 +71,11 @@ fn sanitize_jpeg(bytes: &[u8]) -> Vec<u8> {
         let marker = bytes[i];
         let marker_start = i - 1; // position of the 0xFF preceding the marker
         i += 1;
+        if marker == 0x00 {
+            // Byte-stuffed FF 00 inside entropy-coded data — not a marker.
+            out.extend_from_slice(&bytes[marker_start..i]);
+            continue;
+        }
         if (0xd0..=0xd7).contains(&marker) || marker == 0x01 || marker == 0xd9 || marker == 0xd8 {
             out.extend_from_slice(&bytes[marker_start..i]);
             continue;
@@ -366,9 +371,9 @@ mod tests {
         // DHT
         out.extend_from_slice(&[0xff, 0xc4, 0x00, 0x14, 0x00]);
         out.extend_from_slice(&[0u8; 17]);
-        // SOS + minimal entropy data + EOI
+        // SOS + entropy data containing a byte-stuffed FF 00 + EOI
         out.extend_from_slice(&[0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00]);
-        out.extend_from_slice(&[0x3c, 0xfa, 0xff, 0xd9]);
+        out.extend_from_slice(&[0x3c, 0xfa, 0xff, 0x00, 0x17, 0xff, 0xd9]);
         out
     }
 
@@ -379,9 +384,11 @@ mod tests {
         let sanitized = sanitize_image(&bytes, "image/jpeg");
         assert_ne!(sanitized.as_ref(), &bytes[..]);
         assert!(!sanitized.windows(4).any(|w| w == *b"Exif"));
-        // Still ends with EOI and retains the scan + critical segments.
+        // Still ends with EOI and retains the scan + critical segments,
+        // including the byte-stuffed FF 00 inside the entropy data.
         assert!(sanitized.ends_with(&[0xff, 0xd9]));
         assert!(sanitized.windows(2).any(|w| w == [0xff, 0xda]));
+        assert!(sanitized.windows(2).any(|w| w == [0xff, 0x00]));
     }
 
     #[test]

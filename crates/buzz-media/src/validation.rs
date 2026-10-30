@@ -1021,6 +1021,17 @@ pub(crate) fn minimal_valid_mp4() -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repro_real_screenshot() {
+        let bytes = std::fs::read("/tmp/menu-before.jpg").unwrap();
+        let config = test_config();
+        let sniffed = infer::get(&bytes).unwrap().mime_type().to_string();
+        let sanitized = crate::sanitize::sanitize_image(&bytes, &sniffed).into_owned();
+        println!("len {} -> {}", bytes.len(), sanitized.len());
+        let result = validate_content(&sanitized, &config);
+        println!("REAL RESULT: {result:?}");
+    }
+
     fn test_config() -> MediaConfig {
         MediaConfig {
             s3_endpoint: String::new(),
